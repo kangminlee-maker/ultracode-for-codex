@@ -184,6 +184,8 @@ async function validateExtractedPackage(packageDir) {
     requiredText: [
       'Codex main context as the orchestrator',
       'Use the CLI runtime only when the user explicitly asks',
+      'Situation Choice Matrix',
+      'cumulative ledger',
       'references/progress-visuals.md',
       'Completion Impact Summary',
     ],

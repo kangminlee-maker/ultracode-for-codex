@@ -51,7 +51,10 @@ Phase Inspect - 3 agents
    file inspection, test execution, or integration planning.
 7. As agents complete, report progress with a visual snapshot rather than a
    dense sentence. Use the Default Live Snapshot golden shape from
-   `references/progress-visuals.md` by default.
+   `references/progress-visuals.md` by default. Select task-specific additions
+   from the Situation Choice Matrix in that reference. Within one user
+   request, keep a cumulative ledger: do not remove completed rows from later
+   snapshots; update their status and append newly discovered work below them.
 
 ```text
 Phase E2E Validate

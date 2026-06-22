@@ -143,11 +143,29 @@ async function assertSkillCommandPackageContents(installedPackageDir) {
   assert.match(nativeSkill, /^name: ultracode-for-codex$/m);
   assert.match(nativeSkill, /Codex main context as the orchestrator/);
   assert.match(nativeSkill, /Use the CLI runtime only when the user explicitly asks/);
+  assert.match(nativeSkill, /Situation Choice Matrix/);
+  assert.match(nativeSkill, /cumulative ledger/);
   assert.match(nativeSkill, /references\/progress-visuals\.md/);
   assert.match(nativeAgent, /Run Codex-native phase-wise parallel orchestration/);
+  assert.match(nativeProgressVisuals, /Cumulative Ledger Rule/);
+  assert.match(nativeProgressVisuals, /Situation Choice Matrix/);
+  assert.match(nativeProgressVisuals, /Each row has at most three user-facing/);
+  assert.match(nativeProgressVisuals, /Do not present profile names/);
+  assert.match(nativeProgressVisuals, /Ordinary or mixed work/);
+  assert.match(nativeProgressVisuals, /Review or audit/);
+  assert.match(nativeProgressVisuals, /Release or install/);
+  assert.equal(countSituationRows(nativeProgressVisuals), 6);
+  assert.doesNotMatch(nativeProgressVisuals, /Default Visualization Profile/);
+  assert.doesNotMatch(nativeProgressVisuals, /Work Progress/);
+  assert.doesNotMatch(nativeProgressVisuals, /Review And Evidence/);
+  assert.doesNotMatch(nativeProgressVisuals, /Release And Recovery/);
   assert.match(nativeProgressVisuals, /Default Live Snapshot/);
   assert.match(nativeProgressVisuals, /Completion Impact Summary/);
   assert.match(nativeProgressVisuals, /Plan-Style Result Summary/);
+  assert.match(nativeProgressVisuals, /Research Pattern Map/);
+  assert.match(nativeProgressVisuals, /Building Block Examples/);
+  assert.match(nativeProgressVisuals, /Risk Or Audit Table/);
+  assert.match(nativeProgressVisuals, /Context Coverage Matrix/);
   assert.match(cliSkill, /^name: ultracode-for-codex-cli$/m);
   assert.match(cliSkill, /npm package and CLI runtime surface/);
   assert.match(cliSkill, /The default `\$ultracode-for-codex` skill is Codex-native/);
@@ -169,8 +187,17 @@ async function assertSkillCommandInstall(installedPackageDir) {
     assert.match(installedAgent, /default_prompt:/);
   }
   const installedVisuals = await readFile(join(skillsRoot, 'ultracode-for-codex', 'references', 'progress-visuals.md'), 'utf8');
+  assert.match(installedVisuals, /Cumulative Ledger Rule/);
+  assert.match(installedVisuals, /Situation Choice Matrix/);
+  assert.equal(countSituationRows(installedVisuals), 6);
+  assert.doesNotMatch(installedVisuals, /Default Visualization Profile/);
   assert.match(installedVisuals, /Default Live Snapshot/);
   assert.match(installedVisuals, /Completion Impact Summary/);
+  assert.match(installedVisuals, /Research Pattern Map/);
+}
+
+function countSituationRows(content) {
+  return [...content.matchAll(/^\| (Ordinary or mixed work|Design or planning|Implementation|Review or audit|Release or install|Retry, cancellation, or long-running work) \| [^|]+ \| [^|]+ \| [^|]+ \|$/gm)].length;
 }
 
 async function assertNpmExecRun() {
