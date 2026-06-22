@@ -1,0 +1,76 @@
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+export type Verbosity = 'low' | 'medium' | 'high';
+
+export interface SubagentMessage {
+  readonly role: 'user';
+  readonly content: string;
+}
+
+export interface SubagentTool {
+  readonly name: string;
+  readonly description?: string;
+  readonly inputSchema?: unknown;
+}
+
+export type SubagentToolChoice =
+  | { readonly type: 'auto' }
+  | { readonly type: 'required' };
+
+export interface SubagentRequest {
+  readonly model: string;
+  readonly messages: readonly SubagentMessage[];
+  readonly reasoningEffort?: ReasoningEffort;
+  readonly tools: readonly SubagentTool[];
+  readonly toolChoice: SubagentToolChoice;
+  readonly worktreePath?: string;
+  readonly raw?: unknown;
+}
+
+export interface SubagentUsage {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly totalTokens?: number;
+  readonly cachedInputTokens?: number;
+  readonly reasoningOutputTokens?: number;
+  readonly source?: 'provider' | 'estimated';
+  readonly raw?: unknown;
+}
+
+export interface SubagentToolCall {
+  readonly id: string;
+  readonly name: string;
+  readonly arguments: string;
+}
+
+export interface SubagentResult {
+  readonly id: string;
+  readonly model: string;
+  readonly text: string;
+  readonly toolCalls: readonly SubagentToolCall[];
+  readonly usage: SubagentUsage;
+  readonly latencyMs: number;
+}
+
+export interface SubagentBackend {
+  readonly name: string;
+  readonly model: string;
+  generate(request: SubagentRequest, signal?: AbortSignal): Promise<SubagentResult>;
+  close(): Promise<void>;
+}
+
+export class UltracodeRequestError extends Error {
+  constructor(
+    message: string,
+    readonly statusCode: number,
+    readonly type = 'invalid_request_error',
+    readonly param: string | null = null,
+    readonly code: string | null = null,
+  ) {
+    super(message);
+  }
+}
+
+export function estimateTokens(text: string): number {
+  if (!text) return 0;
+  return Math.max(1, Math.ceil(text.length / 4));
+}

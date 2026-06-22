@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ultracode for Codex Implementation Map</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f8fafc;
+      --fg: #162033;
+      --muted: #5d6b82;
+      --line: #d7dde8;
+      --surface: #ffffff;
+      --runtime: #dff5e8;
+      --runtime-stroke: #228356;
+      --input: #dbeafe;
+      --input-stroke: #2563eb;
+      --artifact: #e5e7eb;
+      --artifact-stroke: #64748b;
+      --gate: #fee2e2;
+      --gate-stroke: #dc2626;
+      --view: #ede9fe;
+      --view-stroke: #7c3aed;
+      --quality: #cffafe;
+      --quality-stroke: #0891b2;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #101418;
+        --fg: #f4f7fb;
+        --muted: #a9b4c2;
+        --line: #344152;
+        --surface: #171d25;
+      }
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 28px 20px 48px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+      line-height: 1.15;
+      letter-spacing: 0;
+    }
+    h2 {
+      margin: 28px 0 10px;
+      font-size: 18px;
+      letter-spacing: 0;
+    }
+    p {
+      color: var(--muted);
+      margin: 0 0 14px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 10px;
+      margin: 18px 0;
+    }
+    .tile {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .tile strong {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+    .tile span {
+      font-size: 15px;
+    }
+    .svg-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      border-radius: 8px;
+      padding: 10px;
+    }
+    svg {
+      display: block;
+      min-width: 1080px;
+    }
+    .lane-title {
+      font-size: 14px;
+      font-weight: 700;
+      fill: var(--muted);
+    }
+    .node-title {
+      font-size: 15px;
+      font-weight: 700;
+      fill: #142033;
+    }
+    .node-line {
+      font-size: 12px;
+      fill: #334155;
+    }
+    .legend {
+      font-size: 12px;
+      fill: #334155;
+    }
+    .arrow {
+      stroke: #475569;
+      stroke-width: 2;
+      fill: none;
+      marker-end: url(#arrow);
+    }
+    .arrow-runtime {
+      stroke: #228356;
+      stroke-width: 2.5;
+      fill: none;
+      marker-end: url(#arrowRuntime);
+    }
+    .arrow-dashed {
+      stroke: #64748b;
+      stroke-width: 2;
+      fill: none;
+      stroke-dasharray: 8 6;
+      marker-end: url(#arrow);
+    }
+    code {
+      font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+    }
+    th, td {
+      text-align: left;
+      border-bottom: 1px solid var(--line);
+      padding: 8px;
+      vertical-align: top;
+    }
+    th {
+      color: var(--muted);
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Ultracode for Codex Implementation Map</h1>
+    <p>Current state of the local CLI runtime and npm package release path.</p>
+
+    <section class="grid" aria-label="Current status">
+      <div class="tile"><strong>Current goal</strong><span>Run workflows as an npm-installed CLI package</span></div>
+      <div class="tile"><strong>Runtime health</strong><span>Latest npm release installed and test suite green</span></div>
+      <div class="tile"><strong>Main risk</strong><span>Cross-process resume remains intentionally out of scope</span></div>
+      <div class="tile"><strong>Next decision</strong><span>Add cross-process resume only if background job recovery becomes necessary</span></div>
+    </section>
+
+    <h2>Service Blueprint</h2>
+    <p>Judgment question: where does authority live during local workflow execution?</p>
+    <div class="svg-wrap">
+      <svg role="img" aria-labelledby="bp-title bp-desc" width="940" height="620" viewBox="0 0 940 620">
+        <title id="bp-title">CLI workflow blueprint</title>
+        <desc id="bp-desc">Shows settings and user input flowing through CLI gates, background launch or attached execution, Codex subagents, journal artifacts, projections, and verification.</desc>
+        <defs>
+          <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+            <path d="M0,0 L0,6 L9,3 z" fill="#475569"></path>
+          </marker>
+          <marker id="arrowRuntime" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+            <path d="M0,0 L0,6 L9,3 z" fill="#228356"></path>
+          </marker>
+        </defs>
+
+        <text class="lane-title" x="40" y="42">Inputs</text>
+        <text class="lane-title" x="260" y="42">Runtime/tools</text>
+        <text class="lane-title" x="520" y="42">Codex semantic work</text>
+        <text class="lane-title" x="760" y="42">Artifacts and projection</text>
+
+        <rect x="40" y="64" width="180" height="116" rx="8" fill="var(--input)" stroke="var(--input-stroke)"></rect>
+        <text class="node-title" x="58" y="92">CLI command</text>
+        <text class="node-line" x="58" y="116">run CLI</text>
+        <text class="node-line" x="58" y="136">settings.json</text>
+        <text class="node-line" x="58" y="156">script/name/args</text>
+
+        <rect x="40" y="230" width="180" height="116" rx="8" fill="var(--input)" stroke="var(--input-stroke)"></rect>
+        <text class="node-title" x="58" y="258">Workflow source</text>
+        <text class="node-line" x="58" y="282">inline or file</text>
+        <text class="node-line" x="58" y="302">named registry</text>
+        <text class="node-line" x="58" y="322">runtime scriptPath</text>
+
+        <rect x="260" y="64" width="210" height="116" rx="8" fill="var(--gate)" stroke="var(--gate-stroke)"></rect>
+        <text class="node-title" x="278" y="92">CLI gates</text>
+        <text class="node-line" x="278" y="116">guide accepted</text>
+        <text class="node-line" x="278" y="136">source selector valid</text>
+        <text class="node-line" x="278" y="156">permission review</text>
+
+        <rect x="260" y="230" width="210" height="136" rx="8" fill="var(--runtime)" stroke="var(--runtime-stroke)"></rect>
+        <text class="node-title" x="278" y="258">Workflow runtime</text>
+        <text class="node-line" x="278" y="282">parse pure meta</text>
+        <text class="node-line" x="278" y="302">validate VM script</text>
+        <text class="node-line" x="278" y="322">schedule agents</text>
+        <text class="node-line" x="278" y="342">retry/cancel authority</text>
+
+        <rect x="520" y="230" width="190" height="116" rx="8" fill="#fef3c7" stroke="#d97706"></rect>
+        <text class="node-title" x="538" y="258">Codex subagents</text>
+        <text class="node-line" x="538" y="282">semantic prompts</text>
+        <text class="node-line" x="538" y="302">raw result text</text>
+        <text class="node-line" x="538" y="322">structured output</text>
+        <text class="node-line" x="538" y="342">workspace reads</text>
+
+        <rect x="760" y="64" width="160" height="116" rx="8" fill="var(--artifact)" stroke="var(--artifact-stroke)"></rect>
+        <text class="node-title" x="778" y="92">Journal</text>
+        <text class="node-line" x="778" y="116">journal.jsonl</text>
+        <text class="node-line" x="778" y="136">hash chained</text>
+        <text class="node-line" x="778" y="156">canonical</text>
+
+        <rect x="760" y="230" width="160" height="116" rx="8" fill="var(--view)" stroke="var(--view-stroke)"></rect>
+        <text class="node-title" x="778" y="258">CLI projection</text>
+        <text class="node-line" x="778" y="282">background files</text>
+        <text class="node-line" x="778" y="302">attached stdio</text>
+        <text class="node-line" x="778" y="322">path internal</text>
+
+        <rect x="760" y="396" width="160" height="116" rx="8" fill="var(--quality)" stroke="var(--quality-stroke)"></rect>
+        <text class="node-title" x="778" y="424">Verification</text>
+        <text class="node-line" x="778" y="448">npm test</text>
+        <text class="node-line" x="778" y="468">package E2E</text>
+        <text class="node-line" x="778" y="488">boundary check</text>
+
+        <path class="arrow" d="M220 122 H260"></path>
+        <path class="arrow" d="M220 288 H260"></path>
+        <path class="arrow-runtime" d="M365 180 V230"></path>
+        <path class="arrow-runtime" d="M470 298 H520"></path>
+        <path class="arrow-runtime" d="M710 288 H760"></path>
+        <path class="arrow-runtime" d="M470 250 C570 120 650 120 760 122"></path>
+        <path class="arrow-runtime" d="M840 180 V230"></path>
+        <path class="arrow-dashed" d="M840 346 V396"></path>
+      </svg>
+    </div>
+
+    <h2>Current Architecture</h2>
+    <table>
+      <tr><th>Area</th><th>Current contract</th></tr>
+      <tr><td>CLI</td><td><code>src/cli.ts</code> exposes <code>run</code>, help, install guide, and package-version reporting. <code>settings.json</code> defaults to OS background execution so long Codex-launched runs can continue while Codex performs other work; <code>--execution attached</code> keeps progress on stderr JSONL and result on stdout JSON when blocking is desired.</td></tr>
+      <tr><td>Settings</td><td><code>settings.json</code> owns workflow execution mode, progress mode, permission default, retry limit, opt-in timeout, background file names, and Codex model controls. The packaged timeout default is <code>0</code>, so workflows wait for completion, cancellation, or app-server exit.</td></tr>
+      <tr><td>Runtime</td><td><code>src/runtime/workflow-runtime.ts</code> owns parsing, validation, phase-wise parallel scheduling, permission, retry, cancel, and progress events. Built-in <code>task</code> and <code>code-review</code> use planner-selected dynamic workflow patterns, run parallel focused subagents by default, emit planning snapshots, emit phase-level plans immediately before each phase, repeat current agent roles on each phase-start event, and include completion counts plus elapsed time on agent completion. Runtime-owned workflow state and isolated worktrees are preserved for review.</td></tr>
+      <tr><td>Journal</td><td><code>src/runtime/workflow-journal.ts</code> owns durable hash-chained workflow truth.</td></tr>
+      <tr><td>Subagent backend</td><td><code>src/codex/subagent-backend.ts</code> talks to Codex app-server over stdio, strips direct provider credentials, runs turns in the requested workflow cwd, and serves bounded read-only workspace tools.</td></tr>
+      <tr><td>Package</td><td>Package contents are the CLI runtime, install guide, companion skill, docs, and public type exports. CLI <code>--version</code> and Codex <code>clientInfo.version</code> read package metadata, so packaging and npm version bumps update both surfaces together.</td></tr>
+    </table>
+
+    <h2>Verification</h2>
+    <table>
+      <tr><th>Check</th><th>Status</th></tr>
+      <tr><td><code>npm test</code></td><td>Build, runtime boundary verification, unit and integration tests.</td></tr>
+      <tr><td><code>npm run test:e2e:ultracode-for-codex</code></td><td>Packaged CLI E2E with fake Codex app-server boundary.</td></tr>
+      <tr><td><code>npm run pack:ultracode-for-codex</code></td><td>Tarball contents, companion skill, exports, and install checks.</td></tr>
+      <tr><td><code>npm run publish:dry-run</code></td><td>npm registry publish payload and lifecycle checks before release.</td></tr>
+    </table>
+  </main>
+</body>
+</html>

@@ -1,0 +1,252 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import {
+  WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+  WorkflowJournalValidationError,
+  WorkflowJournalWriter,
+  computeWorkflowAgentCallKey,
+  readWorkflowJournal,
+  stableJson,
+  workflowJournalHash,
+  workflowJournalPath,
+} from '../dist/runtime/workflow-journal.js';
+
+test('workflow journal stableJson sorts object keys and rejects nondeterministic values', () => {
+  assert.equal(stableJson({ z: 1, a: [true, { b: 'x', a: null }] }), '{"a":[true,{"a":null,"b":"x"}],"z":1}');
+  assert.equal(stableJson({ b: 1, _: 2, A: 3, a: 4 }), '{"A":3,"_":2,"a":4,"b":1}');
+  assert.throws(() => stableJson({ value: Number.NaN }), WorkflowJournalValidationError);
+  assert.throws(() => stableJson({ value: 1n }), WorkflowJournalValidationError);
+  assert.throws(() => stableJson({ value: new Date('2026-01-01T00:00:00.000Z') }), WorkflowJournalValidationError);
+  assert.throws(() => stableJson({ value: new Map([['a', 1]]) }), WorkflowJournalValidationError);
+  const cyclic = {};
+  cyclic.self = cyclic;
+  assert.throws(() => stableJson(cyclic), WorkflowJournalValidationError);
+});
+
+test('workflow journal writer appends durable hash-chained entries and reader validates them', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'workflow-journal-'));
+  try {
+    const transcriptDir = join(root, 'subagents', 'workflows', 'run_test');
+    const writer = await WorkflowJournalWriter.create({
+      transcriptDir,
+      taskId: 'task_test',
+      runId: 'run_test',
+    });
+    const firstAgentKey = computeWorkflowAgentCallKey({
+      previousAgentCallKey: WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+      prompt: 'Return alpha.',
+      semanticOpts: { model: 'fake-local-model', effort: 'xhigh' },
+    });
+    await writer.append({
+      kind: 'workflow.run.started',
+      workflowName: 'journal-demo',
+      workflowSource: 'inline',
+      scriptPath: '/tmp/journal-demo.js',
+      scriptHash: 'sha256:abc',
+      args: { topic: 'coverage' },
+      runtime: { schemaVersion: 1, cwd: '/tmp' },
+    });
+    await writer.append({
+      kind: 'workflow.agent.started',
+      agentIndex: 0,
+      agentId: 'agent_1',
+      previousAgentCallKey: WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+      agentCallKey: firstAgentKey,
+      prompt: 'Return alpha.',
+      semanticOpts: { model: 'fake-local-model', effort: 'xhigh' },
+    });
+    await writer.append({
+      kind: 'workflow.agent.completed',
+      agentIndex: 0,
+      agentId: 'agent_1',
+      agentCallKey: firstAgentKey,
+      result: 'ALPHA',
+      usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+      toolCalls: 0,
+    });
+    await writer.append({
+      kind: 'workflow.run.completed',
+      result: { value: 'ALPHA' },
+      resultPath: '/tmp/result.json',
+      agentCount: 1,
+      usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+      toolCalls: 0,
+      durationMs: 3,
+    });
+
+    const journal = await readWorkflowJournal(workflowJournalPath(transcriptDir));
+    assert.equal(journal.truncatedTail, false);
+    assert.deepEqual(journal.entries.map((entry) => entry.kind), [
+      'workflow.run.started',
+      'workflow.agent.started',
+      'workflow.agent.completed',
+      'workflow.run.completed',
+    ]);
+    assert.equal(journal.entries[0].previousEntryHash, '0'.repeat(64));
+    assert.equal(journal.entries[1].previousEntryHash, journal.entries[0].entryHash);
+    assert.equal(journal.entries[2].agentCallKey, firstAgentKey);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('workflow journal reader rejects unknown fields and recovers only trailing invalid partial JSON', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'workflow-journal-invalid-'));
+  try {
+    const transcriptDir = join(root, 'subagents', 'workflows', 'run_test');
+    const writer = await WorkflowJournalWriter.create({
+      transcriptDir,
+      taskId: 'task_test',
+      runId: 'run_test',
+    });
+    await writer.append({
+      kind: 'workflow.run.started',
+      workflowName: 'journal-demo',
+      workflowSource: 'inline',
+      scriptPath: '/tmp/journal-demo.js',
+      scriptHash: 'sha256:abc',
+      args: null,
+      runtime: { schemaVersion: 1, cwd: '/tmp' },
+    });
+    const journalPath = workflowJournalPath(transcriptDir);
+    const valid = await readFile(journalPath, 'utf8');
+    await writeFile(join(root, 'unknown.jsonl'), valid.replace('"kind":"workflow.run.started"', '"kind":"workflow.run.started","extra":true'));
+    await assert.rejects(() => readWorkflowJournal(join(root, 'unknown.jsonl')), WorkflowJournalValidationError);
+
+    await writeFile(join(root, 'partial.jsonl'), `${valid}{ "kind": "workflow.agent.started"`);
+    const partial = await readWorkflowJournal(join(root, 'partial.jsonl'));
+    assert.equal(partial.truncatedTail, true);
+    assert.equal(partial.entries.length, 1);
+
+    const firstAgentKey = computeWorkflowAgentCallKey({
+      previousAgentCallKey: WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+      prompt: 'Return alpha.',
+      semanticOpts: { model: 'fake-local-model', effort: 'xhigh' },
+    });
+    await writer.append({
+      kind: 'workflow.agent.started',
+      agentIndex: 0,
+      agentId: 'agent_1',
+      previousAgentCallKey: WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+      agentCallKey: firstAgentKey,
+      prompt: 'Return alpha.',
+      semanticOpts: { model: 'fake-local-model', effort: 'xhigh' },
+    });
+    const parseableTail = (await readFile(journalPath, 'utf8')).trimEnd();
+    await writeFile(join(root, 'parseable-tail.jsonl'), parseableTail);
+    await assert.rejects(
+      () => readWorkflowJournal(join(root, 'parseable-tail.jsonl')),
+      /non-newline-terminated JSON entry/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('workflow journal reader rejects tampered agent semantic keys and final pairing', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'workflow-journal-tamper-'));
+  try {
+    const transcriptDir = join(root, 'subagents', 'workflows', 'run_test');
+    const journalPath = workflowJournalPath(transcriptDir);
+    const writer = await WorkflowJournalWriter.create({
+      transcriptDir,
+      taskId: 'task_test',
+      runId: 'run_test',
+    });
+    const firstAgentKey = computeWorkflowAgentCallKey({
+      previousAgentCallKey: WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+      prompt: 'Return alpha.',
+      semanticOpts: { model: 'fake-local-model', effort: 'xhigh' },
+    });
+    await writer.append({
+      kind: 'workflow.run.started',
+      workflowName: 'journal-demo',
+      workflowSource: 'inline',
+      scriptPath: '/tmp/journal-demo.js',
+      scriptHash: 'sha256:abc',
+      args: null,
+      runtime: { schemaVersion: 1, cwd: '/tmp' },
+    });
+    await writer.append({
+      kind: 'workflow.agent.started',
+      agentIndex: 0,
+      agentId: 'agent_1',
+      previousAgentCallKey: WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+      agentCallKey: firstAgentKey,
+      prompt: 'Return alpha.',
+      semanticOpts: { model: 'fake-local-model', effort: 'xhigh' },
+    });
+    await writer.append({
+      kind: 'workflow.agent.completed',
+      agentIndex: 0,
+      agentId: 'agent_1',
+      agentCallKey: firstAgentKey,
+      result: 'ALPHA',
+      usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+      toolCalls: 0,
+    });
+    await writer.append({
+      kind: 'workflow.run.completed',
+      result: 'ALPHA',
+      resultPath: '/tmp/result.json',
+      agentCount: 1,
+      usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+      toolCalls: 0,
+      durationMs: 1,
+    });
+    const entries = (await readFile(journalPath, 'utf8')).trimEnd().split('\n').map((line) => JSON.parse(line));
+
+    const wrongKeyEntries = rehashJournalEntries(entries.map((entry) => {
+      if (entry.kind === 'workflow.agent.started' || entry.kind === 'workflow.agent.completed') {
+        return { ...entry, agentCallKey: 'a'.repeat(64) };
+      }
+      return entry;
+    }));
+    await writeJournalEntries(join(root, 'wrong-key.jsonl'), wrongKeyEntries);
+    await assert.rejects(
+      () => readWorkflowJournal(join(root, 'wrong-key.jsonl')),
+      /agent call key derivation mismatch/,
+    );
+
+    const wrongIndexEntries = rehashJournalEntries(entries.map((entry) => (
+      entry.kind === 'workflow.agent.completed'
+        ? { ...entry, agentIndex: 7 }
+        : entry
+    )));
+    await writeJournalEntries(join(root, 'wrong-index.jsonl'), wrongIndexEntries);
+    await assert.rejects(
+      () => readWorkflowJournal(join(root, 'wrong-index.jsonl')),
+      /agent final index mismatch/,
+    );
+
+    const openAgentCompletedEntries = rehashJournalEntries([entries[0], entries[1], entries[3]]);
+    await writeJournalEntries(join(root, 'open-agent-completed.jsonl'), openAgentCompletedEntries);
+    await assert.rejects(
+      () => readWorkflowJournal(join(root, 'open-agent-completed.jsonl')),
+      /unfinalized agent/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+function rehashJournalEntries(entries) {
+  let previousEntryHash = '0'.repeat(64);
+  return entries.map((entry, index) => {
+    const { entryHash: _entryHash, ...withoutHash } = {
+      ...entry,
+      seq: index + 1,
+      previousEntryHash,
+    };
+    const entryHash = workflowJournalHash(withoutHash);
+    previousEntryHash = entryHash;
+    return { ...withoutHash, entryHash };
+  });
+}
+
+async function writeJournalEntries(path, entries) {
+  await writeFile(path, `${entries.map((entry) => JSON.stringify(entry)).join('\n')}\n`);
+}

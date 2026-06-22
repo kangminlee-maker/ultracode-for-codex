@@ -1,0 +1,20 @@
+{
+  "workflow": {
+    "executionMode": "background",
+    "progress": "jsonl",
+    "permission": "ask",
+    "retryLimit": 0,
+    "timeoutMs": 0,
+    "background": {
+      "runDir": ".ultracode-for-codex/background/{jobId}",
+      "resultFile": "result.json",
+      "progressFile": "progress.jsonl",
+      "metadataFile": "metadata.json",
+      "pidFile": "pid"
+    }
+  },
+  "codex": {
+    "reasoningEffort": "xhigh",
+    "verbosity": "medium"
+  }
+}

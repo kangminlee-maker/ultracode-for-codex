@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ultracode for Codex"
+  short_description: "Operate the Ultracode for Codex npm runtime safely."
+  default_prompt: "Use the Ultracode for Codex npm package as the runtime and follow its local CLI boundaries."

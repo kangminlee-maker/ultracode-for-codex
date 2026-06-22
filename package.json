@@ -1,0 +1,79 @@
+{
+  "name": "ultracode-for-codex",
+  "version": "0.2.6",
+  "description": "Run local Codex-backed workflows from a command-owned CLI runtime.",
+  "keywords": [
+    "codex",
+    "workflow",
+    "cli",
+    "automation",
+    "subagents"
+  ],
+  "homepage": "https://github.com/kangminlee-maker/ultracode-for-codex#readme",
+  "bugs": {
+    "url": "https://github.com/kangminlee-maker/ultracode-for-codex/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kangminlee-maker/ultracode-for-codex.git"
+  },
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "ultracode-for-codex": "dist/cli.js"
+  },
+  "exports": {
+    ".": "./dist/cli.js",
+    "./ultracode-install-guide": "./dist/ultracode-install-guide.js",
+    "./settings": "./dist/settings.js"
+  },
+  "files": [
+    "ULTRACODE_INSTALL.md",
+    "postinstall.mjs",
+    "dist/cli.js",
+    "dist/cli.d.ts",
+    "dist/ultracode-install-guide.js",
+    "dist/ultracode-install-guide.d.ts",
+    "dist/settings.js",
+    "dist/settings.d.ts",
+    "dist/runtime/package-info.js",
+    "dist/runtime/package-info.d.ts",
+    "dist/codex/",
+    "dist/runtime/",
+    "skills/ultracode-for-codex/",
+    "settings.json",
+    "README.md",
+    "docs/provenance-audit.md",
+    "docs/ultracode-p3a-journal-design.md",
+    "docs/ultracode-p3b-resume-cache.md",
+    "docs/ultracode-p3c-worktree-isolation.md"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.json && chmod 755 dist/cli.js",
+    "verify:runtime-boundary": "node scripts/verify-runtime-boundary.mjs",
+    "prepack": "npm run build && npm run verify:runtime-boundary",
+    "postinstall": "node postinstall.mjs",
+    "prepublishOnly": "npm run test:all",
+    "pack:ultracode-for-codex": "node scripts/package-ultracode-for-codex.mjs",
+    "publish:dry-run": "npm publish --dry-run --access public",
+    "publish:npm": "npm publish --access public",
+    "publish:npm:provenance": "npm publish --access public --provenance",
+    "test:e2e:ultracode-for-codex": "node scripts/e2e-installed-ultracode-for-codex.mjs",
+    "test:all": "npm test && npm run test:e2e:ultracode-for-codex",
+    "test": "npm run build && npm run verify:runtime-boundary && node --test --test-concurrency=2 test/*.test.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "run": "npm run build && node dist/cli.js run --accept-llm-guide=v1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "packageManager": "npm@11.12.1"
+}

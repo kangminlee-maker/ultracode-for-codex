@@ -1,0 +1,4529 @@
+import { execFile } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { chmod, mkdir, readdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { promisify } from 'node:util';
+import { createContext, runInContext } from 'node:vm';
+import type { SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage } from './types.js';
+import { UltracodeRequestError, estimateTokens } from './types.js';
+import {
+  WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+  WORKFLOW_JOURNAL_WRITE_FAILED_REASON,
+  WorkflowJournalError,
+  WorkflowJournalWriter,
+  computeWorkflowAgentCallKey,
+  isWorkflowJournalError,
+  normalizeJournalJsonValue,
+  readWorkflowJournal,
+  workflowJournalPath,
+} from './workflow-journal.js';
+import type {
+  JsonValue,
+  WorkflowAgentSemanticOpts,
+  WorkflowJournalEntry,
+  WorkflowJournalDurability,
+  WorkflowJournalUsage,
+} from './workflow-journal.js';
+
+export type WorkflowTaskStatus = 'running' | 'completed' | 'failed';
+export type WorkflowTaskType = 'local_workflow';
+export type WorkflowSource = 'inline' | 'script_path' | 'project' | 'user' | 'plugin' | 'built_in';
+export type WorkflowPermissionDecision = 'allow' | 'deny';
+type AgentIsolation = 'worktree';
+
+export interface WorkflowPlanAgent {
+  readonly id?: string;
+  readonly title: string;
+  readonly focus?: string;
+  readonly label?: string;
+}
+
+export interface WorkflowPlanPhase {
+  readonly id?: string;
+  readonly title: string;
+  readonly goal?: string;
+  readonly agents: readonly WorkflowPlanAgent[];
+}
+
+interface WorkflowExecutionPlan {
+  readonly mode: string;
+  readonly rationale?: string;
+  readonly phases: readonly WorkflowPlanPhase[];
+}
+
+export type WorkflowEvent =
+  | {
+      readonly type: 'workflow.started';
+      readonly taskId: string;
+      readonly runId: string;
+      readonly workflowName: string;
+      readonly scriptPath: string;
+      readonly workflowSource: WorkflowSource;
+      readonly workflowSourcePath?: string;
+      readonly scriptHash: string;
+    }
+  | {
+      readonly type: 'workflow.phase.started';
+      readonly taskId: string;
+      readonly runId: string;
+      readonly phaseIndex: number;
+      readonly title: string;
+      readonly detail?: string;
+      readonly goal?: string;
+      readonly plannedAgentCount?: number;
+      readonly plannedAgents?: readonly WorkflowPlanAgent[];
+    }
+  | {
+      readonly type: 'workflow.plan.ready';
+      readonly taskId: string;
+      readonly runId: string;
+      readonly mode: string;
+      readonly rationale?: string;
+      readonly phases: readonly WorkflowPlanPhase[];
+    }
+  | {
+      readonly type: 'workflow.phase.planned';
+      readonly taskId: string;
+      readonly runId: string;
+      readonly phaseIndex: number;
+      readonly title: string;
+      readonly goal?: string;
+      readonly plannedAgentCount: number;
+      readonly plannedAgents: readonly WorkflowPlanAgent[];
+    }
+  | {
+      readonly type: 'workflow.log';
+      readonly taskId: string;
+      readonly runId: string;
+      readonly message: string;
+    }
+  | {
+      readonly type: 'workflow.agent.started';
+      readonly taskId: string;
+      readonly runId: string;
+      readonly agentIndex: number;
+      readonly agentId: string;
+      readonly label: string;
+      readonly phase?: string;
+      readonly promptPreview: string;
+    }
+  | {
+      readonly type: 'workflow.agent.completed';
+      readonly taskId: string;
+      readonly runId: string;
+      readonly agentIndex: number;
+      readonly agentId: string;
+      readonly label: string;
+      readonly phase?: string;
+      readonly tokens: number;
+      readonly toolCalls: number;
+      readonly resultPreview?: string;
+      readonly cached?: boolean;
+      readonly elapsedMs: number;
+      readonly completedAgentCount: number;
+      readonly knownAgentCount: number;
+      readonly phaseCompletedAgentCount?: number;
+      readonly phaseKnownAgentCount?: number;
+      readonly worktreePath?: string;
+      readonly worktreePreserved?: boolean;
+      readonly preservedWorktrees?: readonly WorkflowAgentPreservedWorktree[];
+    }
+  | {
+      readonly type: 'workflow.agent.failed';
+      readonly taskId: string;
+      readonly runId: string;
+      readonly agentIndex: number;
+      readonly agentId: string;
+      readonly label: string;
+      readonly phase?: string;
+      readonly error: string;
+      readonly skipped?: boolean;
+      readonly worktreePath?: string;
+      readonly worktreePreserved?: boolean;
+      readonly preservedWorktrees?: readonly WorkflowAgentPreservedWorktree[];
+    }
+  | {
+      readonly type: 'workflow.completed';
+      readonly taskId: string;
+      readonly runId: string;
+      readonly resultPath: string;
+      readonly agentCount: number;
+      readonly tokens: number;
+      readonly toolCalls: number;
+      readonly durationMs: number;
+    }
+  | {
+      readonly type: 'workflow.failed';
+      readonly taskId: string;
+      readonly runId: string;
+      readonly error: string;
+      readonly recovery?: { readonly retryable: boolean; readonly reason: string };
+    };
+
+export interface WorkflowLaunchInput {
+  readonly script?: string;
+  readonly name?: string;
+  readonly scriptPath?: string;
+  readonly args?: unknown;
+  readonly resumeFromRunId?: string;
+  readonly toolName?: string;
+}
+
+export type WorkflowLaunchResult = WorkflowAsyncLaunchResult | WorkflowPermissionRequiredResult;
+
+export interface WorkflowAsyncLaunchResult {
+  readonly status: 'async_launched';
+  readonly taskId: string;
+  readonly taskType: 'local_workflow';
+  readonly workflowName: string;
+  readonly runId: string;
+  readonly summary?: string;
+  readonly transcriptDir: string;
+  readonly scriptPath: string;
+  readonly workflowSource: WorkflowSource;
+  readonly workflowSourcePath?: string;
+  readonly scriptHash: string;
+}
+
+export interface WorkflowPermissionRequiredResult {
+  readonly status: 'permission_required';
+  readonly taskType: WorkflowTaskType;
+  readonly workflowName: string;
+  readonly summary?: string;
+  readonly workflowSource: WorkflowSource;
+  readonly workflowSourcePath?: string;
+  readonly scriptHash: string;
+  readonly permissionRequestId: string;
+  readonly review: WorkflowPermissionReview;
+}
+
+export interface WorkflowPermissionDeniedResult {
+  readonly status: 'permission_denied';
+  readonly taskType: WorkflowTaskType;
+  readonly workflowName: string;
+  readonly workflowSource: WorkflowSource;
+  readonly workflowSourcePath?: string;
+  readonly scriptHash: string;
+  readonly permissionRequestId: string;
+  readonly reason: 'workflow_permission_denied';
+}
+
+export interface WorkflowPermissionReview {
+  readonly permissionRequestId: string;
+  readonly reviewVersion: number;
+  readonly workflowName: string;
+  readonly summary?: string;
+  readonly workflowSource: WorkflowSource;
+  readonly workflowSourcePath?: string;
+  readonly scriptHash: string;
+  readonly phases: readonly string[];
+  readonly requestedIsolationModes: readonly string[];
+  readonly dynamicIsolation: boolean;
+  readonly riskSummary: string;
+  readonly scriptPreview: string;
+}
+
+export interface WorkflowTaskSnapshot {
+  readonly taskId: string;
+  readonly runId: string;
+  readonly workflowName: string;
+  readonly status: WorkflowTaskStatus;
+  readonly taskType: WorkflowTaskType;
+  readonly transcriptDir: string;
+  readonly scriptPath: string;
+  readonly workflowSource: WorkflowSource;
+  readonly workflowSourcePath?: string;
+  readonly scriptHash: string;
+  readonly resultPath?: string;
+  readonly result?: unknown;
+  readonly error?: string;
+  readonly failureReason?: string;
+  readonly events: readonly WorkflowEvent[];
+}
+
+export interface WorkflowRuntime {
+  launch(input: WorkflowLaunchInput): Promise<WorkflowLaunchResult>;
+  get(taskId: string): WorkflowTaskSnapshot | null;
+  cancel(taskId: string): Promise<WorkflowTaskSnapshot>;
+  retry(taskId: string): Promise<WorkflowLaunchResult>;
+  getPermissionRequest(permissionRequestId: string): WorkflowPermissionReview | null;
+  approvePermissionRequest(permissionRequestId: string): Promise<WorkflowLaunchResult>;
+  denyPermissionRequest(permissionRequestId: string): Promise<WorkflowPermissionDeniedResult>;
+  streamEvents(taskId: string, signal?: AbortSignal): AsyncIterable<WorkflowEvent>;
+  close?(): Promise<void>;
+}
+
+interface WorkflowTaskMutable {
+  taskId: string;
+  runId: string;
+  workflowName: string;
+  status: WorkflowTaskStatus;
+  taskType: WorkflowTaskType;
+  transcriptDir: string;
+  scriptPath: string;
+  workflowSource: WorkflowSource;
+  workflowSourcePath?: string;
+  scriptHash: string;
+  isolationReview: WorkflowIsolationReview;
+  startedAt: number;
+  journal: WorkflowJournalWriter;
+  resultPath?: string;
+  result?: unknown;
+  error?: string;
+  failureReason?: string;
+  events: WorkflowEvent[];
+  waiters: Array<() => void>;
+  terminalEmitted: boolean;
+  terminalFinalization?: Promise<WorkflowTaskSnapshot>;
+  runPromise?: Promise<void>;
+  abortRequested?: boolean;
+  abortFailure?: { readonly message: string; readonly reason: string };
+  retryInput: ResolvedWorkflowLaunchInput;
+  controller?: AbortController;
+}
+
+type ResolvedWorkflowLaunchInput = Required<Pick<WorkflowLaunchInput, 'script'>> & WorkflowLaunchInput & {
+  readonly workflowSource: WorkflowSource;
+  readonly workflowSourcePath?: string;
+  readonly scriptMetadata?: WorkflowScriptMetadata;
+};
+
+interface ParsedWorkflowScript {
+  readonly meta: WorkflowMeta;
+  readonly body: string;
+  readonly metaLiteral: string;
+}
+
+interface WorkflowMeta {
+  readonly name: string;
+  readonly description?: string;
+  readonly phases?: readonly {
+    readonly title: string;
+    readonly detail?: string;
+  }[];
+}
+
+interface WorkflowRunContext {
+  readonly task: WorkflowTaskMutable;
+  readonly parsed: ParsedWorkflowScript;
+  readonly input: WorkflowLaunchInput;
+  readonly isolationReview: WorkflowIsolationReview;
+  readonly resumeCache?: WorkflowResumeCache;
+  readonly startedAt: number;
+  readonly model: string;
+  inputTokens: number;
+  outputTokens: number;
+  agentCount: number;
+  tokens: number;
+  toolCalls: number;
+  readonly controller: AbortController;
+  readonly timers: Map<number, ReturnType<typeof setTimeout>>;
+  readonly asyncFinalizers: Set<Promise<void>>;
+  nextTimerId: number;
+  previousAgentCallKey: string;
+  currentPhase?: string;
+  announcedPlan?: WorkflowExecutionPlan;
+  pendingPhasePlan?: WorkflowPlanPhase;
+  toVmValue?: (value: unknown) => unknown;
+}
+
+interface WorkflowVmGlobals {
+  readonly argsLiteral: string;
+  readonly budgetLiteral: string;
+  readonly host: Record<string, unknown>;
+  readonly setVmValueProjector: (projector: (value: unknown) => unknown) => void;
+}
+
+type HandledWorkflowPromise<T> = PromiseLike<T> & {
+  then<TResult1 = T, TResult2 = never>(
+    onfulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): HandledWorkflowPromise<TResult1 | TResult2>;
+  catch<TResult = never>(
+    onrejected?: ((reason: unknown) => TResult | PromiseLike<TResult>) | null,
+  ): HandledWorkflowPromise<T | TResult>;
+  finally(onfinally?: (() => void) | null): HandledWorkflowPromise<T>;
+};
+
+interface WorkflowPromiseTracking {
+  handled: boolean;
+  projectValue(value: unknown): unknown;
+  trackPromise<T>(promise: Promise<T>): HandledWorkflowPromise<T>;
+}
+
+interface WorkflowTaskRegistryOptions {
+  readonly backend: SubagentBackend;
+  readonly cwd?: string;
+  readonly stateDir?: string;
+  readonly requestTimeoutMs: number;
+  readonly agentStallTimeoutMs?: number;
+  readonly agentStallRetryLimit?: number;
+  readonly userWorkflowDirs?: readonly string[];
+  readonly pluginWorkflows?: readonly WorkflowPluginRegistry[];
+  readonly builtinWorkflows?: readonly BuiltinWorkflow[];
+  readonly journalDurability?: WorkflowJournalDurability;
+}
+
+interface WorkflowPluginRegistry {
+  readonly pluginName: string;
+  readonly workflowsDir?: string;
+  readonly workflowsDirs?: readonly string[];
+  readonly workflowsPath?: string;
+  readonly workflowsPaths?: readonly string[];
+}
+
+interface BuiltinWorkflow {
+  readonly name: string;
+  readonly script: string;
+}
+
+interface WorkflowScriptMetadata {
+  readonly version: 1;
+  readonly workflowName: string;
+  readonly workflowSource: WorkflowSource;
+  readonly workflowSourcePath?: string;
+  readonly scriptHash: string;
+  readonly permissionKey?: string;
+}
+
+interface WorkspaceContextOptions {
+  readonly query?: string;
+  readonly files: readonly string[];
+  readonly maxFiles: number;
+  readonly maxFileBytes: number;
+  readonly maxBytes: number;
+}
+
+interface WorkflowPermissionRequestMutable {
+  readonly permissionRequestId: string;
+  readonly permissionKey: string;
+  readonly input: WorkflowLaunchInput;
+  readonly review: WorkflowPermissionReview;
+}
+
+interface WorkflowPermissionRecord {
+  readonly permissionKey: string;
+  readonly decision: WorkflowPermissionDecision;
+  readonly reviewVersion?: number;
+  readonly workflowName: string;
+  readonly workflowSource: WorkflowSource;
+  readonly workflowSourcePath?: string;
+  readonly scriptHash: string;
+  readonly requestedIsolationModes?: readonly string[];
+  readonly dynamicIsolation?: boolean;
+  readonly isolationReviewFingerprint?: string;
+  readonly decidedAt: string;
+}
+
+interface WorkflowPermissionStore {
+  readonly version: 1;
+  readonly decisions: readonly WorkflowPermissionRecord[];
+}
+
+interface WorkflowResumePlan {
+  readonly launchInput: WorkflowLaunchInput;
+  readonly sourceTask?: WorkflowTaskMutable;
+}
+
+interface WorkflowResumeCache {
+  readonly entries: readonly WorkflowResumeAgentCacheEntry[];
+  nextIndex: number;
+  prefixOpen: boolean;
+}
+
+interface WorkflowResumeAgentCacheEntry {
+  readonly agentCallKey: string;
+  readonly result: JsonValue;
+}
+
+interface WorkflowAgentWorktree {
+  readonly gitRoot: string;
+  readonly path: string;
+  readonly attemptIndex: number;
+}
+
+export interface WorkflowAgentPreservedWorktree {
+  readonly path: string;
+  readonly attemptIndex: number;
+  readonly reason: 'clean' | 'changed' | 'stalled' | 'aborted' | 'status_unavailable';
+}
+
+interface WorkflowAgentWorktreeFinalization {
+  readonly preserved: boolean;
+  readonly preservedWorktree?: WorkflowAgentPreservedWorktree;
+}
+
+interface WorkflowAgentAttemptOutcome {
+  readonly result: SubagentResult;
+  readonly worktreeFinalization?: WorkflowAgentWorktreeFinalization;
+}
+
+interface AgentOptions {
+  readonly label?: string;
+  readonly model?: string;
+  readonly phase?: string;
+  readonly schema?: unknown;
+  readonly isolation?: unknown;
+}
+
+const MAX_SCRIPT_BYTES = 64 * 1024;
+const MAX_AGENT_CALLS = 1000;
+const MAX_PARALLELISM = 16;
+const DEFAULT_AGENT_STALL_RETRY_LIMIT = 5;
+const DEFAULT_WORKSPACE_CONTEXT_MAX_FILES = 24;
+const DEFAULT_WORKSPACE_CONTEXT_MAX_FILE_BYTES = 12_000;
+const DEFAULT_WORKSPACE_CONTEXT_MAX_BYTES = 80_000;
+const execFileAsync = promisify(execFile);
+const PROJECT_WORKFLOW_DIRS = ['.codex/workflows'];
+const WORKFLOW_PERMISSION_REQUIRED_SOURCES = new Set<WorkflowSource>(['script_path', 'project', 'user', 'plugin']);
+const WORKFLOW_PERMISSION_STORE_VERSION = 1;
+const WORKFLOW_PERMISSION_REVIEW_VERSION = 2;
+const WORKFLOW_STATE_DIR_MODE = 0o700;
+const WORKFLOW_STATE_FILE_MODE = 0o600;
+const WORKFLOW_TOOL_NAMES = new Set(['Workflow', 'RunWorkflow']);
+const STRUCTURED_OUTPUT_TOOL_NAME = 'StructuredOutput';
+const WORKFLOW_INPUT_PARAM = 'workflow';
+const WORKFLOW_JOURNAL_PUBLIC_FAILURE_MESSAGE = 'Workflow journal write failed.';
+const WORKFLOW_STABLE_FAILURE_CODES = new Set([
+  WORKFLOW_JOURNAL_WRITE_FAILED_REASON,
+  'runtime_closed',
+  'workflow_aborted',
+  'workflow_agent_stalled',
+  'workflow_input_invalid',
+  'workflow_meta_invalid',
+  'workflow_permission_denied',
+  'workflow_resume_running',
+  'workflow_script_nondeterministic',
+  'workflow_structured_output_failed',
+]);
+const FORBIDDEN_HOST_PROPERTY_NAMES = new Set(['constructor', 'prototype', '__proto__', 'process', 'require', 'globalThis', 'global', 'module', 'exports']);
+const JSON_SCHEMA_TYPES = new Set(['object', 'array', 'string', 'number', 'integer', 'boolean', 'null']);
+const JSON_SCHEMA_KEYS = new Set([
+  '$schema',
+  'additionalProperties',
+  'description',
+  'enum',
+  'items',
+  'maximum',
+  'maxItems',
+  'maxLength',
+  'minimum',
+  'minItems',
+  'minLength',
+  'properties',
+  'required',
+  'title',
+  'type',
+]);
+const WORKSPACE_CONTEXT_EXCLUDED_DIRS = new Set([
+  '.git',
+  '.next',
+  '.turbo',
+  '.ultracode-for-codex',
+  'artifacts',
+  'build',
+  'coverage',
+  'dist',
+  'node_modules',
+  'out',
+]);
+const WORKSPACE_CONTEXT_ALLOWED_EXTENSIONS = new Set([
+  '.cjs',
+  '.css',
+  '.go',
+  '.html',
+  '.js',
+  '.json',
+  '.jsx',
+  '.md',
+  '.mjs',
+  '.py',
+  '.rs',
+  '.sh',
+  '.toml',
+  '.ts',
+  '.tsx',
+  '.txt',
+  '.yaml',
+  '.yml',
+]);
+const WORKSPACE_CONTEXT_PRIORITY_FILES = new Set([
+  'AGENTS.md',
+  'CONTRACT.md',
+  'IMPLEMENTATION_MAP.html',
+  'README.md',
+  'SKILL.md',
+  'ULTRACODE_INSTALL.md',
+  'package.json',
+  'tsconfig.json',
+]);
+const DYNAMIC_WORKFLOW_PATTERN_GUIDANCE = [
+  'Use dynamic workflow patterns intentionally:',
+  '- classify-and-act: classify the request, risk, or repository area before choosing phase shape.',
+  '- fan-out-and-synthesize: split independent lenses across parallel agents, then merge evidence.',
+  '- adversarial verification: assign at least one agent to challenge correctness, security, or assumptions on high-risk work.',
+  '- generate-and-filter: create candidate approaches or fixes, then select by evidence and constraints.',
+  '- tournament: compare competing alternatives when the best path is unclear.',
+  '- loop-until-done: iterate repair and verification only when there is a clear stop condition.',
+  'Prefer pipelines when later phases need earlier summaries; prefer parallel agents when independent evidence can be gathered at the same time.',
+].join('\n');
+const DEFAULT_BUILTIN_WORKFLOWS: readonly BuiltinWorkflow[] = [
+  {
+    name: 'task',
+    script: phaseWiseBuiltinWorkflowScript({
+      name: 'task',
+      description: 'Run an LLM-planned phase-wise parallel task workflow',
+      defaultPrompt: 'Complete the requested repository task.',
+      plannerKind: 'general task',
+      plannerGuidance: 'Plan phases that make the work faster and more accurate through parallel agents. Default to phase_parallel. Choose single only for tiny changes, strictly sequential investigations, or one indivisible failure mode. Pick workflow patterns that match the request instead of using one fixed shape.',
+      agentGuidance: 'Complete the assigned phase work. Prefer concrete evidence, file paths, commands, and risks over broad narration.',
+      finalGuidance: 'Return the completed task result, key evidence, decisions made, verification status, and residual risk.',
+    }),
+  },
+  {
+    name: 'code-review',
+    script: phaseWiseBuiltinWorkflowScript({
+      name: 'code-review',
+      description: 'Run an LLM-planned phase-wise parallel code review workflow',
+      defaultPrompt: 'Review the current repository for correctness risks.',
+      plannerKind: 'code review',
+      plannerGuidance: 'Plan an effective code review. Default to phase_parallel with multiple focused reviewers per phase. Commonly useful lenses include runtime correctness, security/capability boundaries, API/CLI contracts, persistence/retry/cancel behavior, and test coverage. Prefer fan-out-and-synthesize plus adversarial verification unless the diff is tiny or one indivisible failure mode.',
+      agentGuidance: 'Return material findings only. Prioritize root cause, severity, exact file/line evidence, reproduction or impact, and residual risk.',
+      finalGuidance: 'Return findings ordered by severity with exact file/line references. Deduplicate overlaps, preserve dissent or uncertainty, and say clearly if there are no material findings.',
+    }),
+  },
+  {
+    name: 'batch',
+    script: `export const meta = {
+  name: "batch",
+  description: "Run explicitly supplied prompts in one parallel phase"
+};
+const input = args && typeof args === "object" ? args : {};
+const prompts = Array.isArray(input.prompts) ? input.prompts : [];
+if (prompts.length > 0) {
+  announcePhasePlan({
+    title: "Batch",
+    agents: prompts.map((_, index) => ({
+      title: "Batch " + (index + 1),
+      label: "batch-" + (index + 1)
+    }))
+  });
+}
+phase("Batch");
+return await parallel(prompts.map((prompt, index) => () => agent(
+  prompt == null ? "" : "" + prompt,
+  { label: "batch-" + (index + 1) }
+)));`,
+  },
+];
+
+function phaseWiseBuiltinWorkflowScript(input: {
+  readonly name: string;
+  readonly description: string;
+  readonly defaultPrompt: string;
+  readonly plannerKind: string;
+  readonly plannerGuidance: string;
+  readonly agentGuidance: string;
+  readonly finalGuidance: string;
+}): string {
+  return `export const meta = {
+  name: ${JSON.stringify(input.name)},
+  description: ${JSON.stringify(input.description)}
+};
+const workflowInput = args && typeof args === "object" ? args : {};
+const prompt = typeof workflowInput.prompt === "string" && workflowInput.prompt.trim()
+  ? workflowInput.prompt
+  : ${JSON.stringify(input.defaultPrompt)};
+const context = await workspaceContext({ query: prompt });
+const plan = await agent([
+  ${JSON.stringify(`Plan the phase-wise execution strategy for ${input.plannerKind}.`)},
+  "",
+  ${JSON.stringify(input.plannerGuidance)},
+  "",
+  ${JSON.stringify(DYNAMIC_WORKFLOW_PATTERN_GUIDANCE)},
+  "A phase runs after previous phase summaries are available. Within each phase, use parallel agents by default.",
+  "Return 1 to 4 phases. For ordinary work, prefer 2 phases with 2 to 4 parallel agents each. Use concise stable ids.",
+  "",
+  "User request:",
+  prompt,
+  "",
+  context
+].join("\\n"), {
+  label: ${JSON.stringify(`${input.name}-planner`)},
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      mode: { type: "string", enum: ["phase_parallel", "single"] },
+      rationale: { type: "string", minLength: 1 },
+      phases: {
+        type: "array",
+        minItems: 1,
+        maxItems: 4,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            id: { type: "string", minLength: 1, maxLength: 32 },
+            title: { type: "string", minLength: 1, maxLength: 80 },
+            goal: { type: "string", minLength: 1, maxLength: 800 },
+            agents: {
+              type: "array",
+              minItems: 1,
+              maxItems: 4,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  id: { type: "string", minLength: 1, maxLength: 32 },
+                  title: { type: "string", minLength: 1, maxLength: 80 },
+                  focus: { type: "string", minLength: 1, maxLength: 800 }
+                },
+                required: ["id", "title", "focus"]
+              }
+            }
+          },
+          required: ["id", "title", "goal", "agents"]
+        }
+      }
+    },
+    required: ["mode", "rationale", "phases"]
+  }
+});
+const selectedPhases = plan.mode === "single" ? [plan.phases[0]] : plan.phases;
+function plannedPhaseFor(phasePlan) {
+  return {
+    id: phasePlan.id,
+    title: phasePlan.title,
+    goal: phasePlan.goal,
+    agents: (plan.mode === "single" ? [phasePlan.agents[0]] : phasePlan.agents).map((phaseAgent) => ({
+      id: phaseAgent.id,
+      title: phaseAgent.title,
+      focus: phaseAgent.focus,
+      label: plan.mode === "single"
+        ? ${JSON.stringify(`${input.name}-single`)}
+        : ${JSON.stringify(`${input.name}-`)} + phasePlan.id + "-" + phaseAgent.id
+    }))
+  };
+}
+const firstPhasePlan = plannedPhaseFor(selectedPhases[0]);
+announcePlan({
+  mode: plan.mode,
+  rationale: plan.rationale,
+  phases: [firstPhasePlan]
+});
+if (plan.mode === "single") {
+  const singlePhase = firstPhasePlan;
+  const singleAgent = singlePhase.agents[0];
+  announcePhasePlan(singlePhase);
+  phase(singlePhase.title);
+  return await agent([
+    "Single-agent execution selected by the LLM planner.",
+    "Planner rationale: " + plan.rationale,
+    "Phase goal: " + singlePhase.goal,
+    "Agent focus: " + singleAgent.title + " - " + singleAgent.focus,
+    "",
+    "Original request:",
+    prompt,
+    "",
+    ${JSON.stringify(input.agentGuidance)},
+    "",
+    "Use the deterministic workspace context below as primary evidence. Mention any missing evidence explicitly.",
+    "",
+    context
+  ].join("\\n"), { label: ${JSON.stringify(`${input.name}-single`)}, phase: singlePhase.title });
+}
+const phaseOutputs = [];
+const priorSummaries = [];
+for (const rawPhasePlan of selectedPhases) {
+  const phasePlan = plannedPhaseFor(rawPhasePlan);
+  announcePhasePlan(phasePlan);
+  phase(phasePlan.title);
+  const agents = phasePlan.agents;
+  const agentOutputs = agents.length < 2
+    ? [await agent([
+        "Parallel phase agent: " + agents[0].title,
+        "Phase: " + phasePlan.title,
+        "Phase goal: " + phasePlan.goal,
+        "Agent focus: " + agents[0].focus,
+        "",
+        "Previous phase summaries:",
+        JSON.stringify(priorSummaries, null, 2),
+        "",
+        "Original request:",
+        prompt,
+        "",
+        ${JSON.stringify(input.agentGuidance)},
+        "",
+        "Use the deterministic workspace context below as primary evidence. Mention any missing evidence explicitly.",
+        "",
+        context
+      ].join("\\n"), { label: ${JSON.stringify(`${input.name}-`)} + phasePlan.id + "-" + agents[0].id, phase: phasePlan.title })]
+    : await parallel(agents.map((phaseAgent) => () => agent([
+        "Parallel phase agent: " + phaseAgent.title,
+        "Phase: " + phasePlan.title,
+        "Phase goal: " + phasePlan.goal,
+        "Agent focus: " + phaseAgent.focus,
+        "",
+        "Previous phase summaries:",
+        JSON.stringify(priorSummaries, null, 2),
+        "",
+        "Original request:",
+        prompt,
+        "",
+        ${JSON.stringify(input.agentGuidance)},
+        "",
+        "Use the deterministic workspace context below as primary evidence. Mention any missing evidence explicitly.",
+        "",
+        context
+      ].join("\\n"), { label: ${JSON.stringify(`${input.name}-`)} + phasePlan.id + "-" + phaseAgent.id, phase: phasePlan.title })));
+  const phaseSummary = await agent([
+    "Synthesize this phase.",
+    "Phase: " + phasePlan.title,
+    "Phase goal: " + phasePlan.goal,
+    "",
+    "Original request:",
+    prompt,
+    "",
+    "Agent outputs:",
+    JSON.stringify(agentOutputs, null, 2),
+    "",
+    "Return a concise phase summary with material findings, completed work, open questions, and what the next phase should know."
+  ].join("\\n"), { label: ${JSON.stringify(`${input.name}-phase-`)} + phasePlan.id + "-synthesis", phase: phasePlan.title });
+  const phaseRecord = {
+    id: phasePlan.id,
+    title: phasePlan.title,
+    goal: phasePlan.goal,
+    results: agentOutputs,
+    summary: phaseSummary
+  };
+  phaseOutputs.push(phaseRecord);
+  priorSummaries.push({ id: phaseRecord.id, title: phaseRecord.title, summary: phaseRecord.summary });
+}
+return await agent([
+  ${JSON.stringify(`Synthesize the phase-wise ${input.plannerKind} workflow into the final result.`)},
+  "",
+  "Original request:",
+  prompt,
+  "",
+  "Planner rationale:",
+  plan.rationale,
+  "",
+  "Phase outputs:",
+  JSON.stringify(phaseOutputs, null, 2),
+  "",
+  ${JSON.stringify(input.finalGuidance)}
+].join("\\n"), { label: ${JSON.stringify(`${input.name}-final-synthesis`)} });`;
+}
+
+export class WorkflowTaskRegistry implements WorkflowRuntime {
+  private readonly tasks = new Map<string, WorkflowTaskMutable>();
+  private readonly permissionRequests = new Map<string, WorkflowPermissionRequestMutable>();
+  private permissionRecords?: Map<string, WorkflowPermissionRecord>;
+  private closed = false;
+  private readonly stateDir: string;
+  private readonly agentStallTimeoutMs: number;
+  private readonly agentStallRetryLimit: number;
+
+  constructor(private readonly options: WorkflowTaskRegistryOptions) {
+    this.stateDir = options.stateDir ?? join(options.cwd ?? process.cwd(), '.ultracode-for-codex');
+    this.agentStallRetryLimit = normalizeAgentStallRetryLimit(options.agentStallRetryLimit);
+    this.agentStallTimeoutMs = normalizeAgentStallTimeoutMs(
+      options.agentStallTimeoutMs,
+      options.requestTimeoutMs,
+    );
+  }
+
+  async launch(input: WorkflowLaunchInput): Promise<WorkflowLaunchResult> {
+    if (this.closed) throw workflowInputError('Workflow runtime is closed.');
+    const resumePlan = this.prepareResumePlan(input);
+    let resolved = await this.resolveLaunchInput(resumePlan.launchInput);
+    const parsed = parseInlineWorkflowScript(resolved.script);
+    const scriptHash = workflowScriptHash(resolved.script);
+    const isolationReview = workflowRequestedIsolationModes(resolved.script);
+    resolved = await this.resolveTrustedScriptPathMetadata(resolved, parsed, scriptHash, isolationReview);
+    const permissionRequired = await this.workflowPermissionRequired(
+      resumePlan.launchInput,
+      resolved,
+      parsed,
+      scriptHash,
+      isolationReview,
+    );
+    if (permissionRequired) return permissionRequired;
+    const resumeCache = resumePlan.sourceTask
+      ? await this.createResumeCache(resumePlan.sourceTask)
+      : undefined;
+    const taskId = `task_${randomUUID()}`;
+    const runId = `run_${randomUUID()}`;
+    let scriptPath = resolved.scriptPath ?? this.workflowScriptPath(parsed.meta.name, runId);
+    if (!resolved.scriptPath) {
+      scriptPath = await this.persistInlineWorkflowScript(scriptPath, resolved.script);
+      await this.writeWorkflowScriptMetadata(scriptPath, resolved, parsed, scriptHash);
+    }
+    const transcriptDir = join(this.stateDir, 'subagents', 'workflows', runId);
+    const retryInput = { ...resolved, scriptPath };
+    const startedAt = Date.now();
+    const journalArgs = journalJsonValueOrInputError(resumePlan.launchInput.args ?? null, 'workflow args');
+    let journal: WorkflowJournalWriter;
+    try {
+      journal = await WorkflowJournalWriter.create({
+        transcriptDir,
+        taskId,
+        runId,
+        durability: this.options.journalDurability,
+      });
+      await journal.append({
+        kind: 'workflow.run.started',
+        workflowName: parsed.meta.name,
+        workflowSource: resolved.workflowSource,
+        ...(resolved.workflowSourcePath ? { workflowSourcePath: resolved.workflowSourcePath } : {}),
+        scriptPath,
+        scriptHash,
+        args: journalArgs,
+        runtime: {
+          schemaVersion: 1,
+          cwd: this.options.cwd ?? process.cwd(),
+        },
+      });
+      if (!resolved.scriptPath) {
+        await this.recordWorkflowSourceAllow(resolved, parsed, scriptHash, isolationReview);
+      }
+    } catch (err) {
+      throw workflowJournalRequestError(err);
+    }
+    const task: WorkflowTaskMutable = {
+      taskId,
+      runId,
+      workflowName: parsed.meta.name,
+      status: 'running',
+      taskType: 'local_workflow',
+      transcriptDir,
+      scriptPath,
+      workflowSource: resolved.workflowSource,
+      ...(resolved.workflowSourcePath ? { workflowSourcePath: resolved.workflowSourcePath } : {}),
+      scriptHash,
+      isolationReview,
+      startedAt,
+      journal,
+      retryInput,
+      events: [],
+      waiters: [],
+      terminalEmitted: false,
+    };
+    this.tasks.set(taskId, task);
+    this.emit(task, {
+      type: 'workflow.started',
+      taskId,
+      runId,
+      workflowName: task.workflowName,
+      scriptPath,
+      workflowSource: task.workflowSource,
+      ...(task.workflowSourcePath ? { workflowSourcePath: task.workflowSourcePath } : {}),
+      scriptHash,
+    });
+    task.runPromise = this.runTask(task, parsed, retryInput, resumeCache);
+    task.runPromise.catch(() => undefined);
+    return {
+      status: 'async_launched',
+      taskId,
+      taskType: 'local_workflow',
+      workflowName: task.workflowName,
+      runId,
+      summary: parsed.meta.description,
+      transcriptDir,
+      scriptPath,
+      workflowSource: task.workflowSource,
+      ...(task.workflowSourcePath ? { workflowSourcePath: task.workflowSourcePath } : {}),
+      scriptHash,
+    };
+  }
+
+  private prepareResumePlan(input: WorkflowLaunchInput): WorkflowResumePlan {
+    if (!Object.prototype.hasOwnProperty.call(input, 'resumeFromRunId')) {
+      return { launchInput: input };
+    }
+    const resumeFromRunId = normalizeResumeFromRunId(input.resumeFromRunId);
+    const sourceTask = this.workflowTaskByRunId(resumeFromRunId);
+    if (!sourceTask) throw workflowInputError(`Unknown workflow run for resume: ${resumeFromRunId}`);
+    if (sourceTask.status === 'running') throw workflowResumeRunningError(resumeFromRunId);
+    const inheritedArgs = !Object.prototype.hasOwnProperty.call(input, 'args') && sourceTask.retryInput.args !== undefined
+      ? { args: sourceTask.retryInput.args }
+      : {};
+    if (workflowLaunchHasSourceSelector(input)) {
+      return {
+        sourceTask,
+        launchInput: {
+          ...inheritedArgs,
+          ...input,
+          resumeFromRunId,
+        },
+      };
+    }
+    return {
+      sourceTask,
+      launchInput: {
+        ...sourceTask.retryInput,
+        ...inheritedArgs,
+        ...(Object.prototype.hasOwnProperty.call(input, 'args') ? { args: input.args } : {}),
+        ...(input.toolName ? { toolName: input.toolName } : {}),
+        resumeFromRunId,
+      },
+    };
+  }
+
+  private workflowTaskByRunId(runId: string): WorkflowTaskMutable | undefined {
+    for (const task of this.tasks.values()) {
+      if (task.runId === runId) return task;
+    }
+    return undefined;
+  }
+
+  private async createResumeCache(sourceTask: WorkflowTaskMutable): Promise<WorkflowResumeCache> {
+    let entries: readonly WorkflowJournalEntry[];
+    try {
+      entries = (await readWorkflowJournal(workflowJournalPath(sourceTask.transcriptDir))).entries;
+    } catch {
+      throw workflowInputError(`Workflow run cannot be used as a resume source: ${sourceTask.runId}`);
+    }
+    const completedByCallKey = new Map<string, Extract<WorkflowJournalEntry, { kind: 'workflow.agent.completed' }>>();
+    for (const entry of entries) {
+      if (entry.kind === 'workflow.agent.completed') completedByCallKey.set(entry.agentCallKey, entry);
+    }
+    const cacheEntries: WorkflowResumeAgentCacheEntry[] = [];
+    for (const entry of entries) {
+      if (entry.kind !== 'workflow.agent.started') continue;
+      const completed = completedByCallKey.get(entry.agentCallKey);
+      if (!completed) break;
+      cacheEntries.push({
+        agentCallKey: entry.agentCallKey,
+        result: completed.result,
+      });
+    }
+    return {
+      entries: cacheEntries,
+      nextIndex: 0,
+      prefixOpen: true,
+    };
+  }
+
+  private async resolveLaunchInput(input: WorkflowLaunchInput): Promise<ResolvedWorkflowLaunchInput> {
+    const normalized = normalizeLaunchInput(input);
+    if (normalized.scriptPath) {
+      const resolved = await this.readRuntimeWorkflowScript(normalized.scriptPath);
+      return {
+        ...normalized,
+        script: resolved.script,
+        scriptPath: resolved.scriptPath,
+        workflowSource: 'script_path',
+        workflowSourcePath: resolved.scriptPath,
+        ...(resolved.metadata ? { scriptMetadata: resolved.metadata } : {}),
+      };
+    }
+    if (normalized.name) {
+      return {
+        ...normalized,
+        ...await this.resolveNamedWorkflow(normalized.name),
+      };
+    }
+    return {
+      ...normalized,
+      script: normalized.script as string,
+      workflowSource: 'inline',
+    };
+  }
+
+  private async workflowPermissionRequired(
+    input: WorkflowLaunchInput,
+    resolved: ResolvedWorkflowLaunchInput,
+    parsed: ParsedWorkflowScript,
+    scriptHash: string,
+    requestedIsolation: WorkflowIsolationReview,
+  ): Promise<WorkflowPermissionRequiredResult | null> {
+    const permissionSource = resolved.workflowSource;
+    if (!WORKFLOW_PERMISSION_REQUIRED_SOURCES.has(permissionSource)) return null;
+    const permissionKey = workflowPermissionKey(permissionSource, resolved.workflowSourcePath, parsed.meta.name, scriptHash);
+    const existing = await this.workflowPermissionRecord(permissionKey);
+    if (
+      existing?.decision === 'allow'
+      && workflowPermissionRecordMatchesCurrentReview(existing, requestedIsolation)
+    ) {
+      return null;
+    }
+    if (existing?.decision === 'deny') {
+      throw workflowPermissionDeniedError(parsed.meta.name, permissionSource, scriptHash);
+    }
+    const permissionRequestId = workflowPermissionRequestId(permissionKey);
+    const review: WorkflowPermissionReview = {
+      permissionRequestId,
+      reviewVersion: WORKFLOW_PERMISSION_REVIEW_VERSION,
+      workflowName: parsed.meta.name,
+      ...(parsed.meta.description ? { summary: parsed.meta.description } : {}),
+      workflowSource: permissionSource,
+      ...(resolved.workflowSourcePath ? { workflowSourcePath: resolved.workflowSourcePath } : {}),
+      scriptHash,
+      phases: parsed.meta.phases?.map((phase) => phase.title) ?? [],
+      requestedIsolationModes: requestedIsolation.modes,
+      dynamicIsolation: requestedIsolation.dynamic,
+      riskSummary: workflowPermissionRiskSummary(permissionSource, requestedIsolation),
+      scriptPreview: preview(resolved.script, 1600),
+    };
+    this.permissionRequests.set(permissionRequestId, {
+      permissionRequestId,
+      permissionKey,
+      input,
+      review,
+    });
+    return {
+      status: 'permission_required',
+      taskType: 'local_workflow',
+      workflowName: parsed.meta.name,
+      ...(parsed.meta.description ? { summary: parsed.meta.description } : {}),
+      workflowSource: permissionSource,
+      ...(resolved.workflowSourcePath ? { workflowSourcePath: resolved.workflowSourcePath } : {}),
+      scriptHash,
+      permissionRequestId,
+      review,
+    };
+  }
+
+  private async resolveTrustedScriptPathMetadata(
+    resolved: ResolvedWorkflowLaunchInput,
+    parsed: ParsedWorkflowScript,
+    scriptHash: string,
+    isolationReview: WorkflowIsolationReview,
+  ): Promise<ResolvedWorkflowLaunchInput> {
+    if (!resolved.scriptPath || !resolved.scriptMetadata) return resolved;
+    const metadata = resolved.scriptMetadata;
+    if (metadata.scriptHash !== scriptHash || metadata.workflowName !== parsed.meta.name) return resolved;
+    const permissionKey = workflowPermissionKey(
+      metadata.workflowSource,
+      metadata.workflowSourcePath,
+      parsed.meta.name,
+      scriptHash,
+    );
+    if (metadata.permissionKey !== permissionKey) return resolved;
+    const record = await this.workflowPermissionRecord(permissionKey);
+    if (!workflowPermissionRecordMatchesMetadata(record, metadata, parsed.meta.name, scriptHash, isolationReview)) return resolved;
+    const trusted: ResolvedWorkflowLaunchInput = {
+      ...resolved,
+      workflowSource: metadata.workflowSource,
+      scriptMetadata: metadata,
+    };
+    if (metadata.workflowSourcePath) {
+      return { ...trusted, workflowSourcePath: metadata.workflowSourcePath };
+    }
+    const { workflowSourcePath: _ignored, ...withoutSourcePath } = trusted;
+    return withoutSourcePath;
+  }
+
+  getPermissionRequest(permissionRequestId: string): WorkflowPermissionReview | null {
+    return this.permissionRequests.get(permissionRequestId)?.review ?? null;
+  }
+
+  async approvePermissionRequest(permissionRequestId: string): Promise<WorkflowLaunchResult> {
+    const request = this.consumePendingWorkflowPermission(permissionRequestId);
+    await this.recordWorkflowPermission(request, 'allow');
+    return this.launch(request.input);
+  }
+
+  async denyPermissionRequest(permissionRequestId: string): Promise<WorkflowPermissionDeniedResult> {
+    const request = this.consumePendingWorkflowPermission(permissionRequestId);
+    await this.recordWorkflowPermission(request, 'deny');
+    return {
+      status: 'permission_denied',
+      taskType: 'local_workflow',
+      workflowName: request.review.workflowName,
+      workflowSource: request.review.workflowSource,
+      ...(request.review.workflowSourcePath ? { workflowSourcePath: request.review.workflowSourcePath } : {}),
+      scriptHash: request.review.scriptHash,
+      permissionRequestId,
+      reason: 'workflow_permission_denied',
+    };
+  }
+
+  private consumePendingWorkflowPermission(permissionRequestId: string): WorkflowPermissionRequestMutable {
+    const request = this.permissionRequests.get(permissionRequestId);
+    if (!request) throw workflowInputError(`Unknown workflow permission request: ${permissionRequestId}`);
+    this.deletePendingWorkflowPermissions(request.permissionKey);
+    return request;
+  }
+
+  private deletePendingWorkflowPermissions(permissionKey: string): void {
+    for (const [requestId, request] of this.permissionRequests.entries()) {
+      if (request.permissionKey === permissionKey) this.permissionRequests.delete(requestId);
+    }
+  }
+
+  private async workflowPermissionRecord(permissionKey: string): Promise<WorkflowPermissionRecord | undefined> {
+    return (await this.workflowPermissionRecords()).get(permissionKey);
+  }
+
+  private async recordWorkflowPermission(
+    request: WorkflowPermissionRequestMutable,
+    decision: WorkflowPermissionDecision,
+  ): Promise<void> {
+    await this.recordWorkflowPermissionRecord({
+      permissionKey: request.permissionKey,
+      decision,
+      ...workflowPermissionReviewRecordFields(request.review),
+      workflowName: request.review.workflowName,
+      workflowSource: request.review.workflowSource,
+      ...(request.review.workflowSourcePath ? { workflowSourcePath: request.review.workflowSourcePath } : {}),
+      scriptHash: request.review.scriptHash,
+      decidedAt: new Date().toISOString(),
+    });
+  }
+
+  private async recordWorkflowSourceAllow(
+    resolved: ResolvedWorkflowLaunchInput,
+    parsed: ParsedWorkflowScript,
+    scriptHash: string,
+    isolationReview: WorkflowIsolationReview,
+  ): Promise<void> {
+    const permissionKey = workflowPermissionKey(
+      resolved.workflowSource,
+      resolved.workflowSourcePath,
+      parsed.meta.name,
+      scriptHash,
+    );
+    const existing = await this.workflowPermissionRecord(permissionKey);
+    if (
+      existing?.decision === 'allow'
+      && workflowPermissionRecordMatchesCurrentReview(existing, isolationReview)
+    ) {
+      return;
+    }
+    await this.recordWorkflowPermissionRecord({
+      permissionKey,
+      decision: 'allow',
+      ...workflowIsolationReviewRecordFields(isolationReview),
+      workflowName: parsed.meta.name,
+      workflowSource: resolved.workflowSource,
+      ...(resolved.workflowSourcePath ? { workflowSourcePath: resolved.workflowSourcePath } : {}),
+      scriptHash,
+      decidedAt: new Date().toISOString(),
+    });
+  }
+
+  private async recordWorkflowPermissionRecord(record: WorkflowPermissionRecord): Promise<void> {
+    const records = await this.workflowPermissionRecords();
+    records.set(record.permissionKey, record);
+    await this.writeWorkflowPermissionRecords(records);
+  }
+
+  private async workflowPermissionRecords(): Promise<Map<string, WorkflowPermissionRecord>> {
+    if (this.permissionRecords) return this.permissionRecords;
+    const records = new Map<string, WorkflowPermissionRecord>();
+    try {
+      const raw = JSON.parse(await readFile(this.workflowPermissionStorePath(), 'utf8')) as unknown;
+      const store = asRecord(raw);
+      const decisions = store?.decisions;
+      if (Array.isArray(decisions)) {
+        for (const item of decisions) {
+          const record = workflowPermissionRecordFromUnknown(item);
+          if (record) records.set(record.permissionKey, record);
+        }
+      }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT') throw workflowInputError('Workflow permission store cannot be read.');
+    }
+    this.permissionRecords = records;
+    return records;
+  }
+
+  private async writeWorkflowPermissionRecords(records: Map<string, WorkflowPermissionRecord>): Promise<void> {
+    await ensureWorkflowStateDirectory(join(this.stateDir, 'workflows'));
+    const store: WorkflowPermissionStore = {
+      version: WORKFLOW_PERMISSION_STORE_VERSION,
+      decisions: [...records.values()].sort((left, right) => left.permissionKey.localeCompare(right.permissionKey)),
+    };
+    await writeWorkflowStateFile(this.workflowPermissionStorePath(), `${JSON.stringify(store, null, 2)}\n`);
+  }
+
+  private workflowPermissionStorePath(): string {
+    return join(this.stateDir, 'workflows', 'permissions.json');
+  }
+
+  private async resolveNamedWorkflow(name: string): Promise<ResolvedWorkflowLaunchInput> {
+    const available = new Set<string>();
+    const project = await this.findNamedWorkflowInDirs(
+      name,
+      'project',
+      PROJECT_WORKFLOW_DIRS.map((dir) => join(this.options.cwd ?? process.cwd(), dir)),
+      available,
+    );
+    if (project) return project;
+    const user = await this.findNamedWorkflowInDirs(
+      name,
+      'user',
+      this.userWorkflowDirs(),
+      available,
+    );
+    if (user) return user;
+    for (const plugin of this.options.pluginWorkflows ?? []) {
+      const pluginName = plugin.pluginName.trim();
+      if (!pluginName) continue;
+      const pluginWorkflow = await this.findNamedWorkflowInDirs(
+        name,
+        'plugin',
+        pluginWorkflowDirs(plugin),
+        available,
+        pluginName,
+      );
+      if (pluginWorkflow) return pluginWorkflow;
+    }
+    const builtIn = this.findBuiltinWorkflow(name, available);
+    if (builtIn) return builtIn;
+    throw namedWorkflowNotFoundError(name, available);
+  }
+
+  private userWorkflowDirs(): readonly string[] {
+    if (this.options.userWorkflowDirs) return this.options.userWorkflowDirs;
+    const codexHome = process.env.CODEX_HOME?.trim()
+      ? resolve(process.env.CODEX_HOME)
+      : join(homedir(), '.codex');
+    return [
+      join(codexHome, 'workflows'),
+    ];
+  }
+
+  private async findNamedWorkflowInDirs(
+    requestedName: string,
+    workflowSource: Extract<WorkflowSource, 'project' | 'user' | 'plugin'>,
+    dirs: readonly string[],
+    available: Set<string>,
+    prefix?: string,
+  ): Promise<ResolvedWorkflowLaunchInput | null> {
+    for (const dir of dirs) {
+      const files = await workflowScriptFiles(dir);
+      const ordered = [
+        ...files.filter((file) => prefixedWorkflowName(workflowFileName(file), prefix) === requestedName),
+        ...files.filter((file) => prefixedWorkflowName(workflowFileName(file), prefix) !== requestedName),
+      ];
+      for (const file of ordered) {
+        const scriptPath = join(dir, file);
+        const fileName = prefixedWorkflowName(workflowFileName(file), prefix);
+        let script: string;
+        let canonicalPath: string;
+        let parsed: ParsedWorkflowScript;
+        try {
+          canonicalPath = await realpath(scriptPath);
+          script = await readFile(canonicalPath, 'utf8');
+          parsed = parseInlineWorkflowScript(script);
+        } catch (err) {
+          if (fileName === requestedName) throw err;
+          continue;
+        }
+        const metaName = prefixedWorkflowName(parsed.meta.name, prefix);
+        available.add(metaName);
+        if (fileName !== metaName) available.add(fileName);
+        if (fileName === requestedName || metaName === requestedName) {
+          return {
+            name: requestedName,
+            script,
+            workflowSource,
+            workflowSourcePath: canonicalPath,
+          };
+        }
+      }
+    }
+    return null;
+  }
+
+  private findBuiltinWorkflow(
+    requestedName: string,
+    available: Set<string>,
+  ): ResolvedWorkflowLaunchInput | null {
+    for (const workflow of this.options.builtinWorkflows ?? DEFAULT_BUILTIN_WORKFLOWS) {
+      const name = workflow.name.trim();
+      if (!name) continue;
+      available.add(name);
+      if (name !== requestedName) continue;
+      return {
+        name,
+        script: workflow.script,
+        workflowSource: 'built_in',
+      };
+    }
+    return null;
+  }
+
+  private workflowScriptsDir(): string {
+    return join(this.stateDir, 'workflows', 'scripts');
+  }
+
+  private workflowScriptPath(workflowName: string, runId: string): string {
+    return join(this.workflowScriptsDir(), `${workflowScriptSlug(workflowName)}-${runId}.js`);
+  }
+
+  private async persistInlineWorkflowScript(scriptPath: string, script: string): Promise<string> {
+    await ensureWorkflowStateDirectory(this.workflowScriptsDir());
+    await writeWorkflowStateFile(scriptPath, script, { flag: 'wx' });
+    return await realpath(scriptPath);
+  }
+
+  private async writeWorkflowScriptMetadata(
+    scriptPath: string,
+    resolved: ResolvedWorkflowLaunchInput,
+    parsed: ParsedWorkflowScript,
+    scriptHash: string,
+  ): Promise<void> {
+    const metadata: WorkflowScriptMetadata = {
+      version: 1,
+      workflowName: parsed.meta.name,
+      workflowSource: resolved.workflowSource,
+      ...(resolved.workflowSourcePath ? { workflowSourcePath: resolved.workflowSourcePath } : {}),
+      scriptHash,
+      permissionKey: workflowPermissionKey(resolved.workflowSource, resolved.workflowSourcePath, parsed.meta.name, scriptHash),
+    };
+    await writeWorkflowStateFile(workflowScriptMetadataPath(scriptPath), `${JSON.stringify(metadata, null, 2)}\n`, { flag: 'wx' });
+  }
+
+  private async readRuntimeWorkflowScript(
+    scriptPath: string,
+  ): Promise<{ readonly script: string; readonly scriptPath: string; readonly metadata?: WorkflowScriptMetadata }> {
+    const scriptsDir = this.workflowScriptsDir();
+    await ensureWorkflowStateDirectory(scriptsDir);
+    const root = await realpath(scriptsDir);
+    const requested = isAbsolute(scriptPath)
+      ? resolve(scriptPath)
+      : resolve(this.options.cwd ?? process.cwd(), scriptPath);
+    let canonicalScriptPath: string;
+    try {
+      canonicalScriptPath = await realpath(requested);
+    } catch {
+      throw workflowInputError(`Workflow scriptPath not found: ${scriptPath}`);
+    }
+    if (!pathInsideOrEqual(root, canonicalScriptPath)) {
+      throw workflowInputError('scriptPath must point to a runtime-owned workflow script.');
+    }
+    try {
+      const script = await readFile(canonicalScriptPath, 'utf8');
+      const metadata = await this.readWorkflowScriptMetadata(canonicalScriptPath);
+      const currentScriptHash = workflowScriptHash(script);
+      return {
+        script,
+        scriptPath: canonicalScriptPath,
+        ...(metadata.metadata?.scriptHash === currentScriptHash ? metadata : {}),
+      };
+    } catch {
+      throw workflowInputError(`Workflow scriptPath cannot be read: ${scriptPath}`);
+    }
+  }
+
+  private async readWorkflowScriptMetadata(
+    scriptPath: string,
+  ): Promise<{ readonly metadata?: WorkflowScriptMetadata }> {
+    try {
+      const metadata = workflowScriptMetadataFromUnknown(JSON.parse(await readFile(workflowScriptMetadataPath(scriptPath), 'utf8')));
+      return metadata ? { metadata } : {};
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') return {};
+      return {};
+    }
+  }
+
+  get(taskId: string): WorkflowTaskSnapshot | null {
+    const task = this.tasks.get(taskId);
+    if (!task) return null;
+    return workflowTaskSnapshot(task);
+  }
+
+  async cancel(taskId: string): Promise<WorkflowTaskSnapshot> {
+    const task = this.tasks.get(taskId);
+    if (!task) throw workflowInputError(`Unknown workflow task: ${taskId}`);
+    if (task.status === 'running') {
+      task.abortRequested = true;
+      task.abortFailure = { message: 'Workflow cancelled.', reason: 'workflow_aborted' };
+      task.controller?.abort();
+      if (task.runPromise) {
+        await task.runPromise;
+        return workflowTaskSnapshot(task);
+      }
+      return await this.failTask(task, 'Workflow cancelled.', 'workflow_aborted');
+    }
+    return workflowTaskSnapshot(task);
+  }
+
+  async retry(taskId: string): Promise<WorkflowLaunchResult> {
+    const task = this.tasks.get(taskId);
+    if (!task) throw workflowInputError(`Unknown workflow task: ${taskId}`);
+    if (task.status === 'running') {
+      throw new UltracodeRequestError(
+        'Running workflows cannot be retried; cancel or wait for a terminal state first.',
+        409,
+        'invalid_request_error',
+        WORKFLOW_INPUT_PARAM,
+        'workflow_input_invalid',
+      );
+    }
+    return this.launch(task.retryInput);
+  }
+
+  async *streamEvents(taskId: string, signal?: AbortSignal): AsyncIterable<WorkflowEvent> {
+    const task = this.tasks.get(taskId);
+    if (!task) throw workflowInputError(`Unknown workflow task: ${taskId}`);
+    let index = 0;
+    while (true) {
+      while (index < task.events.length) {
+        if (signal?.aborted) return;
+        yield task.events[index] as WorkflowEvent;
+        index += 1;
+      }
+      if (task.status !== 'running') return;
+      if (!await waitForWorkflowTaskEvent(task, signal)) return;
+    }
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+    for (const task of this.tasks.values()) {
+      if (task.status === 'running') {
+        task.abortRequested = true;
+        task.abortFailure = { message: 'Workflow runtime closed.', reason: 'runtime_closed' };
+        task.controller?.abort();
+        if (task.runPromise) {
+          await task.runPromise;
+        } else {
+          await this.failTask(task, 'Workflow runtime closed.', 'runtime_closed');
+        }
+      }
+    }
+    await this.options.backend.close();
+  }
+
+  private async runTask(
+    task: WorkflowTaskMutable,
+    parsed: ParsedWorkflowScript,
+    input: WorkflowLaunchInput,
+    resumeCache?: WorkflowResumeCache,
+  ): Promise<void> {
+    const controller = new AbortController();
+    const ctx: WorkflowRunContext = {
+      task,
+      parsed,
+      input,
+      isolationReview: task.isolationReview,
+      ...(resumeCache ? { resumeCache } : {}),
+      startedAt: task.startedAt,
+      model: this.options.backend.model,
+      inputTokens: 0,
+      outputTokens: 0,
+      agentCount: 0,
+      tokens: 0,
+      toolCalls: 0,
+      controller,
+      timers: new Map(),
+      asyncFinalizers: new Set(),
+      nextTimerId: 1,
+      previousAgentCallKey: WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+    };
+    task.controller = controller;
+    if (task.abortRequested) controller.abort();
+    if (task.status !== 'running') {
+      controller.abort();
+      return;
+    }
+    const workflowTimer = this.options.requestTimeoutMs > 0
+      ? setTimeout(() => {
+          controller.abort();
+        }, this.options.requestTimeoutMs)
+      : null;
+    try {
+      if (controller.signal.aborted) throw workflowInputError('Workflow is aborted.');
+      const result = await executeInlineWorkflow(parsed, this.createVmGlobals(ctx), controller.signal);
+      await this.drainWorkflowFinalizers(ctx);
+      if (controller.signal.aborted || task.status !== 'running') return;
+      const journalResult = journalJsonValueOrInputError(result, 'workflow result');
+      const resultPath = join(this.stateDir, 'workflows', `${task.runId}.result.json`);
+      await ensureWorkflowStateDirectory(join(this.stateDir, 'workflows'));
+      await writeWorkflowStateFile(resultPath, `${JSON.stringify({
+        taskId: task.taskId,
+        runId: task.runId,
+        workflowName: task.workflowName,
+        workflowSource: task.workflowSource,
+        ...(task.workflowSourcePath ? { workflowSourcePath: task.workflowSourcePath } : {}),
+        scriptHash: task.scriptHash,
+        result: journalResult,
+      }, null, 2)}\n`);
+      const completedSnapshot = await this.completeTask(ctx, journalResult, {
+        type: 'workflow.completed',
+        taskId: task.taskId,
+        runId: task.runId,
+        resultPath,
+        agentCount: ctx.agentCount,
+        tokens: ctx.tokens,
+        toolCalls: ctx.toolCalls,
+        durationMs: Date.now() - ctx.startedAt,
+      });
+      void completedSnapshot;
+    } catch (err) {
+      const abortFailure = controller.signal.aborted
+        ? task.abortFailure ?? { message: 'Workflow timed out or was aborted.', reason: 'workflow_aborted' }
+        : null;
+      await this.drainWorkflowFinalizers(ctx);
+      await this.failTask(
+        task,
+        abortFailure ? abortFailure.message : workflowErrorMessage(err),
+        abortFailure ? abortFailure.reason : workflowFailureReason(err),
+      );
+    } finally {
+      if (workflowTimer) clearTimeout(workflowTimer);
+      for (const timer of ctx.timers.values()) clearTimeout(timer);
+      ctx.timers.clear();
+    }
+  }
+
+  private createVmGlobals(ctx: WorkflowRunContext): WorkflowVmGlobals {
+    const log = (message: unknown): void => {
+      if (ctx.controller.signal.aborted || ctx.task.status !== 'running') return;
+      this.emit(ctx.task, {
+        type: 'workflow.log',
+        taskId: ctx.task.taskId,
+        runId: ctx.task.runId,
+        message: String(message),
+      });
+    };
+    const workflowSetTimeout = hardenCallable((callback: unknown, delay?: unknown, ...args: unknown[]): number => {
+      if (ctx.controller.signal.aborted || ctx.task.status !== 'running') return 0;
+      if (typeof callback !== 'function') throw workflowInputError('setTimeout callback must be a function.');
+      const ms = typeof delay === 'number' && Number.isFinite(delay) && delay >= 0 ? delay : 0;
+      const timerId = ctx.nextTimerId;
+      ctx.nextTimerId += 1;
+      const handle = setTimeout(() => {
+        ctx.timers.delete(timerId);
+        if (!ctx.controller.signal.aborted && ctx.task.status === 'running') {
+          try {
+            const returned = (callback as (...values: unknown[]) => unknown)(...args);
+            Promise.resolve(returned).catch((err) => {
+              void this.failTaskFromCallback(ctx, err);
+            });
+          } catch (err) {
+            void this.failTaskFromCallback(ctx, err);
+          }
+        }
+      }, ms);
+      ctx.timers.set(timerId, handle);
+      return timerId;
+    });
+    const workflowClearTimeout = hardenCallable((handle: unknown): void => {
+      if (typeof handle !== 'number') return;
+      const timer = ctx.timers.get(handle);
+      if (!timer) return;
+      clearTimeout(timer);
+      ctx.timers.delete(handle);
+    });
+    const host = Object.create(null) as Record<string, unknown>;
+    host.trackPromise = hardenCallable((value: unknown): HandledWorkflowPromise<unknown> => this.trackWorkflowPromise(ctx, value));
+    host.agent = hardenCallable((prompt: unknown, options?: AgentOptions): HandledWorkflowPromise<unknown> => this.runAgent(ctx, prompt, options));
+    host.parallel = hardenCallable((items: unknown): HandledWorkflowPromise<unknown[]> => {
+      return this.trackWorkflowPromise(ctx, this.parallel(ctx, items));
+    });
+    host.pipeline = hardenCallable((items: unknown, ...stages: unknown[]): HandledWorkflowPromise<unknown[]> => {
+      return this.trackWorkflowPromise(ctx, this.pipeline(ctx, items, stages));
+    });
+    host.workspaceContext = hardenCallable((options?: unknown): HandledWorkflowPromise<string> => {
+      return this.trackWorkflowPromise(ctx, this.workspaceContext(ctx, options));
+    });
+    host.announcePlan = hardenCallable((plan: unknown): void => this.announcePlan(ctx, plan));
+    host.announcePhasePlan = hardenCallable((phasePlan: unknown): void => this.announcePhasePlan(ctx, phasePlan));
+    host.phase = hardenCallable((title: unknown): void => this.phase(ctx, title));
+    host.log = hardenCallable(log);
+    host.consoleLog = hardenCallable((...values: unknown[]): void => {
+      log(values.map((value) => String(value)).join(' '));
+    });
+    host.workflow = hardenCallable((): never => {
+      throw workflowInputError('Nested workflow calls are not supported by this runtime yet.');
+    });
+    host.setTimeout = workflowSetTimeout;
+    host.clearTimeout = workflowClearTimeout;
+    return {
+      argsLiteral: vmDataLiteral(ctx.input.args, 'args'),
+      budgetLiteral: vmDataLiteral({
+        maxAgentCalls: MAX_AGENT_CALLS,
+        maxParallelism: MAX_PARALLELISM,
+        agentStallTimeoutMs: this.agentStallTimeoutMs,
+        agentStallRetryLimit: this.agentStallRetryLimit,
+      }, 'budget'),
+      host: Object.freeze(host),
+      setVmValueProjector: (projector) => {
+        ctx.toVmValue = projector;
+      },
+    };
+  }
+
+  private runAgent(
+    ctx: WorkflowRunContext,
+    prompt: unknown,
+    options?: AgentOptions,
+  ): HandledWorkflowPromise<unknown> {
+    let resolveFinalizer: () => void;
+    const finalizer = new Promise<void>((resolve) => {
+      resolveFinalizer = resolve;
+    });
+    ctx.asyncFinalizers.add(finalizer);
+    const inner = this.runAgentInner(ctx, prompt, options);
+    inner.catch(() => undefined);
+    const operation = inner.finally(() => {
+      ctx.asyncFinalizers.delete(finalizer);
+      resolveFinalizer!();
+    });
+    operation.catch(() => undefined);
+    return this.trackWorkflowPromise(ctx, operation);
+  }
+
+  private async workspaceContext(ctx: WorkflowRunContext, options?: unknown): Promise<string> {
+    if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
+      throw workflowInputError('Workflow is aborted.');
+    }
+    return await buildWorkspaceContext(
+      this.options.cwd ?? process.cwd(),
+      normalizeWorkspaceContextOptions(options),
+    );
+  }
+
+  private async runAgentInner(
+    ctx: WorkflowRunContext,
+    prompt: unknown,
+    options?: AgentOptions,
+  ): Promise<unknown> {
+    if (typeof prompt !== 'string' || prompt.trim() === '') {
+      throw workflowInputError('agent(prompt) requires a non-empty string prompt.');
+    }
+    if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
+      throw workflowInputError('Workflow is aborted.');
+    }
+    if (options?.model !== undefined) {
+      throw workflowInputError('agent model override is not supported by this runtime yet.');
+    }
+    if (ctx.agentCount >= MAX_AGENT_CALLS) {
+      throw workflowInputError(`Workflow agent call cap exceeded (${MAX_AGENT_CALLS}).`);
+    }
+    const schema = normalizeStructuredOutputSchema(options?.schema);
+    const isolation = normalizeAgentIsolation(options?.isolation);
+    if (isolation && !workflowIsolationReviewAllowsMode(ctx.isolationReview, isolation)) {
+      throw workflowInputError(`agent ${isolation} isolation was not covered by the current workflow permission review.`);
+    }
+    const agentIndex = ctx.agentCount;
+    ctx.agentCount += 1;
+    const agentId = `agent_${agentIndex + 1}`;
+    const semanticOpts = workflowAgentSemanticOpts({
+      model: ctx.model,
+      effort: 'xhigh',
+      schema,
+      isolation,
+    });
+    const previousAgentCallKey = ctx.previousAgentCallKey;
+    const agentCallKey = computeWorkflowAgentCallKey({
+      previousAgentCallKey,
+      prompt,
+      semanticOpts,
+    });
+    ctx.previousAgentCallKey = agentCallKey;
+    const label = options?.label ?? preview(prompt, 48);
+    const phase = options?.phase ?? ctx.currentPhase;
+    try {
+      await ctx.task.journal.append({
+        kind: 'workflow.agent.started',
+        agentIndex,
+        agentId,
+        previousAgentCallKey,
+        agentCallKey,
+        prompt,
+        semanticOpts,
+      });
+    } catch (err) {
+      ctx.controller.abort();
+      await this.failTask(ctx.task, 'Workflow journal write failed before agent start.', WORKFLOW_JOURNAL_WRITE_FAILED_REASON);
+      throw workflowJournalRuntimeError(err);
+    }
+    this.emit(ctx.task, {
+      type: 'workflow.agent.started',
+      taskId: ctx.task.taskId,
+      runId: ctx.task.runId,
+      agentIndex,
+      agentId,
+      label,
+      phase,
+      promptPreview: preview(prompt, 160),
+    });
+    const cached = takeResumeCacheHit(ctx.resumeCache, agentCallKey);
+    if (cached) {
+      try {
+        await ctx.task.journal.append({
+          kind: 'workflow.agent.completed',
+          agentIndex,
+          agentId,
+          agentCallKey,
+          result: cached.result,
+          usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          toolCalls: 0,
+        });
+      } catch (err) {
+        ctx.controller.abort();
+        await this.failTask(ctx.task, 'Workflow journal write failed after cached agent completion.', WORKFLOW_JOURNAL_WRITE_FAILED_REASON);
+        throw workflowJournalRuntimeError(err);
+      }
+      this.emit(ctx.task, {
+        type: 'workflow.agent.completed',
+        taskId: ctx.task.taskId,
+        runId: ctx.task.runId,
+        agentIndex,
+        agentId,
+        label,
+        phase,
+        tokens: 0,
+        toolCalls: 0,
+        resultPreview: previewValue(cached.result, 160),
+        cached: true,
+        ...agentCompletionProgress(ctx, phase),
+      });
+      return cached.result;
+    }
+    const preservedWorktrees: WorkflowAgentPreservedWorktree[] = [];
+    const recordWorktreeFinalization = (finalization: WorkflowAgentWorktreeFinalization): void => {
+      if (!finalization.preserved || !finalization.preservedWorktree) return;
+      if (preservedWorktrees.some((item) => item.path === finalization.preservedWorktree?.path)) return;
+      preservedWorktrees.push(finalization.preservedWorktree);
+    };
+    try {
+      const attempt = await this.runAgentWithStallRetries(ctx, {
+        agentId,
+        prompt,
+        schema,
+        isolation,
+        model: ctx.model,
+        onWorktreeFinalized: recordWorktreeFinalization,
+      });
+      const result = attempt.result;
+      if (attempt.worktreeFinalization) recordWorktreeFinalization(attempt.worktreeFinalization);
+      if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
+        throw workflowInputError('Workflow is aborted.');
+      }
+      const agentResult = schema
+        ? structuredAgentResult(result, schema)
+        : agentResultText(result);
+      const journalResult = journalJsonValueOrInputError(agentResult, 'agent result');
+      const usage = workflowUsage(result.usage);
+      const toolCalls = result.toolCalls.length;
+      try {
+        await ctx.task.journal.append({
+          kind: 'workflow.agent.completed',
+          agentIndex,
+          agentId,
+          agentCallKey,
+          result: journalResult,
+          usage,
+          toolCalls,
+        });
+      } catch (err) {
+        ctx.controller.abort();
+        await this.failTask(ctx.task, 'Workflow journal write failed after agent completion.', WORKFLOW_JOURNAL_WRITE_FAILED_REASON);
+        throw workflowJournalRuntimeError(err);
+      }
+      ctx.inputTokens += usage.inputTokens;
+      ctx.outputTokens += usage.outputTokens;
+      ctx.tokens += usage.totalTokens;
+      ctx.toolCalls += toolCalls;
+      this.emit(ctx.task, {
+        type: 'workflow.agent.completed',
+        taskId: ctx.task.taskId,
+        runId: ctx.task.runId,
+        agentIndex,
+        agentId,
+        label,
+        phase,
+        tokens: usage.totalTokens,
+        toolCalls,
+        resultPreview: previewValue(journalResult, 160),
+        ...agentCompletionProgress(ctx, phase),
+        ...preservedWorktreeEventProjection(preservedWorktrees),
+      });
+      return journalResult;
+    } catch (err) {
+      if (isWorkflowJournalError(err)) throw err;
+      if (ctx.task.status !== 'running') throw err;
+      const error = workflowErrorMessage(err);
+      try {
+        await ctx.task.journal.append({
+          kind: 'workflow.agent.failed',
+          agentIndex,
+          agentId,
+          agentCallKey,
+          reason: ctx.controller.signal.aborted
+            ? ctx.task.abortFailure?.reason ?? 'workflow_aborted'
+            : workflowFailureReason(err),
+          message: error,
+        });
+      } catch (journalErr) {
+        ctx.controller.abort();
+        await this.failTask(ctx.task, 'Workflow journal write failed after agent failure.', WORKFLOW_JOURNAL_WRITE_FAILED_REASON);
+        throw workflowJournalRuntimeError(journalErr);
+      }
+      this.emit(ctx.task, {
+        type: 'workflow.agent.failed',
+        taskId: ctx.task.taskId,
+        runId: ctx.task.runId,
+        agentIndex,
+        agentId,
+        label,
+        phase,
+        error,
+        ...preservedWorktreeEventProjection(preservedWorktrees),
+      });
+      if (ctx.controller.signal.aborted) return null;
+      throw err;
+    }
+  }
+
+  private async createAgentWorktree(
+    ctx: WorkflowRunContext,
+    agentId: string,
+    attemptIndex = 0,
+  ): Promise<WorkflowAgentWorktree> {
+    const cwd = this.options.cwd ?? process.cwd();
+    let gitRoot: string;
+    try {
+      gitRoot = await gitOutput(cwd, ['rev-parse', '--show-toplevel']);
+      await gitOutput(gitRoot, ['rev-parse', '--verify', 'HEAD']);
+    } catch (err) {
+      throw workflowInputError(`worktree isolation requires a git repository with at least one commit: ${workflowErrorMessage(err)}`);
+    }
+    const worktreeRoot = join(
+      dirname(gitRoot),
+      '.ultracode-for-codex-worktrees',
+      `${workflowScriptSlug(basename(gitRoot))}-${shortHash(gitRoot)}`,
+      ctx.task.runId,
+    );
+    await ensureWorkflowStateDirectory(worktreeRoot);
+    const worktreePath = join(worktreeRoot, attemptIndex === 0 ? agentId : `${agentId}-attempt-${attemptIndex + 1}`);
+    try {
+      await gitOutput(gitRoot, ['worktree', 'add', '--detach', worktreePath, 'HEAD']);
+      return {
+        gitRoot,
+        path: await realpath(worktreePath),
+        attemptIndex,
+      };
+    } catch (err) {
+      throw workflowInputError(`worktree isolation could not create an isolated worktree: ${workflowErrorMessage(err)}`);
+    }
+  }
+
+  private async finalizeAgentWorktree(worktree: WorkflowAgentWorktree): Promise<WorkflowAgentWorktreeFinalization> {
+    let status: string;
+    try {
+      status = await gitOutput(worktree.path, ['status', '--porcelain=v1', '--untracked-files=all', '--ignored=matching']);
+    } catch {
+      return {
+        preserved: true,
+        preservedWorktree: preservedWorktree(worktree, 'status_unavailable'),
+      };
+    }
+    if (status.trim()) {
+      return {
+        preserved: true,
+        preservedWorktree: preservedWorktree(worktree, 'changed'),
+      };
+    }
+    return {
+      preserved: true,
+      preservedWorktree: preservedWorktree(worktree, 'clean'),
+    };
+  }
+
+  private async runAgentWithStallRetries(
+    ctx: WorkflowRunContext,
+    input: {
+      readonly agentId: string;
+      readonly prompt: string;
+      readonly schema?: Record<string, unknown>;
+      readonly isolation?: 'worktree';
+      readonly model: string;
+      readonly onWorktreeFinalized: (finalization: WorkflowAgentWorktreeFinalization) => void;
+    },
+  ): Promise<WorkflowAgentAttemptOutcome> {
+    for (let retryIndex = 0; retryIndex <= this.agentStallRetryLimit; retryIndex += 1) {
+      if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
+        throw workflowInputError('Workflow is aborted.');
+      }
+      const worktree = input.isolation === 'worktree'
+        ? await this.createAgentWorktree(ctx, input.agentId, retryIndex)
+        : undefined;
+      try {
+        const result = await this.runAgentAttempt(ctx, agentRequest({
+          model: input.model,
+          prompt: input.prompt,
+          schema: input.schema,
+          worktreePath: worktree?.path,
+        }));
+        const worktreeFinalization = worktree
+          ? await this.finalizeAgentWorktree(worktree)
+          : undefined;
+        if (worktreeFinalization) input.onWorktreeFinalized(worktreeFinalization);
+        return {
+          result,
+          ...(worktreeFinalization ? { worktreeFinalization } : {}),
+        };
+      } catch (err) {
+        if (worktree) {
+          const worktreeFinalization = isWorkflowAgentStalledError(err) || ctx.controller.signal.aborted
+            ? {
+                preserved: true,
+                preservedWorktree: preservedWorktree(
+                  worktree,
+                  ctx.controller.signal.aborted ? 'aborted' : 'stalled',
+                ),
+              } satisfies WorkflowAgentWorktreeFinalization
+            : await this.finalizeAgentWorktree(worktree);
+          input.onWorktreeFinalized(worktreeFinalization);
+        }
+        if (
+          isWorkflowAgentStalledError(err)
+          && retryIndex < this.agentStallRetryLimit
+          && !ctx.controller.signal.aborted
+          && ctx.task.status === 'running'
+        ) {
+          this.emit(ctx.task, {
+            type: 'workflow.log',
+            taskId: ctx.task.taskId,
+            runId: ctx.task.runId,
+            message: `${input.agentId} stalled; retrying (${retryIndex + 1}/${this.agentStallRetryLimit}).`,
+          });
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw workflowAgentStalledError(`Workflow agent stalled after ${this.agentStallRetryLimit + 1} attempts.`);
+  }
+
+  private async gitStatusArgsExcludingRuntimeState(gitRoot: string): Promise<readonly string[]> {
+    const args = ['status', '--porcelain=v1', '--untracked-files=all', '--', '.'];
+    const canonicalGitRoot = await realpath(gitRoot).catch(() => resolve(gitRoot));
+    const canonicalStateDir = await realpath(this.stateDir).catch(() => resolve(this.stateDir));
+    const relativeStateDir = relative(canonicalGitRoot, canonicalStateDir);
+    if (relativeStateDir && !relativeStateDir.startsWith('..') && !isAbsolute(relativeStateDir)) {
+      args.push(`:(exclude)${relativeStateDir}`);
+      args.push(`:(exclude)${relativeStateDir}/**`);
+    }
+    return args;
+  }
+
+  private async runAgentAttempt(ctx: WorkflowRunContext, request: SubagentRequest): Promise<SubagentResult> {
+    const attemptController = new AbortController();
+    let timedOut = false;
+    const abortFromWorkflow = (): void => {
+      attemptController.abort();
+    };
+    if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
+      throw workflowInputError('Workflow is aborted.');
+    }
+    ctx.controller.signal.addEventListener('abort', abortFromWorkflow, { once: true });
+    const timer = this.agentStallTimeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          attemptController.abort();
+        }, this.agentStallTimeoutMs)
+      : null;
+    try {
+      type AgentAttemptOutcome =
+        | { readonly type: 'result'; readonly result: SubagentResult }
+        | { readonly type: 'error'; readonly error: unknown }
+        | { readonly type: 'aborted' };
+      const generated: Promise<AgentAttemptOutcome> = this.options.backend.generate(request, attemptController.signal).then(
+        (result) => ({ type: 'result', result }),
+        (err) => ({ type: 'error', error: err }),
+      );
+      const aborted = new Promise<AgentAttemptOutcome>((resolve) => {
+        attemptController.signal.addEventListener('abort', () => {
+          resolve({ type: 'aborted' });
+        }, { once: true });
+      });
+      const outcome = await Promise.race([generated, aborted]);
+      if (timedOut) {
+        throw workflowAgentStalledError(`Workflow agent stalled after ${this.agentStallTimeoutMs} ms.`);
+      }
+      if (outcome.type === 'result') return outcome.result;
+      if (outcome.type === 'aborted') {
+        throw workflowInputError('Workflow is aborted.');
+      }
+      if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
+        throw workflowInputError('Workflow is aborted.');
+      }
+      throw outcome.error;
+    } finally {
+      if (timer) clearTimeout(timer);
+      ctx.controller.signal.removeEventListener('abort', abortFromWorkflow);
+    }
+  }
+
+  private async parallel(ctx: WorkflowRunContext, items: unknown): Promise<unknown[]> {
+    if (!Array.isArray(items)) throw workflowInputError('parallel() requires an array.');
+    return mapWithConcurrency(items, MAX_PARALLELISM, async (item) => {
+      try {
+        return typeof item === 'function' ? await (item as () => unknown)() : await item;
+      } catch (err) {
+        this.emit(ctx.task, {
+          type: 'workflow.log',
+          taskId: ctx.task.taskId,
+          runId: ctx.task.runId,
+          message: `parallel item failed: ${workflowErrorMessage(err)}`,
+        });
+        return null;
+      }
+    });
+  }
+
+  private async pipeline(ctx: WorkflowRunContext, items: unknown, stages: unknown[]): Promise<unknown[]> {
+    if (!Array.isArray(items)) throw workflowInputError('pipeline() requires an item array.');
+    for (const stage of stages) {
+      if (typeof stage !== 'function') throw workflowInputError('pipeline() stages must be functions.');
+    }
+    return mapWithConcurrency(items, MAX_PARALLELISM, async (item) => {
+      let current: unknown = item;
+      for (const stage of stages as Array<(value: unknown) => unknown>) {
+        if (current === null || current === undefined) return null;
+        try {
+          current = await stage(current);
+        } catch (err) {
+          this.emit(ctx.task, {
+            type: 'workflow.log',
+            taskId: ctx.task.taskId,
+            runId: ctx.task.runId,
+            message: `pipeline stage failed: ${workflowErrorMessage(err)}`,
+          });
+          return null;
+        }
+      }
+      return current;
+    });
+  }
+
+  private announcePlan(ctx: WorkflowRunContext, plan: unknown): void {
+    if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
+      throw workflowInputError('Workflow is aborted.');
+    }
+    const normalized = normalizeWorkflowExecutionPlan(plan);
+    ctx.announcedPlan = normalized;
+    this.emit(ctx.task, {
+      type: 'workflow.plan.ready',
+      taskId: ctx.task.taskId,
+      runId: ctx.task.runId,
+      ...normalized,
+    });
+  }
+
+  private announcePhasePlan(ctx: WorkflowRunContext, phasePlan: unknown): void {
+    if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
+      throw workflowInputError('Workflow is aborted.');
+    }
+    const normalized = normalizeWorkflowPhasePlan(phasePlan, 'announcePhasePlan(phasePlan)');
+    ctx.pendingPhasePlan = normalized;
+    const phaseIndex = ctx.task.events
+      .filter((event) => event.type === 'workflow.phase.started')
+      .length;
+    this.emit(ctx.task, {
+      type: 'workflow.phase.planned',
+      taskId: ctx.task.taskId,
+      runId: ctx.task.runId,
+      phaseIndex,
+      title: normalized.title,
+      ...(normalized.goal ? { goal: normalized.goal } : {}),
+      plannedAgentCount: normalized.agents.length,
+      plannedAgents: normalized.agents,
+    });
+  }
+
+  private phase(ctx: WorkflowRunContext, title: unknown): void {
+    if (typeof title !== 'string' || title.trim() === '') {
+      throw workflowInputError('phase() requires a non-empty string title.');
+    }
+    const normalizedTitle = title.trim();
+    ctx.currentPhase = normalizedTitle;
+    const phaseIndex = ctx.task.events
+      .filter((event) => event.type === 'workflow.phase.started')
+      .length;
+    const detail = ctx.parsed.meta.phases?.find((item) => item.title === normalizedTitle)?.detail;
+    const pendingPhase = ctx.pendingPhasePlan?.title === normalizedTitle
+      ? ctx.pendingPhasePlan
+      : undefined;
+    if (pendingPhase) ctx.pendingPhasePlan = undefined;
+    const plannedPhase = pendingPhase ?? workflowPlannedPhase(ctx.announcedPlan, phaseIndex, normalizedTitle);
+    this.emit(ctx.task, {
+      type: 'workflow.phase.started',
+      taskId: ctx.task.taskId,
+      runId: ctx.task.runId,
+      phaseIndex,
+      title: normalizedTitle,
+      ...(detail ? { detail } : {}),
+      ...(plannedPhase?.goal ? { goal: plannedPhase.goal } : {}),
+      ...(plannedPhase ? {
+        plannedAgentCount: plannedPhase.agents.length,
+        plannedAgents: plannedPhase.agents,
+      } : {}),
+    });
+  }
+
+  private async completeTask(
+    ctx: WorkflowRunContext,
+    result: JsonValue,
+    event: Extract<WorkflowEvent, { type: 'workflow.completed' }>,
+  ): Promise<WorkflowTaskSnapshot> {
+    return await this.finalizeTask(ctx.task, async () => {
+      await ctx.task.journal.append({
+        kind: 'workflow.run.completed',
+        result,
+        resultPath: event.resultPath,
+        agentCount: ctx.agentCount,
+        usage: {
+          inputTokens: ctx.inputTokens,
+          outputTokens: ctx.outputTokens,
+          totalTokens: ctx.tokens,
+        },
+        toolCalls: ctx.toolCalls,
+        durationMs: event.durationMs,
+      });
+      ctx.task.result = result;
+      ctx.task.resultPath = event.resultPath;
+      this.emit(ctx.task, event);
+      ctx.task.status = 'completed';
+    });
+  }
+
+  private async failTask(task: WorkflowTaskMutable, error: string, reason: string): Promise<WorkflowTaskSnapshot> {
+    return await this.finalizeTask(task, async () => {
+      await task.journal.append({
+        kind: 'workflow.run.failed',
+        reason,
+        message: error,
+        recovery: { retryable: true, reason },
+        durationMs: Date.now() - task.startedAt,
+      });
+      task.error = error;
+      task.failureReason = reason;
+      this.emit(task, {
+        type: 'workflow.failed',
+        taskId: task.taskId,
+        runId: task.runId,
+        error,
+        recovery: { retryable: true, reason },
+      });
+      task.status = 'failed';
+    });
+  }
+
+  private async finalizeTask(task: WorkflowTaskMutable, action: () => Promise<void>): Promise<WorkflowTaskSnapshot> {
+    if (task.terminalFinalization) return await task.terminalFinalization;
+    task.terminalFinalization = (async () => {
+      if (task.status !== 'running' || task.terminalEmitted) return workflowTaskSnapshot(task);
+      try {
+        await action();
+      } catch (err) {
+        task.error = WORKFLOW_JOURNAL_PUBLIC_FAILURE_MESSAGE;
+        task.failureReason = WORKFLOW_JOURNAL_WRITE_FAILED_REASON;
+        task.status = 'failed';
+        task.terminalEmitted = true;
+        this.notifyTaskWaiters(task);
+      }
+      return workflowTaskSnapshot(task);
+    })();
+    return await task.terminalFinalization;
+  }
+
+  private async failTaskFromCallback(
+    ctx: WorkflowRunContext,
+    err: unknown,
+    reason = 'workflow_timer_callback_failed',
+    excludeFinalizer?: Promise<void>,
+  ): Promise<void> {
+    if (ctx.controller.signal.aborted || ctx.task.status !== 'running') return;
+    ctx.task.abortFailure = {
+      message: workflowErrorMessage(err),
+      reason,
+    };
+    ctx.controller.abort();
+    await this.drainWorkflowFinalizers(ctx, excludeFinalizer);
+    await this.failTask(
+      ctx.task,
+      ctx.task.abortFailure.message,
+      ctx.task.abortFailure.reason,
+    );
+  }
+
+  private async drainWorkflowFinalizers(ctx: WorkflowRunContext, exclude?: Promise<void>): Promise<void> {
+    while (ctx.asyncFinalizers.size > (exclude ? 1 : 0)) {
+      const pending = [...ctx.asyncFinalizers].filter((finalizer) => finalizer !== exclude);
+      if (pending.length === 0) return;
+      await Promise.allSettled(pending);
+    }
+  }
+
+  private trackWorkflowPromise<T>(ctx: WorkflowRunContext, value: T | PromiseLike<T>): HandledWorkflowPromise<T> {
+    const promise = Promise.resolve(value);
+    const tracking: WorkflowPromiseTracking = {
+      handled: false,
+      projectValue: (nextValue) => ctx.toVmValue ? ctx.toVmValue(nextValue) : nextValue,
+      trackPromise: <U>(nextPromise: Promise<U>) => this.trackWorkflowPromise(ctx, nextPromise),
+    };
+    let finalizer: Promise<void>;
+    const settled = promise.then(
+      () => undefined,
+      async (reason) => {
+        await sleep(0);
+        if (!tracking.handled) {
+          await this.failTaskFromCallback(ctx, reason, 'workflow_promise_rejected', finalizer);
+        }
+      },
+    );
+    const aborted = new Promise<void>((resolve) => {
+      if (ctx.controller.signal.aborted) {
+        resolve();
+      } else {
+        ctx.controller.signal.addEventListener('abort', () => resolve(), { once: true });
+      }
+    });
+    finalizer = Promise.race([settled, aborted]).finally(() => {
+      ctx.asyncFinalizers.delete(finalizer);
+    });
+    finalizer.catch(() => undefined);
+    ctx.asyncFinalizers.add(finalizer);
+    return handledWorkflowPromise(promise, tracking);
+  }
+
+  private emit(task: WorkflowTaskMutable, event: WorkflowEvent): void {
+    if (task.terminalEmitted) return;
+    if (isTerminalWorkflowEvent(event)) task.terminalEmitted = true;
+    task.events.push(event);
+    this.notifyTaskWaiters(task);
+  }
+
+  private notifyTaskWaiters(task: WorkflowTaskMutable): void {
+    const waiters = task.waiters.splice(0);
+    for (const waiter of waiters) waiter();
+  }
+}
+
+function normalizeLaunchInput(input: WorkflowLaunchInput): WorkflowLaunchInput {
+  if (input.toolName !== undefined && !WORKFLOW_TOOL_NAMES.has(input.toolName)) {
+    throw workflowInputError('Workflow launch tool must be Workflow or RunWorkflow.');
+  }
+  const resume = Object.prototype.hasOwnProperty.call(input, 'resumeFromRunId')
+    ? { resumeFromRunId: normalizeResumeFromRunId(input.resumeFromRunId) }
+    : {};
+  if (input.scriptPath !== undefined) {
+    if (typeof input.scriptPath !== 'string') {
+      throw workflowInputError('Workflow scriptPath must be a non-empty string.');
+    }
+    const scriptPath = input.scriptPath.trim();
+    if (!scriptPath) throw workflowInputError('Workflow scriptPath must be a non-empty string.');
+    return { ...input, ...resume, scriptPath };
+  }
+  if (input.name !== undefined) {
+    if (typeof input.name !== 'string') {
+      throw workflowInputError('Workflow name must be a non-empty string.');
+    }
+    const name = input.name.trim();
+    if (!name) throw workflowInputError('Workflow name must be a non-empty string.');
+    return { ...input, ...resume, name };
+  }
+  if (typeof input.script !== 'string' || input.script.trim() === '') {
+    throw workflowInputError('Workflow launch requires an inline script string.');
+  }
+  return { ...input, ...resume, script: input.script };
+}
+
+function workflowLaunchHasSourceSelector(input: WorkflowLaunchInput): boolean {
+  return input.script !== undefined || input.name !== undefined || input.scriptPath !== undefined;
+}
+
+function normalizeResumeFromRunId(value: unknown): string {
+  if (typeof value !== 'string') {
+    throw workflowInputError('resumeFromRunId must be a non-empty workflow runId string.');
+  }
+  const runId = value.trim();
+  if (!runId) throw workflowInputError('resumeFromRunId must be a non-empty workflow runId string.');
+  return runId;
+}
+
+function normalizeAgentIsolation(value: unknown): AgentIsolation | undefined {
+  if (value === undefined) return undefined;
+  if (value === 'worktree') return 'worktree';
+  throw workflowInputError('agent isolation must be "worktree" when provided.');
+}
+
+function takeResumeCacheHit(
+  cache: WorkflowResumeCache | undefined,
+  agentCallKey: string,
+): WorkflowResumeAgentCacheEntry | null {
+  if (!cache || !cache.prefixOpen) return null;
+  const entry = cache.entries[cache.nextIndex];
+  if (!entry || entry.agentCallKey !== agentCallKey) {
+    cache.prefixOpen = false;
+    return null;
+  }
+  cache.nextIndex += 1;
+  return entry;
+}
+
+async function gitOutput(cwd: string, args: readonly string[]): Promise<string> {
+  try {
+    const result = await execFileAsync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      maxBuffer: 1024 * 1024,
+    });
+    return result.stdout.trim();
+  } catch (err) {
+    const record = err as { readonly stderr?: unknown; readonly message?: unknown };
+    const stderr = typeof record.stderr === 'string' ? record.stderr.trim() : '';
+    const message = stderr || (typeof record.message === 'string' ? record.message : String(err));
+    throw new Error(message);
+  }
+}
+
+async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptions): Promise<string> {
+  const root = await workspaceContextRoot(cwd);
+  const gitStatus = await gitOutput(root, ['status', '--short']).catch(() => '');
+  const explicitPaths = [
+    ...options.files,
+    ...extractMentionedWorkspacePaths(options.query ?? ''),
+  ];
+  const changedPaths = pathsFromGitStatus(gitStatus);
+  const listedPaths = await listWorkspaceContextCandidates(root);
+  const candidates = uniqueStrings([
+    ...explicitPaths,
+    ...changedPaths,
+    ...WORKSPACE_CONTEXT_PRIORITY_FILES,
+    ...listedPaths,
+  ]).filter(shouldIncludeWorkspaceContextPath);
+  const fileBlocks: string[] = [];
+  let usedBytes = 0;
+  for (const candidate of candidates) {
+    if (fileBlocks.length >= options.maxFiles) break;
+    const block = await workspaceContextFileBlock(root, candidate, options.maxFileBytes).catch(() => null);
+    if (!block) continue;
+    const blockBytes = Buffer.byteLength(block, 'utf8');
+    if (usedBytes + blockBytes > options.maxBytes) {
+      if (fileBlocks.length > 0) break;
+      fileBlocks.push(block.slice(0, options.maxBytes));
+      break;
+    }
+    fileBlocks.push(block);
+    usedBytes += blockBytes;
+  }
+  return [
+    '## Workspace Context',
+    `Root: ${root}`,
+    '',
+    '### Git Status',
+    gitStatus.trim() ? gitStatus : '(clean or unavailable)',
+    '',
+    '### Included Files',
+    fileBlocks.length ? fileBlocks.join('\n\n') : '(no readable text files selected)',
+  ].join('\n');
+}
+
+function normalizeWorkspaceContextOptions(value: unknown): WorkspaceContextOptions {
+  const options = asRecord(value) ?? {};
+  const query = typeof options.query === 'string' ? options.query : undefined;
+  const files = Array.isArray(options.files)
+    ? options.files.filter((item): item is string => typeof item === 'string' && item.trim() !== '')
+    : [];
+  return {
+    ...(query ? { query } : {}),
+    files,
+    maxFiles: boundedPositiveInteger(options.maxFiles, DEFAULT_WORKSPACE_CONTEXT_MAX_FILES, 1, 100),
+    maxFileBytes: boundedPositiveInteger(options.maxFileBytes, DEFAULT_WORKSPACE_CONTEXT_MAX_FILE_BYTES, 1_000, 50_000),
+    maxBytes: boundedPositiveInteger(options.maxBytes, DEFAULT_WORKSPACE_CONTEXT_MAX_BYTES, 10_000, 200_000),
+  };
+}
+
+function boundedPositiveInteger(value: unknown, fallback: number, min: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(value)));
+}
+
+async function workspaceContextRoot(cwd: string): Promise<string> {
+  try {
+    return await gitOutput(cwd, ['rev-parse', '--show-toplevel']);
+  } catch {
+    return await realpath(cwd).catch(() => resolve(cwd));
+  }
+}
+
+async function listWorkspaceContextCandidates(root: string): Promise<readonly string[]> {
+  try {
+    return splitLines(await gitOutput(root, ['ls-files', '--cached', '--others', '--exclude-standard']));
+  } catch {
+    return await walkWorkspaceContextFiles(root);
+  }
+}
+
+async function walkWorkspaceContextFiles(root: string): Promise<readonly string[]> {
+  const found: string[] = [];
+  async function walk(dir: string): Promise<void> {
+    if (found.length >= 500) return;
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (found.length >= 500) return;
+      if (WORKSPACE_CONTEXT_EXCLUDED_DIRS.has(entry.name)) continue;
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+        continue;
+      }
+      if (entry.isFile()) found.push(relative(root, fullPath));
+    }
+  }
+  await walk(root);
+  return found;
+}
+
+function extractMentionedWorkspacePaths(query: string): readonly string[] {
+  const out = new Set<string>();
+  for (const file of WORKSPACE_CONTEXT_PRIORITY_FILES) {
+    if (query.includes(file)) out.add(file);
+  }
+  const matches = query.match(/[A-Za-z0-9_.@+-]+(?:\/[A-Za-z0-9_.@+-]+)+(?:\.[A-Za-z0-9]+)?(?::\d+)?/g) ?? [];
+  for (const match of matches) {
+    if (match.includes('://')) continue;
+    out.add(match.replace(/:\d+$/, ''));
+  }
+  return [...out];
+}
+
+function pathsFromGitStatus(status: string): readonly string[] {
+  const paths: string[] = [];
+  for (const line of status.split(/\r?\n/).filter(Boolean)) {
+    const rawPath = line.length > 3 ? line.slice(3).trim() : line.trim();
+    if (!rawPath) continue;
+    const path = rawPath.includes(' -> ') ? rawPath.split(' -> ').at(-1) ?? rawPath : rawPath;
+    paths.push(path.replace(/^"|"$/g, ''));
+  }
+  return paths;
+}
+
+async function workspaceContextFileBlock(root: string, requestedPath: string, maxFileBytes: number): Promise<string | null> {
+  const resolved = await resolveWorkspaceContextPath(root, requestedPath);
+  if (!resolved) return null;
+  const fileStat = await stat(resolved.path).catch(() => null);
+  if (!fileStat?.isFile() || fileStat.size > maxFileBytes) return null;
+  const text = await readFile(resolved.path, 'utf8').catch(() => null);
+  if (text === null || text.includes('\0')) return null;
+  return [
+    `--- ${resolved.relativePath} (${fileStat.size} bytes) ---`,
+    numberWorkspaceContextLines(text),
+  ].join('\n');
+}
+
+async function resolveWorkspaceContextPath(
+  root: string,
+  requestedPath: string,
+): Promise<{ readonly path: string; readonly relativePath: string } | null> {
+  const requested = requestedPath.trim();
+  if (!requested) return null;
+  const candidate = isAbsolute(requested) ? resolve(requested) : resolve(root, requested);
+  if (!pathInsideOrEqual(root, candidate)) return null;
+  const canonical = await realpath(candidate).catch(() => null);
+  if (!canonical || !pathInsideOrEqual(root, canonical)) return null;
+  return {
+    path: canonical,
+    relativePath: relative(root, canonical) || '.',
+  };
+}
+
+function shouldIncludeWorkspaceContextPath(path: string): boolean {
+  const normalized = path.replaceAll('\\', '/').replace(/^\.\/+/, '');
+  if (!normalized || normalized.startsWith('../') || normalized.includes('/../')) return false;
+  const parts = normalized.split('/');
+  if (parts.some((part) => WORKSPACE_CONTEXT_EXCLUDED_DIRS.has(part))) return false;
+  const name = parts.at(-1) ?? '';
+  if (WORKSPACE_CONTEXT_PRIORITY_FILES.has(name)) return true;
+  const dot = name.lastIndexOf('.');
+  if (dot < 0) return false;
+  return WORKSPACE_CONTEXT_ALLOWED_EXTENSIONS.has(name.slice(dot).toLowerCase());
+}
+
+function numberWorkspaceContextLines(text: string): string {
+  return text.split(/\r?\n/).map((line, index) => {
+    return `${String(index + 1).padStart(4, ' ')} | ${line}`;
+  }).join('\n');
+}
+
+function splitLines(value: string): string[] {
+  return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
+function uniqueStrings(values: Iterable<string>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    const normalized = value.trim();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function preservedWorktree(
+  worktree: WorkflowAgentWorktree,
+  reason: WorkflowAgentPreservedWorktree['reason'],
+): WorkflowAgentPreservedWorktree {
+  return {
+    path: worktree.path,
+    attemptIndex: worktree.attemptIndex,
+    reason,
+  };
+}
+
+function preservedWorktreeEventProjection(
+  preservedWorktrees: readonly WorkflowAgentPreservedWorktree[],
+): {
+  readonly worktreePath?: string;
+  readonly worktreePreserved?: true;
+  readonly preservedWorktrees?: readonly WorkflowAgentPreservedWorktree[];
+} {
+  if (preservedWorktrees.length === 0) return {};
+  const primary = preservedWorktrees.find((item) => item.reason === 'changed')
+    ?? preservedWorktrees.find((item) => item.reason === 'status_unavailable')
+    ?? preservedWorktrees[0];
+  return {
+    worktreePath: primary?.path,
+    worktreePreserved: true,
+    preservedWorktrees: [...preservedWorktrees],
+  };
+}
+
+function workflowPlannedPhase(
+  plan: WorkflowExecutionPlan | undefined,
+  phaseIndex: number,
+  title: string,
+): WorkflowPlanPhase | undefined {
+  const indexed = plan?.phases[phaseIndex];
+  if (indexed?.title === title) return indexed;
+  return plan?.phases.find((phase) => phase.title === title);
+}
+
+function agentCompletionProgress(
+  ctx: WorkflowRunContext,
+  phase: string | undefined,
+): {
+  readonly elapsedMs: number;
+  readonly completedAgentCount: number;
+  readonly knownAgentCount: number;
+  readonly phaseCompletedAgentCount?: number;
+  readonly phaseKnownAgentCount?: number;
+} {
+  const completedAgentCount = ctx.task.events
+    .filter((event) => event.type === 'workflow.agent.completed')
+    .length + 1;
+  const base = {
+    elapsedMs: Date.now() - ctx.startedAt,
+    completedAgentCount,
+    knownAgentCount: ctx.agentCount,
+  };
+  if (!phase) return base;
+  const phaseCompletedAgentCount = ctx.task.events
+    .filter((event) => event.type === 'workflow.agent.completed' && event.phase === phase)
+    .length + 1;
+  const phaseKnownAgentCount = Math.max(
+    phaseCompletedAgentCount,
+    ctx.task.events.filter((event) => event.type === 'workflow.agent.started' && event.phase === phase).length,
+  );
+  return {
+    ...base,
+    phaseCompletedAgentCount,
+    phaseKnownAgentCount,
+  };
+}
+
+function shortHash(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, 12);
+}
+
+function workflowScriptHash(script: string): string {
+  return `sha256:${createHash('sha256').update(script).digest('hex')}`;
+}
+
+function workflowPermissionKey(
+  workflowSource: WorkflowSource,
+  workflowSourcePath: string | undefined,
+  workflowName: string,
+  scriptHash: string,
+): string {
+  const sourceRef = workflowSourcePath ?? workflowName;
+  return `${workflowSource}\0${sourceRef}\0${workflowName}\0${scriptHash}`;
+}
+
+function workflowPermissionRequestId(permissionKey: string): string {
+  const permissionKeyHash = createHash('sha256').update(permissionKey).digest('hex').slice(0, 12);
+  return `perm_${permissionKeyHash}_${randomUUID().replaceAll('-', '').slice(0, 16)}`;
+}
+
+interface WorkflowIsolationReview {
+  readonly modes: readonly string[];
+  readonly dynamic: boolean;
+}
+
+function workflowIsolationReviewRecordFields(
+  isolationReview: WorkflowIsolationReview,
+): Pick<WorkflowPermissionRecord, 'reviewVersion' | 'requestedIsolationModes' | 'dynamicIsolation' | 'isolationReviewFingerprint'> {
+  return {
+    reviewVersion: WORKFLOW_PERMISSION_REVIEW_VERSION,
+    requestedIsolationModes: [...isolationReview.modes].sort((left, right) => left.localeCompare(right)),
+    dynamicIsolation: isolationReview.dynamic,
+    isolationReviewFingerprint: workflowIsolationReviewFingerprint(isolationReview),
+  };
+}
+
+function workflowPermissionReviewRecordFields(
+  review: WorkflowPermissionReview,
+): Pick<WorkflowPermissionRecord, 'reviewVersion' | 'requestedIsolationModes' | 'dynamicIsolation' | 'isolationReviewFingerprint'> {
+  return workflowIsolationReviewRecordFields({
+    modes: review.requestedIsolationModes,
+    dynamic: review.dynamicIsolation,
+  });
+}
+
+function workflowIsolationReviewFingerprint(isolationReview: WorkflowIsolationReview): string {
+  const canonical = JSON.stringify({
+    dynamic: isolationReview.dynamic,
+    modes: [...isolationReview.modes].sort((left, right) => left.localeCompare(right)),
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+function workflowPermissionRecordMatchesCurrentReview(
+  record: WorkflowPermissionRecord,
+  isolationReview: WorkflowIsolationReview,
+): boolean {
+  const expected = workflowIsolationReviewRecordFields(isolationReview);
+  return record.reviewVersion === expected.reviewVersion
+    && record.dynamicIsolation === expected.dynamicIsolation
+    && record.isolationReviewFingerprint === expected.isolationReviewFingerprint
+    && arraysEqual(record.requestedIsolationModes ?? [], expected.requestedIsolationModes ?? []);
+}
+
+function arraysEqual(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function workflowIsolationReviewAllowsMode(isolationReview: WorkflowIsolationReview, mode: AgentIsolation): boolean {
+  return isolationReview.dynamic || isolationReview.modes.includes(mode);
+}
+
+function workflowPermissionRiskSummary(
+  workflowSource: WorkflowSource,
+  requestedIsolation: WorkflowIsolationReview,
+): string {
+  const sourceSummary = (() => {
+    if (workflowSource === 'project') return 'Project workflow source requires approval before execution.';
+    if (workflowSource === 'user') return 'User workflow source requires approval before execution.';
+    if (workflowSource === 'plugin') return 'Plugin workflow source requires approval before execution.';
+    if (workflowSource === 'script_path') return 'Edited runtime workflow scriptPath requires approval before execution.';
+    return 'Workflow source is trusted by default.';
+  })();
+  const isolationSummaries: string[] = [];
+  if (requestedIsolation.modes.includes('worktree')) {
+    isolationSummaries.push('Requests worktree isolation, allowing subagents to write inside isolated git worktrees that may be preserved for review.');
+  }
+  if (requestedIsolation.dynamic) {
+    isolationSummaries.push('Contains dynamic agent isolation options; review as a possible worktree write request.');
+  }
+  const unknownModes = requestedIsolation.modes.filter((mode) => mode !== 'worktree');
+  if (unknownModes.length > 0) {
+    isolationSummaries.push(`Requests unsupported agent isolation mode(s): ${unknownModes.join(', ')}.`);
+  }
+  return [sourceSummary, ...isolationSummaries].join(' ');
+}
+
+function workflowRequestedIsolationModes(script: string): WorkflowIsolationReview {
+  const modes = new Set<string>();
+  let dynamic = workflowAgentCallsHaveDynamicOptions(script);
+  for (let index = 0; index < script.length; index += 1) {
+    const char = script[index] ?? '';
+    const next = script[index + 1] ?? '';
+    if (char === '/' && next === '/') {
+      index = skipLineComment(script, index + 2);
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      index = skipBlockComment(script, index + 2);
+      continue;
+    }
+    if (char === '.' && next === '.' && script[index + 2] === '.') {
+      dynamic = true;
+      index += 2;
+      continue;
+    }
+    if (char === '`') {
+      const template = readTemplateLiteralReview(script, index);
+      if (template) {
+        dynamic = template.dynamic || dynamic;
+        for (const mode of template.modes) modes.add(mode);
+        index = template.end;
+      } else {
+        dynamic = true;
+      }
+      continue;
+    }
+    if (char === '[') {
+      const computed = readComputedPropertyKey(script, index);
+      if (computed) {
+        if (computed.key === 'isolation') {
+          dynamic = readIsolationModeValue(script, computed.afterColon + 1, modes) || dynamic;
+        } else if (computed.hasColon) {
+          dynamic = true;
+        }
+        index = computed.end;
+      } else {
+        dynamic = true;
+      }
+      continue;
+    }
+    if (
+      char === '.'
+      && script.startsWith('isolation', index + 1)
+      && !isIdentifierChar(script[index + 1 + 'isolation'.length] ?? '')
+    ) {
+      dynamic = true;
+      index += 'isolation'.length;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      const key = readStringLiteral(script, index, char);
+      if (!key) continue;
+      const colon = firstNonCodeWhitespace(script, key.end + 1);
+      if (key.value === 'isolation' && script[colon] === ':') {
+        dynamic = readIsolationModeValue(script, colon + 1, modes) || dynamic;
+      }
+      index = key.end;
+      continue;
+    }
+    if (
+      script.startsWith('isolation', index)
+      && !isIdentifierChar(script[index - 1] ?? '')
+      && !isIdentifierChar(script[index + 'isolation'.length] ?? '')
+    ) {
+      const colon = firstNonCodeWhitespace(script, index + 'isolation'.length);
+      if (script[colon] === ':') {
+        dynamic = readIsolationModeValue(script, colon + 1, modes) || dynamic;
+      } else {
+        dynamic = true;
+      }
+      index += 'isolation'.length - 1;
+    }
+  }
+  return {
+    modes: [...modes].sort((left, right) => left.localeCompare(right)),
+    dynamic,
+  };
+}
+
+function workflowAgentCallsHaveDynamicOptions(script: string): boolean {
+  for (let index = 0; index < script.length; index += 1) {
+    const char = script[index] ?? '';
+    const next = script[index + 1] ?? '';
+    if (char === '/' && next === '/') {
+      index = skipLineComment(script, index + 2);
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      index = skipBlockComment(script, index + 2);
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      const literal = readStringLiteral(script, index, char);
+      if (!literal) continue;
+      index = literal.end;
+      continue;
+    }
+    if (char === '`') {
+      const template = readTemplateLiteralReview(script, index);
+      if (!template) return true;
+      if (template.dynamic) return true;
+      index = template.end;
+      continue;
+    }
+    if (!script.startsWith('agent', index) || isIdentifierChar(script[index - 1] ?? '') || isIdentifierChar(script[index + 5] ?? '')) {
+      continue;
+    }
+    const openParen = firstNonWhitespace(script, index + 5);
+    if (script[openParen] !== '(') continue;
+    const args = splitTopLevelCallArguments(script, openParen);
+    if (!args) return true;
+    if (args.args.length < 2) {
+      index = args.end;
+      continue;
+    }
+    const optionsArg = args.args[1]?.trim() ?? '';
+    if (!optionsArg.startsWith('{') || !optionsArg.endsWith('}')) return true;
+    if (optionsArg.includes('...')) return true;
+    index = args.end;
+  }
+  return false;
+}
+
+function readIsolationModeValue(script: string, start: number, modes: Set<string>): boolean {
+  const valueStart = firstNonCodeWhitespace(script, start);
+  const quote = script[valueStart];
+  if (quote === '"' || quote === "'") {
+    const value = readStringLiteral(script, valueStart, quote);
+    if (value?.value) modes.add(value.value);
+    return false;
+  }
+  if (quote === '`') {
+    const value = readSimpleTemplateLiteral(script, valueStart);
+    if (value?.value) {
+      modes.add(value.value);
+      return false;
+    }
+  }
+  return true;
+}
+
+function readComputedPropertyKey(
+  script: string,
+  start: number,
+): { readonly key?: string; readonly end: number; readonly hasColon: boolean; readonly afterColon: number } | null {
+  const closeBracket = findMatchingBracket(script, start);
+  if (closeBracket === -1) return null;
+  const keyStart = firstNonCodeWhitespace(script, start + 1);
+  const quote = script[keyStart];
+  let key: string | undefined;
+  if (quote === '"' || quote === "'") {
+    const literal = readStringLiteral(script, keyStart, quote);
+    if (!literal) return null;
+    if (firstNonCodeWhitespace(script, literal.end + 1) === closeBracket) key = literal.value;
+  }
+  const afterBracket = firstNonCodeWhitespace(script, closeBracket + 1);
+  const hasColon = script[afterBracket] === ':';
+  return {
+    ...(key !== undefined ? { key } : {}),
+    end: closeBracket,
+    hasColon,
+    afterColon: afterBracket,
+  };
+}
+
+function findMatchingBracket(script: string, start: number): number {
+  let depth = 0;
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = start; index < script.length; index += 1) {
+    const char = script[index] ?? '';
+    const next = script[index + 1] ?? '';
+    if (lineComment) {
+      if (char === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '/' && next === '/') {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === '`') {
+      index = skipTemplateLiteral(script, index + 1);
+      continue;
+    }
+    if (char === '[') {
+      depth += 1;
+      continue;
+    }
+    if (char === ']') {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function readSimpleTemplateLiteral(
+  script: string,
+  start: number,
+): { readonly value: string; readonly end: number } | null {
+  let value = '';
+  let escaped = false;
+  for (let index = start + 1; index < script.length; index += 1) {
+    const char = script[index] ?? '';
+    const next = script[index + 1] ?? '';
+    if (escaped) {
+      value += char;
+      escaped = false;
+    } else if (char === '\\') {
+      escaped = true;
+    } else if (char === '$' && next === '{') {
+      return null;
+    } else if (char === '`') {
+      return { value, end: index };
+    } else {
+      value += char;
+    }
+  }
+  return null;
+}
+
+function readTemplateLiteralReview(
+  script: string,
+  start: number,
+): { readonly end: number; readonly dynamic: boolean; readonly modes: readonly string[] } | null {
+  const modes = new Set<string>();
+  let dynamic = false;
+  let escaped = false;
+  for (let index = start + 1; index < script.length; index += 1) {
+    const char = script[index] ?? '';
+    const next = script[index + 1] ?? '';
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (char === '`') {
+      return {
+        end: index,
+        dynamic,
+        modes: [...modes].sort((left, right) => left.localeCompare(right)),
+      };
+    }
+    if (char === '$' && next === '{') {
+      const expressionStart = index + 2;
+      const expressionEnd = findMatchingExpressionBrace(script, expressionStart);
+      if (expressionEnd === -1) return null;
+      const nested = workflowRequestedIsolationModes(script.slice(expressionStart, expressionEnd));
+      dynamic = dynamic || nested.dynamic;
+      for (const mode of nested.modes) modes.add(mode);
+      index = expressionEnd;
+    }
+  }
+  return null;
+}
+
+function findMatchingExpressionBrace(script: string, start: number): number {
+  let depth = 1;
+  let quote: '"' | "'" | '`' | null = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = start; index < script.length; index += 1) {
+    const char = script[index] ?? '';
+    const next = script[index + 1] ?? '';
+    if (lineComment) {
+      if (char === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '/' && next === '/') {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char;
+      continue;
+    }
+    if (char === '{') depth += 1;
+    if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function splitTopLevelCallArguments(
+  script: string,
+  openParen: number,
+): { readonly args: readonly string[]; readonly end: number } | null {
+  let depth = 1;
+  let nestedParen = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let argStart = openParen + 1;
+  let quote: '"' | "'" | '`' | null = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  const args: string[] = [];
+  for (let index = openParen + 1; index < script.length; index += 1) {
+    const char = script[index] ?? '';
+    const next = script[index + 1] ?? '';
+    if (lineComment) {
+      if (char === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '/' && next === '/') {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char;
+      continue;
+    }
+    if (char === '(') {
+      nestedParen += 1;
+      continue;
+    }
+    if (char === '[') {
+      bracketDepth += 1;
+      continue;
+    }
+    if (char === ']') {
+      bracketDepth = Math.max(0, bracketDepth - 1);
+      continue;
+    }
+    if (char === '{') {
+      braceDepth += 1;
+      continue;
+    }
+    if (char === '}') {
+      braceDepth = Math.max(0, braceDepth - 1);
+      continue;
+    }
+    if (char === ')' && nestedParen === 0 && bracketDepth === 0 && braceDepth === 0) {
+      depth -= 1;
+      if (depth === 0) {
+        const lastArg = script.slice(argStart, index).trim();
+        if (lastArg) args.push(lastArg);
+        return { args, end: index };
+      }
+    }
+    if (char === ')' && nestedParen > 0) {
+      nestedParen -= 1;
+      continue;
+    }
+    if (char === ',' && nestedParen === 0 && bracketDepth === 0 && braceDepth === 0) {
+      args.push(script.slice(argStart, index));
+      argStart = index + 1;
+    }
+  }
+  return null;
+}
+
+function skipLineComment(script: string, start: number): number {
+  const lineEnd = script.indexOf('\n', start);
+  return lineEnd === -1 ? script.length : lineEnd;
+}
+
+function skipBlockComment(script: string, start: number): number {
+  const blockEnd = script.indexOf('*/', start);
+  return blockEnd === -1 ? script.length : blockEnd + 1;
+}
+
+function skipTemplateLiteral(script: string, start: number): number {
+  let escaped = false;
+  for (let index = start; index < script.length; index += 1) {
+    const char = script[index] ?? '';
+    if (escaped) {
+      escaped = false;
+    } else if (char === '\\') {
+      escaped = true;
+    } else if (char === '`') {
+      return index;
+    }
+  }
+  return script.length;
+}
+
+function isIdentifierChar(char: string): boolean {
+  return /[A-Za-z0-9_$]/.test(char);
+}
+
+function workflowScriptMetadataPath(scriptPath: string): string {
+  return `${scriptPath}.meta.json`;
+}
+
+function workflowScriptMetadataFromUnknown(value: unknown): WorkflowScriptMetadata | null {
+  const record = asRecord(value);
+  if (!record || record.version !== 1) return null;
+  if (typeof record.workflowName !== 'string' || !record.workflowName.trim()) return null;
+  if (!isWorkflowSource(record.workflowSource)) return null;
+  if (typeof record.scriptHash !== 'string' || !record.scriptHash.startsWith('sha256:')) return null;
+  if (record.workflowSourcePath !== undefined && typeof record.workflowSourcePath !== 'string') return null;
+  if (record.permissionKey !== undefined && typeof record.permissionKey !== 'string') return null;
+  return {
+    version: 1,
+    workflowName: record.workflowName,
+    workflowSource: record.workflowSource,
+    ...(typeof record.workflowSourcePath === 'string' ? { workflowSourcePath: record.workflowSourcePath } : {}),
+    scriptHash: record.scriptHash,
+    ...(typeof record.permissionKey === 'string' ? { permissionKey: record.permissionKey } : {}),
+  };
+}
+
+function workflowPermissionRecordFromUnknown(value: unknown): WorkflowPermissionRecord | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  if (typeof record.permissionKey !== 'string' || !record.permissionKey) return null;
+  if (record.decision !== 'allow' && record.decision !== 'deny') return null;
+  if (record.reviewVersion !== undefined && (
+    typeof record.reviewVersion !== 'number'
+    || !Number.isInteger(record.reviewVersion)
+    || record.reviewVersion < 1
+  )) return null;
+  if (typeof record.workflowName !== 'string' || !record.workflowName.trim()) return null;
+  if (!isWorkflowSource(record.workflowSource)) return null;
+  if (record.workflowSourcePath !== undefined && typeof record.workflowSourcePath !== 'string') return null;
+  if (typeof record.scriptHash !== 'string' || !record.scriptHash.startsWith('sha256:')) return null;
+  if (record.requestedIsolationModes !== undefined && (
+    !Array.isArray(record.requestedIsolationModes)
+    || record.requestedIsolationModes.some((item) => typeof item !== 'string')
+  )) return null;
+  if (record.dynamicIsolation !== undefined && typeof record.dynamicIsolation !== 'boolean') return null;
+  if (record.isolationReviewFingerprint !== undefined && (
+    typeof record.isolationReviewFingerprint !== 'string'
+    || !record.isolationReviewFingerprint.startsWith('sha256:')
+  )) return null;
+  if (typeof record.decidedAt !== 'string' || !record.decidedAt) return null;
+  return {
+    permissionKey: record.permissionKey,
+    decision: record.decision,
+    ...(typeof record.reviewVersion === 'number' ? { reviewVersion: record.reviewVersion } : {}),
+    workflowName: record.workflowName,
+    workflowSource: record.workflowSource,
+    ...(typeof record.workflowSourcePath === 'string' ? { workflowSourcePath: record.workflowSourcePath } : {}),
+    scriptHash: record.scriptHash,
+    ...(Array.isArray(record.requestedIsolationModes) ? { requestedIsolationModes: record.requestedIsolationModes } : {}),
+    ...(typeof record.dynamicIsolation === 'boolean' ? { dynamicIsolation: record.dynamicIsolation } : {}),
+    ...(typeof record.isolationReviewFingerprint === 'string' ? { isolationReviewFingerprint: record.isolationReviewFingerprint } : {}),
+    decidedAt: record.decidedAt,
+  };
+}
+
+function workflowPermissionRecordMatchesMetadata(
+  record: WorkflowPermissionRecord | undefined,
+  metadata: WorkflowScriptMetadata,
+  workflowName: string,
+  scriptHash: string,
+  isolationReview: WorkflowIsolationReview,
+): boolean {
+  return record?.decision === 'allow'
+    && record.workflowName === workflowName
+    && record.workflowSource === metadata.workflowSource
+    && record.workflowSourcePath === metadata.workflowSourcePath
+    && record.scriptHash === scriptHash
+    && workflowPermissionRecordMatchesCurrentReview(record, isolationReview);
+}
+
+function isWorkflowSource(value: unknown): value is WorkflowSource {
+  return value === 'inline'
+    || value === 'script_path'
+    || value === 'project'
+    || value === 'user'
+    || value === 'plugin'
+    || value === 'built_in';
+}
+
+function workflowPermissionDeniedError(
+  workflowName: string,
+  workflowSource: WorkflowSource,
+  scriptHash: string,
+): UltracodeRequestError {
+  return new UltracodeRequestError(
+    `Workflow permission denied for ${workflowName} (${workflowSource}, ${scriptHash}).`,
+    403,
+    'invalid_request_error',
+    WORKFLOW_INPUT_PARAM,
+    'workflow_permission_denied',
+  );
+}
+
+async function workflowScriptFiles(dir: string): Promise<readonly string[]> {
+  try {
+    const entries = await readdir(dir, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.js'))
+      .map((entry) => entry.name)
+      .sort((left, right) => left.localeCompare(right));
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return [];
+    throw workflowInputError(`Workflow directory cannot be read: ${dir}`);
+  }
+}
+
+function workflowFileName(file: string): string {
+  return basename(file, '.js');
+}
+
+function prefixedWorkflowName(name: string, prefix: string | undefined): string {
+  return prefix ? `${prefix}:${name}` : name;
+}
+
+function pluginWorkflowDirs(plugin: WorkflowPluginRegistry): readonly string[] {
+  return [
+    ...(plugin.workflowsDir ? [plugin.workflowsDir] : []),
+    ...(plugin.workflowsDirs ?? []),
+    ...(plugin.workflowsPath ? [plugin.workflowsPath] : []),
+    ...(plugin.workflowsPaths ?? []),
+  ];
+}
+
+function namedWorkflowNotFoundError(name: string, available: Set<string>): UltracodeRequestError {
+  const names = [...available].sort((left, right) => left.localeCompare(right));
+  const detail = names.length
+    ? ` Available workflows: ${names.slice(0, 20).join(', ')}${names.length > 20 ? ', ...' : ''}.`
+    : ' No workflows are registered.';
+  return workflowInputError(`Named workflow not found: ${name}.${detail}`);
+}
+
+function workflowScriptSlug(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return slug || 'workflow';
+}
+
+async function ensureWorkflowStateDirectory(directoryPath: string): Promise<void> {
+  await mkdir(directoryPath, { recursive: true, mode: WORKFLOW_STATE_DIR_MODE });
+  await chmod(directoryPath, WORKFLOW_STATE_DIR_MODE).catch(() => undefined);
+}
+
+async function writeWorkflowStateFile(
+  filePath: string,
+  data: string,
+  options: { readonly flag?: string } = {},
+): Promise<void> {
+  await writeFile(filePath, data, {
+    ...options,
+    mode: WORKFLOW_STATE_FILE_MODE,
+  });
+  await chmod(filePath, WORKFLOW_STATE_FILE_MODE).catch(() => undefined);
+}
+
+function pathInsideOrEqual(parent: string, child: string): boolean {
+  const candidate = relative(parent, child);
+  return candidate === '' || (!candidate.startsWith('..') && !isAbsolute(candidate));
+}
+
+function normalizeAgentStallRetryLimit(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_AGENT_STALL_RETRY_LIMIT;
+  if (!Number.isFinite(value)) return DEFAULT_AGENT_STALL_RETRY_LIMIT;
+  return Math.max(0, Math.floor(value));
+}
+
+function normalizeAgentStallTimeoutMs(
+  configured: number | undefined,
+  requestTimeoutMs: number,
+): number {
+  if (configured !== undefined && Number.isFinite(configured) && configured > 0) {
+    return Math.max(1, Math.floor(configured));
+  }
+  if (configured === 0 || requestTimeoutMs === 0) return 0;
+  return Math.max(1, Math.floor(requestTimeoutMs));
+}
+
+function workflowTaskSnapshot(task: WorkflowTaskMutable): WorkflowTaskSnapshot {
+  return {
+    taskId: task.taskId,
+    runId: task.runId,
+    workflowName: task.workflowName,
+    status: task.status,
+    taskType: task.taskType,
+    transcriptDir: task.transcriptDir,
+    scriptPath: task.scriptPath,
+    workflowSource: task.workflowSource,
+    ...(task.workflowSourcePath ? { workflowSourcePath: task.workflowSourcePath } : {}),
+    scriptHash: task.scriptHash,
+    ...(task.resultPath ? { resultPath: task.resultPath } : {}),
+    ...(task.result !== undefined ? { result: task.result } : {}),
+    ...(task.error ? { error: task.error } : {}),
+    ...(task.failureReason ? { failureReason: task.failureReason } : {}),
+    events: [...task.events],
+  };
+}
+
+function parseInlineWorkflowScript(script: string): ParsedWorkflowScript {
+  if (Buffer.byteLength(script, 'utf8') > MAX_SCRIPT_BYTES) {
+    throw workflowMetaError('Workflow script exceeds the runtime size cap.');
+  }
+  const trimmedStart = script.trimStart();
+  if (!trimmedStart.startsWith('export const meta')) {
+    throw workflowMetaError('Workflow script must start with export const meta = {...};');
+  }
+  rejectForbiddenSyntax(script);
+  const metaStart = script.indexOf('export const meta');
+  const equals = script.indexOf('=', metaStart);
+  if (equals === -1) throw workflowMetaError('Workflow meta declaration must assign a pure object literal.');
+  const objectStart = firstNonWhitespace(script, equals + 1);
+  if (script[objectStart] !== '{') {
+    throw workflowMetaError('Workflow meta must be a pure object literal.');
+  }
+  const objectEnd = findMatchingBrace(script, objectStart);
+  const semicolon = firstNonWhitespace(script, objectEnd + 1);
+  if (script[semicolon] !== ';') {
+    throw workflowMetaError('Workflow meta declaration must end with a semicolon.');
+  }
+  const metaLiteral = script.slice(objectStart, objectEnd + 1);
+  rejectImpureMeta(metaLiteral);
+  const meta = readMetaLiteral(metaLiteral);
+  return {
+    meta,
+    metaLiteral,
+    body: script.slice(semicolon + 1),
+  };
+}
+
+function rejectForbiddenSyntax(script: string): void {
+  const stripped = stripCommentsAndStrings(script);
+  rejectForbiddenComputedLiteralAccess(script);
+  const rawForbidden: Array<[RegExp, string]> = [
+    [/\b(?:constructor|prototype|__proto__)\b/, 'prototype/constructor access is disabled in workflows.'],
+    [/\b(?:process|require|globalThis|global|module|exports)\b/, 'host runtime access is disabled in workflows.'],
+  ];
+  for (const [pattern, message] of rawForbidden) {
+    if (pattern.test(stripped)) throw workflowScriptError(message);
+  }
+  const checks: Array<[RegExp, string]> = [
+    [/\bDate\s*(?:\.|\[|\()/, 'Date is disabled in workflows.'],
+    [/\bnew\s+Date\s*\(\s*\)/, 'argless new Date() is nondeterministic.'],
+    [/\bMath\.random\s*\(/, 'Math.random() is nondeterministic.'],
+    [/\bMath\s*\[/, 'computed Math access is disabled in workflows.'],
+    [/\bimport\s*\(/, 'dynamic import is disabled in workflows.'],
+    [/\beval\s*\(/, 'eval is disabled in workflows.'],
+    [/\bFunction\s*\(/, 'Function constructor is disabled in workflows.'],
+    [/\bWebAssembly\b/, 'WebAssembly code generation is disabled in workflows.'],
+    [/\brequire\s*\(/, 'require is disabled in workflows.'],
+    [/\basync\b/, 'async function definitions are disabled in workflows.'],
+    [/(^|[^?]):\s*(string|number|boolean|unknown|any|Record|Array|Promise)\b/, 'TypeScript syntax is not accepted in workflow scripts.'],
+  ];
+  for (const [pattern, message] of checks) {
+    if (pattern.test(stripped)) throw workflowScriptError(message);
+  }
+}
+
+function rejectForbiddenComputedLiteralAccess(script: string): void {
+  let quote: '"' | "'" | '`' | null = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = 0; index < script.length; index += 1) {
+    const char = script[index] ?? '';
+    const next = script[index + 1] ?? '';
+    if (lineComment) {
+      if (char === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '/' && next === '/') {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char;
+      continue;
+    }
+    if (char !== '[') continue;
+    const literalStart = firstNonWhitespace(script, index + 1);
+    const literalQuote = script[literalStart];
+    if (literalQuote !== '"' && literalQuote !== "'") continue;
+    const literal = readStringLiteral(script, literalStart, literalQuote);
+    if (!literal) continue;
+    const closeBracket = firstNonWhitespace(script, literal.end + 1);
+    if (script[closeBracket] !== ']') continue;
+    if (FORBIDDEN_HOST_PROPERTY_NAMES.has(literal.value)) {
+      throw workflowScriptError(`computed ${literal.value} access is disabled in workflows.`);
+    }
+  }
+}
+
+function readStringLiteral(
+  text: string,
+  start: number,
+  quote: '"' | "'",
+): { readonly value: string; readonly end: number } | null {
+  let value = '';
+  for (let index = start + 1; index < text.length; index += 1) {
+    const char = text[index] ?? '';
+    if (char === quote) return { value, end: index };
+    if (char !== '\\') {
+      value += char;
+      continue;
+    }
+    const escaped = text[index + 1] ?? '';
+    if (escaped === 'u') {
+      const hex = text.slice(index + 2, index + 6);
+      if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+        value += String.fromCharCode(Number.parseInt(hex, 16));
+        index += 5;
+        continue;
+      }
+    }
+    if (escaped === 'x') {
+      const hex = text.slice(index + 2, index + 4);
+      if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+        value += String.fromCharCode(Number.parseInt(hex, 16));
+        index += 3;
+        continue;
+      }
+    }
+    value += escaped;
+    index += 1;
+  }
+  return null;
+}
+
+function rejectImpureMeta(metaLiteral: string): void {
+  const stripped = stripCommentsAndStrings(metaLiteral);
+  if (containsTemplateLiteral(metaLiteral)) {
+    throw workflowMetaError('Workflow meta must not use template literals.');
+  }
+  const checks: Array<[RegExp, string]> = [
+    [/\.\.\./, 'Workflow meta must not use spread syntax.'],
+    [/\[[^\]]+\]\s*:/, 'Workflow meta must not use computed keys.'],
+    [/\b(get|set)\s+[A-Za-z_$]/, 'Workflow meta must not use accessors.'],
+    [/=>|\bfunction\b/, 'Workflow meta must not use functions.'],
+    [/\bnew\b|\bimport\b|\beval\b/, 'Workflow meta must not call code.'],
+    [/\b(__proto__|constructor|prototype)\b/, 'Workflow meta contains a forbidden key.'],
+    [/[()]/, 'Workflow meta must be a pure literal without calls or grouping.'],
+  ];
+  for (const [pattern, message] of checks) {
+    if (pattern.test(stripped)) throw workflowMetaError(message);
+  }
+}
+
+function readMetaLiteral(metaLiteral: string): WorkflowMeta {
+  let value: unknown;
+  try {
+    const context = createWorkflowVmContext();
+    disableDangerousGlobals(context);
+    value = runInContext(`(${metaLiteral})`, context, { timeout: 50 });
+  } catch (err) {
+    throw workflowMetaError(`Workflow meta object is invalid: ${workflowErrorMessage(err)}`);
+  }
+  const meta = asRecord(value);
+  if (!meta || typeof meta.name !== 'string' || meta.name.trim() === '') {
+    throw workflowMetaError('Workflow meta.name must be a non-empty string.');
+  }
+  if (meta.description !== undefined && typeof meta.description !== 'string') {
+    throw workflowMetaError('Workflow meta.description must be a string when present.');
+  }
+  if (meta.phases !== undefined) {
+    if (!Array.isArray(meta.phases)) throw workflowMetaError('Workflow meta.phases must be an array.');
+    for (const phase of meta.phases) {
+      const phaseRecord = asRecord(phase);
+      if (!phaseRecord || typeof phaseRecord.title !== 'string' || phaseRecord.title.trim() === '') {
+        throw workflowMetaError('Every workflow phase must have a non-empty title.');
+      }
+      if (phaseRecord.detail !== undefined && typeof phaseRecord.detail !== 'string') {
+        throw workflowMetaError('Workflow phase detail must be a string when present.');
+      }
+    }
+  }
+  return {
+    name: meta.name,
+    ...(typeof meta.description === 'string' ? { description: meta.description } : {}),
+    ...(Array.isArray(meta.phases) ? { phases: meta.phases as WorkflowMeta['phases'] } : {}),
+  };
+}
+
+async function executeInlineWorkflow(
+  parsed: ParsedWorkflowScript,
+  globals: WorkflowVmGlobals,
+  signal: AbortSignal,
+): Promise<unknown> {
+  const context = createWorkflowVmContext();
+  installWorkflowVmGlobals(context, globals);
+  const wrapped = [
+    '"use strict";',
+    `const meta = ${parsed.metaLiteral};`,
+    'async function __workflow_main() {',
+    parsed.body,
+    '}',
+    '__workflow_main.call(undefined);',
+  ].join('\n');
+  const result = runInContext(wrapped, context, { timeout: 250 });
+  return await abortable(result, signal);
+}
+
+function createWorkflowVmContext(): ReturnType<typeof createContext> {
+  return createContext({
+    Math: safeMath(),
+  }, {
+    codeGeneration: { strings: false, wasm: false },
+  });
+}
+
+function installWorkflowVmGlobals(
+  context: ReturnType<typeof createContext>,
+  globals: WorkflowVmGlobals,
+): void {
+  globals.setVmValueProjector(createWorkflowVmValueProjector(context));
+  Object.defineProperty(context, '__workflowHost', {
+    value: globals.host,
+    configurable: true,
+    enumerable: false,
+    writable: false,
+  });
+  runInContext([
+    '"use strict";',
+    '{',
+    '  const define = Object.defineProperty;',
+    '  const freeze = Object.freeze;',
+    '  const __host = globalThis.__workflowHost;',
+    '  const NativePromise = Promise;',
+    '  delete globalThis.__workflowHost;',
+    '  function WorkflowPromise(executor) {',
+    '    if (typeof executor !== "function") throw new TypeError("Promise resolver must be a function");',
+    '    return __host.trackPromise(new NativePromise(executor));',
+    '  }',
+    '  define(WorkflowPromise, "resolve", { value: (value) => __host.trackPromise(NativePromise.resolve(value)), writable: false, configurable: false });',
+    '  define(WorkflowPromise, "reject", { value: (reason) => __host.trackPromise(NativePromise.reject(reason)), writable: false, configurable: false });',
+    '  define(WorkflowPromise, "all", { value: (values) => __host.trackPromise(NativePromise.all(values)), writable: false, configurable: false });',
+    '  define(WorkflowPromise, "allSettled", { value: (values) => __host.trackPromise(NativePromise.allSettled(values)), writable: false, configurable: false });',
+    '  define(WorkflowPromise, "any", { value: (values) => __host.trackPromise(NativePromise.any(values)), writable: false, configurable: false });',
+    '  define(WorkflowPromise, "race", { value: (values) => __host.trackPromise(NativePromise.race(values)), writable: false, configurable: false });',
+    '  try { Object.setPrototypeOf(WorkflowPromise, null); } catch {}',
+    '  try { Object.setPrototypeOf(WorkflowPromise.prototype, null); } catch {}',
+    `  define(globalThis, "args", { value: ${globals.argsLiteral}, writable: false, configurable: false });`,
+    `  define(globalThis, "budget", { value: freeze(${globals.budgetLiteral}), writable: false, configurable: false });`,
+    '  define(globalThis, "Promise", { value: freeze(WorkflowPromise), writable: false, configurable: false });',
+    '  define(globalThis, "agent", { value: (...values) => __host.agent(...values), writable: false, configurable: false });',
+    '  define(globalThis, "parallel", { value: (...values) => __host.parallel(...values), writable: false, configurable: false });',
+    '  define(globalThis, "pipeline", { value: (...values) => __host.pipeline(...values), writable: false, configurable: false });',
+    '  define(globalThis, "workspaceContext", { value: (...values) => __host.workspaceContext(...values), writable: false, configurable: false });',
+    '  define(globalThis, "announcePlan", { value: (...values) => __host.announcePlan(...values), writable: false, configurable: false });',
+    '  define(globalThis, "announcePhasePlan", { value: (...values) => __host.announcePhasePlan(...values), writable: false, configurable: false });',
+    '  define(globalThis, "phase", { value: (...values) => __host.phase(...values), writable: false, configurable: false });',
+    '  define(globalThis, "log", { value: (...values) => __host.log(...values), writable: false, configurable: false });',
+    '  define(globalThis, "workflow", { value: (...values) => __host.workflow(...values), writable: false, configurable: false });',
+    '  define(globalThis, "setTimeout", { value: (...values) => __host.setTimeout(...values), writable: false, configurable: false });',
+    '  define(globalThis, "clearTimeout", { value: (...values) => __host.clearTimeout(...values), writable: false, configurable: false });',
+    '  define(globalThis, "console", { value: freeze({',
+    '    log: (...values) => __host.consoleLog(...values),',
+    '    warn: (...values) => __host.consoleLog(...values),',
+    '    error: (...values) => __host.consoleLog(...values),',
+    '  }), writable: false, configurable: false });',
+    '}',
+  ].join('\n'), context, { timeout: 50 });
+  hardenWorkflowVmIntrinsics(context);
+  disableDangerousGlobals(context);
+}
+
+function createWorkflowVmValueProjector(context: ReturnType<typeof createContext>): (value: unknown) => unknown {
+  return (value: unknown): unknown => {
+    if (value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      return value;
+    }
+    if (value === undefined || typeof value === 'function' || typeof value === 'symbol') return undefined;
+    if (value instanceof Error) return projectWorkflowErrorToVm(context, value);
+    const json = JSON.stringify(workflowVmSerializableValue(value));
+    if (json === undefined) return undefined;
+    Object.defineProperty(context, '__workflowValueJson', {
+      value: json,
+      configurable: true,
+      enumerable: false,
+      writable: true,
+    });
+    try {
+      return runInContext('JSON.parse(__workflowValueJson)', context, { timeout: 50 });
+    } finally {
+      delete (context as Record<string, unknown>).__workflowValueJson;
+    }
+  };
+}
+
+function projectWorkflowErrorToVm(context: ReturnType<typeof createContext>, err: Error): unknown {
+  const source = err as Error & { readonly code?: unknown };
+  const payload = {
+    name: err.name,
+    message: err.message,
+    ...(typeof source.code === 'string' ? { code: source.code } : {}),
+  };
+  Object.defineProperty(context, '__workflowErrorJson', {
+    value: JSON.stringify(payload),
+    configurable: true,
+    enumerable: false,
+    writable: true,
+  });
+  try {
+    return runInContext([
+      '(() => {',
+      '  const payload = JSON.parse(__workflowErrorJson);',
+      '  const err = new Error(payload.message);',
+      '  try { err.name = payload.name || "Error"; } catch {}',
+      '  if (typeof payload.code === "string") {',
+      '    try { err.code = payload.code; } catch {}',
+      '  }',
+      '  return err;',
+      '})()',
+    ].join('\n'), context, { timeout: 50 });
+  } finally {
+    delete (context as Record<string, unknown>).__workflowErrorJson;
+  }
+}
+
+function workflowVmSerializableValue(value: unknown): unknown {
+  return value;
+}
+
+function hardenWorkflowVmIntrinsics(context: ReturnType<typeof createContext>): void {
+  runInContext([
+    '"use strict";',
+    '{',
+    '  const define = Object.defineProperty;',
+    '  const constructors = [',
+    '    Object, Function, Array, String, Number, Boolean, RegExp, Error, TypeError, Promise, Map, Set,',
+    '    async function () {}.constructor,',
+    '    function* () {}.constructor,',
+    '    async function* () {}.constructor,',
+    '  ];',
+    '  for (const ctor of constructors) {',
+    '    if (!ctor || !ctor.prototype) continue;',
+    '    try { define(ctor.prototype, "constructor", { value: undefined, writable: false, configurable: false }); } catch {}',
+    '  }',
+    '  try { define(Object.prototype, "__proto__", { value: undefined, writable: false, configurable: false }); } catch {}',
+    '}',
+  ].join('\n'), context, { timeout: 50 });
+}
+
+function disableDangerousGlobals(context: ReturnType<typeof createContext>): void {
+  runInContext([
+    '"use strict";',
+    '{',
+    '  const define = Object.defineProperty;',
+    '  for (const name of ["Date", "Function", "eval", "WebAssembly", "require", "process", "global", "module", "exports", "Object", "Reflect", "globalThis"]) {',
+    '    define(globalThis, name, { value: undefined, writable: false, configurable: false });',
+    '  }',
+    '}',
+  ].join('\n'), context, { timeout: 50 });
+}
+
+function safeMath(): Math {
+  const math = Object.create(null) as Math;
+  for (const key of Object.getOwnPropertyNames(Math) as Array<keyof Math>) {
+    if (key === 'random') continue;
+    const descriptor = Object.getOwnPropertyDescriptor(Math, key);
+    if (!descriptor) continue;
+    if ('value' in descriptor && typeof descriptor.value === 'function') {
+      const fn = descriptor.value as (...args: unknown[]) => unknown;
+      Object.defineProperty(math, key, {
+        value: hardenCallable((...args: unknown[]) => fn(...args)),
+        enumerable: descriptor.enumerable,
+        configurable: false,
+        writable: false,
+      });
+    } else {
+      Object.defineProperty(math, key, descriptor);
+    }
+  }
+  return Object.freeze(math);
+}
+
+function hardenCallable<T extends (...args: never[]) => unknown>(fn: T): T {
+  Object.setPrototypeOf(fn, null);
+  Object.defineProperty(fn, 'constructor', { value: undefined, configurable: false, writable: false });
+  Object.defineProperty(fn, 'prototype', { value: undefined, configurable: false, writable: false });
+  return Object.freeze(fn);
+}
+
+function handledWorkflowPromise<T>(
+  promise: Promise<T>,
+  tracking?: WorkflowPromiseTracking,
+): HandledWorkflowPromise<T> {
+  promise.catch(() => undefined);
+  const thenable = Object.create(null) as HandledWorkflowPromise<T>;
+  Object.defineProperties(thenable, {
+    then: {
+      value: hardenCallable(<TResult1 = T, TResult2 = never>(
+        onfulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
+        onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+      ): HandledWorkflowPromise<TResult1 | TResult2> => {
+        if (typeof onrejected === 'function' && tracking) tracking.handled = true;
+        const wrappedFulfilled = typeof onfulfilled === 'function'
+          ? (value: T) => onfulfilled((tracking?.projectValue(value) ?? value) as T)
+          : onfulfilled;
+        const wrappedRejected = typeof onrejected === 'function'
+          ? (reason: unknown) => onrejected(tracking?.projectValue(reason) ?? reason)
+          : onrejected;
+        const nextPromise = promise.then(wrappedFulfilled, wrappedRejected);
+        return tracking ? tracking.trackPromise(nextPromise) : handledWorkflowPromise(nextPromise);
+      }),
+      enumerable: true,
+      configurable: false,
+      writable: false,
+    },
+    catch: {
+      value: hardenCallable(<TResult = never>(
+        onrejected?: ((reason: unknown) => TResult | PromiseLike<TResult>) | null,
+      ): HandledWorkflowPromise<T | TResult> => {
+        if (tracking) tracking.handled = true;
+        const wrappedRejected = typeof onrejected === 'function'
+          ? (reason: unknown) => onrejected(tracking?.projectValue(reason) ?? reason)
+          : onrejected;
+        const nextPromise = promise.catch(wrappedRejected);
+        return tracking ? tracking.trackPromise(nextPromise) : handledWorkflowPromise(nextPromise);
+      }),
+      enumerable: true,
+      configurable: false,
+      writable: false,
+    },
+    finally: {
+      value: hardenCallable((onfinally?: (() => void) | null): HandledWorkflowPromise<T> => {
+        if (tracking) tracking.handled = true;
+        const nextPromise = promise.finally(onfinally);
+        return tracking ? tracking.trackPromise(nextPromise) : handledWorkflowPromise(nextPromise);
+      }),
+      enumerable: true,
+      configurable: false,
+      writable: false,
+    },
+  });
+  return Object.freeze(thenable);
+}
+
+function vmDataLiteral(value: unknown, label: string): string {
+  if (value === undefined) return 'undefined';
+  try {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) {
+      throw new Error(`${label} must be JSON-serializable for workflow VM.`);
+    }
+    return serialized;
+  } catch (err) {
+    throw workflowInputError(workflowErrorMessage(err, `${label} must be JSON-serializable for workflow VM.`));
+  }
+}
+
+async function abortable<T>(value: Promise<T> | T, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw workflowInputError('Workflow is aborted.');
+  return await Promise.race([
+    Promise.resolve(value),
+    new Promise<T>((_, reject) => {
+      signal.addEventListener('abort', () => reject(workflowInputError('Workflow is aborted.')), { once: true });
+    }),
+  ]);
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function waitForWorkflowTaskEvent(task: WorkflowTaskMutable, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return false;
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    const cleanup = (): void => {
+      const index = task.waiters.indexOf(waiter);
+      if (index !== -1) task.waiters.splice(index, 1);
+      signal?.removeEventListener('abort', abort);
+    };
+    const finish = (value: boolean): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const waiter = (): void => finish(true);
+    const abort = (): void => finish(false);
+    task.waiters.push(waiter);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+  });
+}
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await fn(items[index] as T, index);
+    }
+  }));
+  return results;
+}
+
+function isTerminalWorkflowEvent(event: WorkflowEvent): boolean {
+  return event.type === 'workflow.completed' || event.type === 'workflow.failed';
+}
+
+function agentRequest(input: {
+  readonly model: string;
+  readonly prompt: string;
+  readonly schema?: Record<string, unknown>;
+  readonly worktreePath?: string;
+}): SubagentRequest {
+  const tools = input.schema ? [{
+    name: STRUCTURED_OUTPUT_TOOL_NAME,
+    description: 'Submit the canonical structured return value for this workflow agent.',
+    inputSchema: input.schema,
+  }] : [];
+  const prompt = input.worktreePath
+    ? [
+        input.prompt,
+        '',
+        'Worktree isolation is enabled. The runtime has set your current working directory to the isolated worktree.',
+        'Make any file changes inside the current working directory only.',
+      ].join('\n')
+    : input.prompt;
+  return {
+    model: input.model,
+    messages: [{
+      role: 'user',
+      content: prompt,
+    }],
+    reasoningEffort: 'xhigh',
+    tools,
+    toolChoice: input.schema ? { type: 'required' } : { type: 'auto' },
+    ...(input.worktreePath ? { worktreePath: input.worktreePath } : {}),
+    raw: {
+      localWorkflowAgent: true,
+      ...(input.schema ? { structuredOutput: true } : {}),
+      ...(input.worktreePath ? { isolation: 'worktree' } : {}),
+    },
+  };
+}
+
+function agentResultText(result: SubagentResult): string {
+  if (result.text) return result.text;
+  if (result.toolCalls.length > 0) return JSON.stringify(result.toolCalls);
+  return '';
+}
+
+function structuredAgentResult(
+  result: SubagentResult,
+  schema: Record<string, unknown>,
+): unknown {
+  const structuredCalls = result.toolCalls.filter((call) => call.name === STRUCTURED_OUTPUT_TOOL_NAME);
+  if (structuredCalls.length !== 1 || result.toolCalls.length !== 1) {
+    throw workflowStructuredOutputError('StructuredOutput tool call is required for schema-based workflow agents.');
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(structuredCalls[0]?.arguments ?? '');
+  } catch (err) {
+    throw workflowStructuredOutputError(`StructuredOutput arguments must be valid JSON: ${workflowErrorMessage(err)}`);
+  }
+  const error = validateJsonSchemaValue(value, schema);
+  if (error) throw workflowStructuredOutputError(error);
+  return value;
+}
+
+function normalizeStructuredOutputSchema(value: unknown): Record<string, unknown> | undefined {
+  if (value === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(vmDataLiteral(value, 'agent schema')) as unknown;
+  } catch (err) {
+    if (err instanceof UltracodeRequestError) throw err;
+    throw workflowInputError(workflowErrorMessage(err, 'agent schema must be JSON-serializable.'));
+  }
+  const schema = asRecord(parsed);
+  if (!schema) throw workflowInputError('agent schema must be a JSON Schema object.');
+  assertSupportedJsonSchema(schema, 'agent schema');
+  return schema;
+}
+
+function assertSupportedJsonSchema(schema: unknown, path: string): void {
+  if (typeof schema === 'boolean') return;
+  const record = asRecord(schema);
+  if (!record) throw workflowInputError(`${path} must be a JSON Schema object.`);
+  for (const key of Object.keys(record)) {
+    if (!JSON_SCHEMA_KEYS.has(key)) {
+      throw workflowInputError(`${path}.${key} is not supported by the workflow schema validator.`);
+    }
+  }
+  const type = record.type;
+  if (type !== undefined) {
+    const types = Array.isArray(type) ? type : [type];
+    if (
+      types.length === 0
+      || !types.every((item) => typeof item === 'string' && JSON_SCHEMA_TYPES.has(item))
+    ) {
+      throw workflowInputError(`${path}.type must be a JSON Schema primitive type or type array.`);
+    }
+  }
+  const properties = record.properties;
+  if (properties !== undefined) {
+    const propertySchemas = asRecord(properties);
+    if (!propertySchemas) throw workflowInputError(`${path}.properties must be an object.`);
+    for (const [key, child] of Object.entries(propertySchemas)) {
+      assertSupportedJsonSchema(child, `${path}.properties.${key}`);
+    }
+  }
+  const required = record.required;
+  if (required !== undefined && (!Array.isArray(required) || !required.every((item) => typeof item === 'string'))) {
+    throw workflowInputError(`${path}.required must be an array of strings.`);
+  }
+  const additionalProperties = record.additionalProperties;
+  if (
+    additionalProperties !== undefined
+    && typeof additionalProperties !== 'boolean'
+  ) {
+    assertSupportedJsonSchema(additionalProperties, `${path}.additionalProperties`);
+  }
+  if (record.items !== undefined) {
+    assertSupportedJsonSchema(record.items, `${path}.items`);
+  }
+  if (record.enum !== undefined && !Array.isArray(record.enum)) {
+    throw workflowInputError(`${path}.enum must be an array.`);
+  }
+  for (const key of ['minimum', 'maximum', 'minLength', 'maxLength', 'minItems', 'maxItems']) {
+    const constraint = record[key];
+    if (constraint !== undefined && (typeof constraint !== 'number' || !Number.isFinite(constraint))) {
+      throw workflowInputError(`${path}.${key} must be a finite number.`);
+    }
+  }
+}
+
+function validateJsonSchemaValue(value: unknown, schema: unknown, path = '$'): string | null {
+  if (schema === true) return null;
+  if (schema === false) return `${path} is rejected by schema.`;
+  const record = asRecord(schema);
+  if (!record) return `${path} schema is invalid.`;
+  if (Array.isArray(record.enum) && !record.enum.some((item) => jsonDeepEqual(item, value))) {
+    return `${path} must equal one of the schema enum values.`;
+  }
+  const typeError = validateJsonSchemaType(value, record.type, path);
+  if (typeError) return typeError;
+  if (isJsonObject(value)) {
+    const required = Array.isArray(record.required) ? record.required : [];
+    for (const key of required) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) return `${path}.${key} is required by schema.`;
+    }
+    const properties = asRecord(record.properties) ?? {};
+    for (const [key, childSchema] of Object.entries(properties)) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        const childError = validateJsonSchemaValue(value[key], childSchema, `${path}.${key}`);
+        if (childError) return childError;
+      }
+    }
+    const additionalProperties = record.additionalProperties;
+    if (additionalProperties !== undefined) {
+      for (const key of Object.keys(value)) {
+        if (Object.prototype.hasOwnProperty.call(properties, key)) continue;
+        if (additionalProperties === false) return `${path}.${key} is not allowed by schema.`;
+        if (additionalProperties !== true) {
+          const childError = validateJsonSchemaValue(value[key], additionalProperties, `${path}.${key}`);
+          if (childError) return childError;
+        }
+      }
+    }
+  }
+  if (Array.isArray(value)) {
+    const minItems = numberConstraint(record.minItems);
+    if (minItems !== undefined && value.length < minItems) return `${path} must contain at least ${minItems} items.`;
+    const maxItems = numberConstraint(record.maxItems);
+    if (maxItems !== undefined && value.length > maxItems) return `${path} must contain at most ${maxItems} items.`;
+    if (record.items !== undefined) {
+      for (const [index, item] of value.entries()) {
+        const itemError = validateJsonSchemaValue(item, record.items, `${path}[${index}]`);
+        if (itemError) return itemError;
+      }
+    }
+  }
+  if (typeof value === 'string') {
+    const minLength = numberConstraint(record.minLength);
+    if (minLength !== undefined && value.length < minLength) return `${path} must contain at least ${minLength} characters.`;
+    const maxLength = numberConstraint(record.maxLength);
+    if (maxLength !== undefined && value.length > maxLength) return `${path} must contain at most ${maxLength} characters.`;
+  }
+  if (typeof value === 'number') {
+    const minimum = numberConstraint(record.minimum);
+    if (minimum !== undefined && value < minimum) return `${path} must be at least ${minimum}.`;
+    const maximum = numberConstraint(record.maximum);
+    if (maximum !== undefined && value > maximum) return `${path} must be at most ${maximum}.`;
+  }
+  return null;
+}
+
+function validateJsonSchemaType(value: unknown, type: unknown, path: string): string | null {
+  if (type === undefined) return null;
+  const types = Array.isArray(type) ? type : [type];
+  if (types.some((item) => typeof item === 'string' && jsonTypeMatches(value, item))) return null;
+  return `${path} must be ${types.join(' or ')}.`;
+}
+
+function jsonTypeMatches(value: unknown, type: string): boolean {
+  if (type === 'null') return value === null;
+  if (type === 'array') return Array.isArray(value);
+  if (type === 'object') return isJsonObject(value);
+  if (type === 'integer') return typeof value === 'number' && Number.isInteger(value);
+  return typeof value === type;
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function numberConstraint(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function jsonDeepEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function findMatchingBrace(text: string, start: number): number {
+  let depth = 0;
+  let quote: '"' | "'" | '`' | null = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index] ?? '';
+    const next = text[index + 1] ?? '';
+    if (lineComment) {
+      if (char === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '/' && next === '/') {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char;
+      continue;
+    }
+    if (char === '{') depth += 1;
+    if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  throw workflowMetaError('Workflow meta object is not closed.');
+}
+
+function firstNonWhitespace(text: string, start: number): number {
+  for (let index = start; index < text.length; index += 1) {
+    if (!/\s/.test(text[index] ?? '')) return index;
+  }
+  return text.length;
+}
+
+function firstNonCodeWhitespace(text: string, start: number): number {
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index] ?? '';
+    const next = text[index + 1] ?? '';
+    if (/\s/.test(char)) continue;
+    if (char === '/' && next === '/') {
+      index = skipLineComment(text, index + 2);
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      index = skipBlockComment(text, index + 2);
+      continue;
+    }
+    return index;
+  }
+  return text.length;
+}
+
+function stripCommentsAndStrings(text: string): string {
+  let out = '';
+  let quote: '"' | "'" | '`' | null = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index] ?? '';
+    const next = text[index + 1] ?? '';
+    if (lineComment) {
+      out += char === '\n' ? '\n' : ' ';
+      if (char === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        out += '  ';
+        blockComment = false;
+        index += 1;
+      } else {
+        out += char === '\n' ? '\n' : ' ';
+      }
+      continue;
+    }
+    if (quote) {
+      out += char === '\n' ? '\n' : ' ';
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '/' && next === '/') {
+      out += '  ';
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      out += '  ';
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === '`') {
+      out += ' ';
+      quote = char;
+      continue;
+    }
+    out += char;
+  }
+  return out;
+}
+
+function containsTemplateLiteral(text: string): boolean {
+  let quote: '"' | "'" | null = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index] ?? '';
+    const next = text[index + 1] ?? '';
+    if (lineComment) {
+      if (char === '\n') lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === '*' && next === '/') {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '/' && next === '/') {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === '`') return true;
+  }
+  return false;
+}
+
+function preview(text: string, limit: number): string {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  return normalized.length <= limit ? normalized : `${normalized.slice(0, limit - 1)}...`;
+}
+
+function previewValue(value: unknown, limit: number): string {
+  const text = typeof value === 'string'
+    ? value
+    : JSON.stringify(value) ?? String(value);
+  return preview(text, limit);
+}
+
+function normalizeWorkflowExecutionPlan(value: unknown): WorkflowExecutionPlan {
+  const record = asRecord(value);
+  if (!record) throw workflowInputError('announcePlan(plan) requires a plan object.');
+  const mode = boundedPlanString(record.mode, 'phase_parallel', 48);
+  const rationale = optionalBoundedPlanString(record.rationale, 400);
+  const rawPhases = Array.isArray(record.phases) ? Array.from(record.phases) : [];
+  if (rawPhases.length === 0) throw workflowInputError('announcePlan(plan) requires at least one phase.');
+  const phases = rawPhases
+    .slice(0, 16)
+    .map((phaseValue, phaseIndex) => normalizeWorkflowPhasePlan(
+      phaseValue,
+      `announcePlan(plan).phases[${phaseIndex}]`,
+      phaseIndex,
+    ));
+  return {
+    mode,
+    ...(rationale ? { rationale } : {}),
+    phases,
+  };
+}
+
+function normalizeWorkflowPhasePlan(
+  value: unknown,
+  label: string,
+  phaseIndex = 0,
+): WorkflowPlanPhase {
+  const phase = asRecord(value);
+  if (!phase) throw workflowInputError(`${label} must be an object.`);
+  const rawAgents = Array.isArray(phase.agents) ? Array.from(phase.agents) : [];
+  if (rawAgents.length === 0) {
+    throw workflowInputError(`${label}.agents requires at least one agent.`);
+  }
+  return {
+    ...(typeof phase.id === 'string' && phase.id.trim() ? { id: boundedPlanString(phase.id, '', 48) } : {}),
+    title: boundedPlanString(phase.title, `Phase ${phaseIndex + 1}`, 96),
+    ...(typeof phase.goal === 'string' && phase.goal.trim() ? { goal: boundedPlanString(phase.goal, '', 600) } : {}),
+    agents: rawAgents.slice(0, 16).map((agentValue, agentIndex) => {
+      const agent = asRecord(agentValue);
+      if (!agent) {
+        throw workflowInputError(`${label}.agents[${agentIndex}] must be an object.`);
+      }
+      return {
+        ...(typeof agent.id === 'string' && agent.id.trim() ? { id: boundedPlanString(agent.id, '', 48) } : {}),
+        title: boundedPlanString(agent.title, `Agent ${agentIndex + 1}`, 96),
+        ...(typeof agent.focus === 'string' && agent.focus.trim() ? { focus: boundedPlanString(agent.focus, '', 600) } : {}),
+        ...(typeof agent.label === 'string' && agent.label.trim() ? { label: boundedPlanString(agent.label, '', 96) } : {}),
+      };
+    }),
+  };
+}
+
+function boundedPlanString(value: unknown, fallback: string, limit: number): string {
+  const text = typeof value === 'string' && value.trim() ? value.trim() : fallback;
+  return preview(text, limit);
+}
+
+function optionalBoundedPlanString(value: unknown, limit: number): string | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  return boundedPlanString(value, '', limit);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function workflowErrorMessage(err: unknown, fallback = 'Workflow failed.'): string {
+  if (err instanceof Error) return err.message;
+  const record = asRecord(err);
+  if (typeof record?.message === 'string') return record.message;
+  const text = String(err);
+  return text || fallback;
+}
+
+function workflowAgentSemanticOpts(input: {
+  readonly model: string;
+  readonly effort: string;
+  readonly schema?: Record<string, unknown>;
+  readonly isolation?: AgentIsolation;
+}): WorkflowAgentSemanticOpts {
+  return {
+    ...(input.schema ? { schema: journalJsonValueOrInputError(input.schema, 'agent schema') } : {}),
+    model: input.model,
+    effort: input.effort,
+    ...(input.isolation ? { isolation: input.isolation } : {}),
+  };
+}
+
+function workflowUsage(usage: SubagentUsage): WorkflowJournalUsage {
+  const inputTokens = finiteTokenCount(usage.inputTokens);
+  const outputTokens = finiteTokenCount(usage.outputTokens);
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: finiteTokenCount(usage.totalTokens ?? inputTokens + outputTokens),
+  };
+}
+
+function finiteTokenCount(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function journalJsonValueOrInputError(value: unknown, label: string): JsonValue {
+  try {
+    return normalizeJournalJsonValue(value, label);
+  } catch (err) {
+    throw workflowInputError(workflowErrorMessage(err, `${label} must be JSON-serializable.`));
+  }
+}
+
+function workflowJournalRuntimeError(err: unknown): WorkflowJournalError {
+  if (isWorkflowJournalError(err)) return err;
+  return new WorkflowJournalError('Workflow journal write failed.', err);
+}
+
+function workflowJournalRequestError(_err: unknown): UltracodeRequestError {
+  return new UltracodeRequestError(WORKFLOW_JOURNAL_PUBLIC_FAILURE_MESSAGE, 500, 'server_error', WORKFLOW_INPUT_PARAM, WORKFLOW_JOURNAL_WRITE_FAILED_REASON);
+}
+
+function workflowResumeRunningError(runId: string): UltracodeRequestError {
+  return new UltracodeRequestError(
+    `Workflow run is still running and cannot be resumed: ${runId}`,
+    409,
+    'invalid_request_error',
+    WORKFLOW_INPUT_PARAM,
+    'workflow_resume_running',
+  );
+}
+
+function workflowFailureReason(err: unknown): string {
+  if (isWorkflowJournalError(err)) return WORKFLOW_JOURNAL_WRITE_FAILED_REASON;
+  if (err instanceof UltracodeRequestError && err.code) return err.code;
+  const record = asRecord(err);
+  if (typeof record?.code === 'string' && WORKFLOW_STABLE_FAILURE_CODES.has(record.code)) return record.code;
+  return 'workflow_failed';
+}
+
+function workflowInputError(message: string): UltracodeRequestError {
+  return new UltracodeRequestError(message, 400, 'invalid_request_error', WORKFLOW_INPUT_PARAM, 'workflow_input_invalid');
+}
+
+function workflowMetaError(message: string): UltracodeRequestError {
+  return new UltracodeRequestError(message, 400, 'invalid_request_error', WORKFLOW_INPUT_PARAM, 'workflow_meta_invalid');
+}
+
+function workflowScriptError(message: string): UltracodeRequestError {
+  return new UltracodeRequestError(message, 400, 'invalid_request_error', WORKFLOW_INPUT_PARAM, 'workflow_script_nondeterministic');
+}
+
+function workflowAgentStalledError(message: string): UltracodeRequestError {
+  return new UltracodeRequestError(message, 408, 'invalid_request_error', WORKFLOW_INPUT_PARAM, 'workflow_agent_stalled');
+}
+
+function isWorkflowAgentStalledError(err: unknown): boolean {
+  return err instanceof UltracodeRequestError && err.code === 'workflow_agent_stalled';
+}
+
+function workflowStructuredOutputError(message: string): UltracodeRequestError {
+  return new UltracodeRequestError(message, 400, 'invalid_request_error', WORKFLOW_INPUT_PARAM, 'workflow_structured_output_failed');
+}
+
+export function workflowResultUsage(events: readonly WorkflowEvent[]): { readonly inputTokens: number; readonly outputTokens: number } {
+  const text = events.map((event) => JSON.stringify(event)).join('\n');
+  return {
+    inputTokens: 1,
+    outputTokens: estimateTokens(text),
+  };
+}

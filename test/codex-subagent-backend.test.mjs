@@ -1,0 +1,278 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { afterEach, before, test } from 'node:test';
+import {
+  CodexSubagentBackend,
+  usageFromCodexTokenUsage,
+} from '../dist/codex/subagent-backend.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const fakeCodex = resolve(here, 'fixtures/fake-codex.cjs');
+const packageVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+const originalCodexHome = process.env.CODEX_HOME;
+const originalProviderEnv = snapshotProviderEnv();
+const tempDirs = [];
+
+before(async () => {
+  await chmod(fakeCodex, 0o755);
+});
+
+afterEach(async () => {
+  if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+  else process.env.CODEX_HOME = originalCodexHome;
+  restoreProviderEnv(originalProviderEnv);
+  await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
+test('CodexSubagentBackend returns raw workflow text and provider usage', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  setProviderEnv();
+  const backend = new CodexSubagentBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+    reasoningEffort: 'medium',
+  });
+
+  try {
+    const result = await backend.generate(textRequest({ reasoningEffort: 'minimal' }));
+    assert.equal(result.text, 'MINIMAL_OK');
+    assert.deepEqual(result.toolCalls, []);
+    assert.equal(result.usage.source, 'provider');
+    assert.equal(result.usage.inputTokens, 5);
+    assert.equal(result.usage.outputTokens, 2);
+    assert.equal(result.usage.cachedInputTokens, 2);
+  } finally {
+    await backend.close();
+  }
+});
+
+test('CodexSubagentBackend can wait for a turn without a turn timeout', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  const backend = new CodexSubagentBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 0,
+  });
+
+  try {
+    const result = await backend.generate(textRequest({ prompt: 'Return OK.' }));
+    assert.equal(result.text, 'OK');
+  } finally {
+    await backend.close();
+  }
+});
+
+test('CodexSubagentBackend maps structured output schema to StructuredOutput call', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  const backend = new CodexSubagentBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+    reasoningEffort: 'xhigh',
+  });
+
+  try {
+    const result = await backend.generate({
+      ...textRequest(),
+      tools: [{
+        name: 'StructuredOutput',
+        inputSchema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            detail: { type: 'string' },
+            count: { type: 'integer' },
+          },
+          required: ['detail', 'count'],
+        },
+      }],
+      toolChoice: { type: 'required' },
+    });
+    assert.equal(result.text, '');
+    assert.equal(result.toolCalls.length, 1);
+    assert.equal(result.toolCalls[0].name, 'StructuredOutput');
+    assert.deepEqual(JSON.parse(result.toolCalls[0].arguments), {
+      detail: 'OK',
+      count: 2,
+    });
+  } finally {
+    await backend.close();
+  }
+});
+
+test('CodexSubagentBackend uses an Ultracode-only app-server surface', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  const backend = new CodexSubagentBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+  });
+
+  try {
+    const result = await backend.generate(textRequest({ prompt: 'DEBUG_PAYLOAD' }));
+    const payload = JSON.parse(result.text);
+    assert.equal(payload.initialize.clientInfo.name, 'ultracode_for_codex');
+    assert.equal(payload.initialize.clientInfo.version, packageVersion);
+    assert.match(payload.threadStart.baseInstructions, /Ultracode workflow subagent/);
+    assert.match(payload.threadStart.developerInstructions, /raw result text/);
+    assert.equal(payload.threadStart.personality, 'none');
+    assert.equal(payload.threadStart.experimentalRawEvents, false);
+    assert.equal(payload.threadStart.persistExtendedHistory, false);
+    assert.equal(payload.threadStart.config.model_reasoning_effort, 'xhigh');
+    assert.equal(payload.threadStart.config.model_verbosity, 'medium');
+    assert.equal(payload.threadStart.cwd, process.cwd());
+    assert.deepEqual(payload.threadStart.runtimeWorkspaceRoots, [process.cwd()]);
+    assert.equal(payload.threadStart.dynamicTools[0].name, 'workspace');
+    assert.deepEqual(payload.threadStart.dynamicTools[0].tools.map((tool) => tool.name), [
+      'read_file',
+      'list_directory',
+    ]);
+    assert.equal(payload.turnStart.effort, 'xhigh');
+    assert.equal(payload.turnStart.summary, 'none');
+    assert.equal(payload.turnStart.personality, 'none');
+  } finally {
+    await backend.close();
+  }
+});
+
+test('CodexSubagentBackend serves read-only workspace dynamic tool calls', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  const cwd = await mkdtemp(join(tmpdir(), 'codex-subagent-workspace-'));
+  tempDirs.push(cwd);
+  await writeFile(join(cwd, 'workspace-note.txt'), 'hello from workspace\n');
+  const backend = new CodexSubagentBackend({
+    command: fakeCodex,
+    cwd,
+    timeoutMs: 30_000,
+  });
+
+  try {
+    const read = await backend.generate(textRequest({ prompt: 'READ_WORKSPACE_TOOL' }));
+    assert.match(read.text, /path: workspace-note\.txt/);
+    assert.match(read.text, /hello from workspace/);
+
+    const listed = await backend.generate(textRequest({ prompt: 'LIST_WORKSPACE_TOOL' }));
+    assert.match(listed.text, /workspace-note\.txt/);
+  } finally {
+    await backend.close();
+  }
+});
+
+test('CodexSubagentBackend denies workspace dynamic tool path escapes', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  const cwd = await mkdtemp(join(tmpdir(), 'codex-subagent-workspace-'));
+  tempDirs.push(cwd);
+  const backend = new CodexSubagentBackend({
+    command: fakeCodex,
+    cwd,
+    timeoutMs: 30_000,
+  });
+
+  try {
+    const result = await backend.generate(textRequest({ prompt: 'READ_OUTSIDE_WORKSPACE_TOOL' }));
+    assert.match(result.text, /Path escapes workspace/);
+  } finally {
+    await backend.close();
+  }
+});
+
+test('CodexSubagentBackend runs worktree-isolated turns in the requested workspace', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  const worktreePath = await mkdtemp(join(tmpdir(), 'codex-subagent-worktree-'));
+  tempDirs.push(worktreePath);
+  const backend = new CodexSubagentBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+  });
+
+  try {
+    const result = await backend.generate({
+      ...textRequest({ prompt: 'DEBUG_PAYLOAD' }),
+      worktreePath,
+    });
+    const payload = JSON.parse(result.text);
+    assert.equal(payload.threadStart.cwd, worktreePath);
+    assert.deepEqual(payload.threadStart.runtimeWorkspaceRoots, [worktreePath]);
+    assert.equal(payload.threadStart.sandbox, 'workspace-write');
+    assert.equal(payload.turnStart.cwd, worktreePath);
+    assert.deepEqual(payload.turnStart.runtimeWorkspaceRoots, [worktreePath]);
+  } finally {
+    await backend.close();
+  }
+});
+
+test('usageFromCodexTokenUsage returns provider token details', () => {
+  assert.deepEqual(usageFromCodexTokenUsage({
+    last: {
+      totalTokens: 12,
+      inputTokens: 7,
+      cachedInputTokens: 3,
+      outputTokens: 5,
+      reasoningOutputTokens: 1,
+    },
+  }), {
+    inputTokens: 7,
+    outputTokens: 5,
+    totalTokens: 12,
+    cachedInputTokens: 3,
+    reasoningOutputTokens: 1,
+    source: 'provider',
+    raw: {
+      last: {
+        totalTokens: 12,
+        inputTokens: 7,
+        cachedInputTokens: 3,
+        outputTokens: 5,
+        reasoningOutputTokens: 1,
+      },
+    },
+  });
+  assert.equal(usageFromCodexTokenUsage({ last: {} }), null);
+});
+
+function textRequest(overrides = {}) {
+  return {
+    model: 'codex-subagent',
+    messages: [{ role: 'user', content: overrides.prompt ?? 'Return OK.' }],
+    reasoningEffort: overrides.reasoningEffort,
+    tools: [],
+    toolChoice: { type: 'auto' },
+  };
+}
+
+async function createCodexHome() {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-subagent-home-'));
+  tempDirs.push(dir);
+  await writeFile(join(dir, 'auth.json'), '{"token":"local-test"}\n');
+  await writeFile(join(dir, 'config.toml'), 'model = "gpt-test-model"\n');
+  return dir;
+}
+
+function snapshotProviderEnv() {
+  const out = new Map();
+  for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'OPENAI_API_KEY', 'OPENAI_BASE_URL']) {
+    out.set(key, process.env[key]);
+  }
+  return out;
+}
+
+function restoreProviderEnv(snapshot) {
+  for (const [key, value] of snapshot) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+function setProviderEnv() {
+  process.env.FAKE_ASSERT_NO_DIRECT_PROVIDER_ENV = '1';
+  process.env.ANTHROPIC_API_KEY = 'secret-anthropic';
+  process.env.ANTHROPIC_BASE_URL = 'https://example.invalid/anthropic';
+  process.env.OPENAI_API_KEY = 'secret-openai';
+  process.env.OPENAI_BASE_URL = 'https://example.invalid/openai';
+}

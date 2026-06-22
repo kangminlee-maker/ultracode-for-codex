@@ -1,0 +1,851 @@
+#!/usr/bin/env node
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
+import { mkdir, open, readFile, writeFile } from 'node:fs/promises';
+import { isAbsolute, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { createInterface } from 'node:readline/promises';
+import { CodexSubagentBackend } from './codex/subagent-backend.js';
+import { WorkflowTaskRegistry } from './runtime/workflow-runtime.js';
+import { UltracodeRequestError } from './runtime/types.js';
+import { ultracodePackageVersion } from './runtime/package-info.js';
+import { renderUltracodeInstallGuideNotice } from './ultracode-install-guide.js';
+import {
+  codexDefaultReasoningEffort,
+  codexDefaultVerbosity,
+  isReasoningEffort,
+  isVerbosity,
+  isWorkflowExecutionMode,
+  isWorkflowPermissionPolicy,
+  isWorkflowProgressMode,
+  workflowBackgroundDefaults,
+  workflowDefaultExecutionMode,
+  workflowDefaultPermissionPolicy,
+  workflowDefaultProgressMode,
+  workflowDefaultRetryLimit,
+  workflowDefaultTimeoutMs,
+} from './settings.js';
+import type { ReasoningEffort, Verbosity } from './runtime/types.js';
+import type { WorkflowExecutionMode, WorkflowPermissionPolicy, WorkflowProgressMode } from './settings.js';
+import type {
+  WorkflowEvent,
+  WorkflowLaunchInput,
+  WorkflowLaunchResult,
+  WorkflowPermissionReview,
+  WorkflowTaskSnapshot,
+} from './runtime/workflow-runtime.js';
+
+export type {
+  WorkflowAgentPreservedWorktree,
+  WorkflowEvent,
+  WorkflowLaunchInput,
+  WorkflowLaunchResult,
+  WorkflowPermissionReview,
+  WorkflowTaskSnapshot,
+  WorkflowTaskStatus,
+  WorkflowTaskType,
+} from './runtime/workflow-runtime.js';
+
+const ULTRACODE_INSTALL_GUIDE_ACCEPT_VERSION = 'v1';
+const PROGRESS_KIND = 'ultracode.workflow.progress';
+
+type ExecutionMode = WorkflowExecutionMode;
+type PermissionPolicy = WorkflowPermissionPolicy;
+type ProgressMode = WorkflowProgressMode;
+
+async function main(argv: readonly string[]): Promise<number> {
+  const [command = 'help', ...args] = argv;
+  if (command === 'help' || command === '--help' || command === '-h') {
+    process.stdout.write(helpText());
+    return 0;
+  }
+  if (command === 'version' || command === '--version' || command === '-v') {
+    process.stdout.write(`ultracode-for-codex ${ultracodePackageVersion()}\n`);
+    return 0;
+  }
+  if (command === '--llm-guide' || command === 'llm-guide') {
+    process.stdout.write(renderUltracodeInstallGuideNotice());
+    return 0;
+  }
+  if (command === 'run') return runWorkflow(args);
+  process.stderr.write(`Unknown command: ${command}\n\n${helpText()}`);
+  return 1;
+}
+
+async function runWorkflow(args: readonly string[]): Promise<number> {
+  const options = parseOptions(args);
+  if (options.acceptLlmGuide !== ULTRACODE_INSTALL_GUIDE_ACCEPT_VERSION) {
+    process.stdout.write(renderUltracodeInstallGuideNotice());
+    process.stderr.write(
+      `Refusing to run Ultracode for Codex until the install guide is acknowledged. Re-run with --accept-llm-guide=${ULTRACODE_INSTALL_GUIDE_ACCEPT_VERSION}.\n`,
+    );
+    return 1;
+  }
+
+  const cwd = options.cwd ?? process.cwd();
+  const executionMode = parseExecutionMode(options.execution);
+  if (executionMode === 'background') return launchBackgroundWorkflow(args, cwd);
+  const timeoutMs = parseIntOption(options.timeoutMs, workflowDefaultTimeoutMs());
+  const retryLimit = parseRetryLimit(options.retryLimit);
+  const permissionPolicy = parsePermissionPolicy(options.permission);
+  const progressMode = parseProgressMode(options.progress);
+  const input = await workflowLaunchInputFromOptions(options);
+  const backend = new CodexSubagentBackend({
+    command: options.command,
+    cwd,
+    model: options.model,
+    timeoutMs,
+    reasoningEffort: parseReasoningEffort(options.reasoningEffort),
+    verbosity: parseVerbosity(options.verbosity),
+  });
+  const runtime = new WorkflowTaskRegistry({
+    backend,
+    cwd,
+    requestTimeoutMs: timeoutMs,
+  });
+
+  try {
+    let launch = await requireRunnableLaunch(runtime, await runtime.launch(input), permissionPolicy, progressMode);
+    let retries = 0;
+    while (true) {
+      const snapshot = await streamCommandWorkflow(runtime, launch, progressMode);
+      if (snapshot.status === 'completed') {
+        process.stdout.write(`${JSON.stringify(snapshot.result ?? null, null, 2)}\n`);
+        return 0;
+      }
+      renderFailedSnapshot(snapshot, progressMode);
+      if (snapshot.failureReason === 'workflow_aborted' || retries >= retryLimit) {
+        return snapshot.failureReason === 'workflow_aborted' ? 130 : 1;
+      }
+      retries += 1;
+      renderControlProgress('workflow.retrying', progressMode, {
+        status: 'retrying',
+        summary: `Retrying workflow ${retries}/${retryLimit}`,
+        taskId: snapshot.taskId,
+        runId: snapshot.runId,
+        workflowName: snapshot.workflowName,
+        retryIndex: retries,
+        retryLimit,
+      }, `[workflow] retrying ${retries}/${retryLimit}\n`);
+      launch = await requireRunnableLaunch(runtime, await runtime.retry(snapshot.taskId), permissionPolicy, progressMode);
+    }
+  } finally {
+    await runtime.close();
+  }
+}
+
+interface ParsedOptions {
+  readonly _: string[];
+  readonly args?: string;
+  readonly argsFile?: string;
+  readonly command?: string;
+  readonly model?: string;
+  readonly timeoutMs?: string;
+  readonly cwd?: string;
+  readonly execution?: string;
+  readonly reasoningEffort?: string;
+  readonly verbosity?: string;
+  readonly progress?: string;
+  readonly acceptLlmGuide?: string;
+  readonly script?: string;
+  readonly scriptFile?: string;
+  readonly scriptPath?: string;
+  readonly name?: string;
+  readonly resumeFromRunId?: string;
+  readonly permission?: string;
+  readonly retryLimit?: string;
+}
+
+export function parseOptions(args: readonly string[]): ParsedOptions {
+  const out: Record<string, string | string[]> = { _: [] };
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i] ?? '';
+    if (!arg.startsWith('--')) {
+      (out._ as string[]).push(arg);
+      continue;
+    }
+    const eq = arg.indexOf('=');
+    const rawKey = arg.slice(2, eq === -1 ? undefined : eq);
+    const key = rawKey.replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
+    const value = eq === -1 ? args[i + 1] : arg.slice(eq + 1);
+    if (eq === -1 && (value === undefined || value.startsWith('--'))) {
+      out[key] = 'true';
+      continue;
+    }
+    if (eq === -1) i += 1;
+    out[key] = value ?? '';
+  }
+  return out as unknown as ParsedOptions;
+}
+
+async function launchBackgroundWorkflow(args: readonly string[], cwd: string): Promise<number> {
+  const settings = workflowBackgroundDefaults();
+  const jobId = `job_${randomUUID()}`;
+  const runDir = resolveBackgroundRunDir(cwd, settings.runDir, jobId);
+  const resultPath = join(runDir, settings.resultFile);
+  const progressPath = join(runDir, settings.progressFile);
+  const metadataPath = join(runDir, settings.metadataFile);
+  const pidPath = join(runDir, settings.pidFile);
+  assertDistinctBackgroundPaths([resultPath, progressPath, metadataPath, pidPath]);
+  await mkdir(runDir, { recursive: true });
+
+  const stdout = await open(resultPath, 'w');
+  const stderr = await open(progressPath, 'w');
+  let childPid = 0;
+  try {
+    const child = spawn(process.execPath, [
+      cliEntryPath(),
+      'run',
+      ...args,
+      '--execution',
+      'attached',
+    ], {
+      cwd: process.cwd(),
+      detached: true,
+      stdio: ['ignore', stdout.fd, stderr.fd],
+    });
+    childPid = child.pid ?? 0;
+    child.unref();
+  } finally {
+    await stdout.close();
+    await stderr.close();
+  }
+
+  const launchedAt = new Date().toISOString();
+  await writeFile(pidPath, `${childPid}\n`);
+  await writeFile(metadataPath, `${JSON.stringify({
+    kind: 'ultracode.workflow.background',
+    version: 1,
+    status: 'launched',
+    jobId,
+    pid: childPid,
+    launchedAt,
+    cwd,
+    resultPath,
+    progressPath,
+    metadataPath,
+    pidPath,
+  }, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify({
+    kind: 'ultracode.workflow.background',
+    version: 1,
+    status: 'launched',
+    jobId,
+    pid: childPid,
+    resultPath,
+    progressPath,
+    metadataPath,
+    pidPath,
+  }, null, 2)}\n`);
+  return 0;
+}
+
+function resolveBackgroundRunDir(cwd: string, template: string, jobId: string): string {
+  const expanded = template.replaceAll('{jobId}', jobId);
+  return isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
+}
+
+function assertDistinctBackgroundPaths(paths: readonly string[]): void {
+  const normalized = new Set(paths);
+  if (normalized.size !== paths.length) {
+    throw new Error('Background result, progress, metadata, and pid paths must be distinct.');
+  }
+}
+
+function cliEntryPath(): string {
+  const entry = process.argv[1];
+  if (!entry) throw new Error('Unable to locate CLI entry path for background launch.');
+  return realpathSync(entry);
+}
+
+async function workflowLaunchInputFromOptions(options: ParsedOptions): Promise<WorkflowLaunchInput> {
+  const positionalScriptFile = options._[0];
+  if (options._.length > 1) throw new Error('run accepts at most one positional workflow script file.');
+  const scriptFile = options.scriptFile ?? positionalScriptFile;
+  if (options.resumeFromRunId) {
+    throw new Error('CLI resume is not available yet; use --retry-limit for same-run retry or rerun the workflow command.');
+  }
+  const sourceSelectors = [
+    options.script !== undefined ? '--script' : '',
+    scriptFile ? '--script-file' : '',
+    options.scriptPath ? '--script-path' : '',
+    options.name ? '--name' : '',
+  ].filter(Boolean);
+  if (sourceSelectors.length > 1) {
+    throw new Error(`Choose only one workflow source selector: ${sourceSelectors.join(', ')}.`);
+  }
+  if (sourceSelectors.length === 0) {
+    throw new Error('run requires --script, --script-file, --script-path, --name, or a positional script file.');
+  }
+  return {
+    ...(options.script !== undefined ? { script: options.script } : {}),
+    ...(scriptFile ? { script: await readFile(scriptFile, 'utf8') } : {}),
+    ...(options.scriptPath ? { scriptPath: options.scriptPath } : {}),
+    ...(options.name ? { name: options.name } : {}),
+    args: await parseArgsPayload(options),
+  };
+}
+
+async function parseArgsPayload(options: ParsedOptions): Promise<unknown> {
+  if (options.args !== undefined && options.argsFile) {
+    throw new Error('Use either --args or --args-file, not both.');
+  }
+  const text = options.argsFile ? await readFile(options.argsFile, 'utf8') : options.args;
+  if (text === undefined || text.trim() === '') return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error('Workflow args must be valid JSON.');
+  }
+}
+
+async function requireRunnableLaunch(
+  runtime: WorkflowTaskRegistry,
+  launched: WorkflowLaunchResult,
+  permissionPolicy: PermissionPolicy,
+  progressMode: ProgressMode,
+): Promise<Extract<WorkflowLaunchResult, { readonly status: 'async_launched' }>> {
+  let current = launched;
+  while (current.status === 'permission_required') {
+    const allow = await resolvePermissionReview(current.review, permissionPolicy, progressMode);
+    if (!allow) {
+      const denied = await runtime.denyPermissionRequest(current.permissionRequestId);
+      throw new Error(`Workflow permission denied: ${denied.workflowName}`);
+    }
+    current = await runtime.approvePermissionRequest(current.permissionRequestId);
+  }
+  if (current.status !== 'async_launched') {
+    throw new Error('CLI supports only local workflow launches.');
+  }
+  return current;
+}
+
+async function resolvePermissionReview(
+  review: WorkflowPermissionReview,
+  permissionPolicy: PermissionPolicy,
+  progressMode: ProgressMode,
+): Promise<boolean> {
+  renderPermissionReview(review, progressMode);
+  if (permissionPolicy === 'allow') return true;
+  if (permissionPolicy === 'deny') return false;
+  if (!process.stdin.isTTY) {
+    throw new Error('Workflow permission review requires --permission allow or --permission deny in non-interactive terminals.');
+  }
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const answer = (await rl.question('Allow this workflow? [y/N] ')).trim().toLowerCase();
+    return answer === 'y' || answer === 'yes';
+  } finally {
+    rl.close();
+  }
+}
+
+function renderPermissionReview(review: WorkflowPermissionReview, progressMode: ProgressMode): void {
+  if (progressMode === 'jsonl') {
+    writeJsonlProgress({
+      event: 'workflow.permission.required',
+      status: 'waiting_for_permission',
+      summary: `Permission review required for ${review.workflowName}`,
+      permissionRequestId: review.permissionRequestId,
+      workflowName: review.workflowName,
+      workflowSource: review.workflowSource,
+      workflowSourcePath: review.workflowSourcePath,
+      scriptHash: review.scriptHash,
+      riskSummary: review.riskSummary,
+      phases: review.phases,
+      requestedIsolationModes: review.requestedIsolationModes,
+    });
+    return;
+  }
+  process.stderr.write([
+    '[permission] workflow review required',
+    `  name: ${review.workflowName}`,
+    `  source: ${review.workflowSource}${review.workflowSourcePath ? ` (${review.workflowSourcePath})` : ''}`,
+    `  scriptHash: ${review.scriptHash}`,
+    `  risk: ${review.riskSummary}`,
+    review.phases.length > 0 ? `  phases: ${review.phases.join(', ')}` : '',
+    review.requestedIsolationModes.length > 0 ? `  isolation: ${review.requestedIsolationModes.join(', ')}` : '',
+  ].filter(Boolean).join('\n'));
+  process.stderr.write('\n');
+}
+
+async function streamCommandWorkflow(
+  runtime: WorkflowTaskRegistry,
+  launch: Extract<WorkflowLaunchResult, { readonly status: 'async_launched' }>,
+  progressMode: ProgressMode,
+): Promise<WorkflowTaskSnapshot> {
+  let cancelling = false;
+  const cancel = (signal: NodeJS.Signals): void => {
+    if (cancelling) {
+      renderControlProgress('workflow.cancel.already_requested', progressMode, {
+        status: 'cancelling',
+        summary: `${signal} received while cancellation is already in progress`,
+        taskId: launch.taskId,
+        runId: launch.runId,
+        workflowName: launch.workflowName,
+        signal,
+      }, `[workflow] ${signal} received while cancellation is already in progress\n`);
+      return;
+    }
+    cancelling = true;
+    renderControlProgress('workflow.cancel.requested', progressMode, {
+      status: 'cancelling',
+      summary: `${signal} received; cancelling workflow`,
+      taskId: launch.taskId,
+      runId: launch.runId,
+      workflowName: launch.workflowName,
+      signal,
+    }, `[workflow] ${signal} received; cancelling ${launch.taskId}\n`);
+    void runtime.cancel(launch.taskId).catch((err) => {
+      renderControlProgress('workflow.cancel.failed', progressMode, {
+        status: 'failed',
+        summary: 'Workflow cancellation failed',
+        taskId: launch.taskId,
+        runId: launch.runId,
+        workflowName: launch.workflowName,
+        error: errorMessage(err),
+      }, `[workflow] cancellation failed: ${errorMessage(err)}\n`);
+    });
+  };
+  process.once('SIGINT', cancel);
+  process.once('SIGTERM', cancel);
+  try {
+    for await (const event of runtime.streamEvents(launch.taskId)) {
+      renderWorkflowEvent(event, progressMode);
+    }
+  } finally {
+    process.off('SIGINT', cancel);
+    process.off('SIGTERM', cancel);
+  }
+  const snapshot = runtime.get(launch.taskId);
+  if (!snapshot) throw new Error(`Workflow task disappeared: ${launch.taskId}`);
+  return snapshot;
+}
+
+function renderWorkflowEvent(event: WorkflowEvent, progressMode: ProgressMode): void {
+  if (progressMode === 'jsonl') {
+    writeJsonlProgress(progressPayloadForEvent(event));
+    return;
+  }
+  switch (event.type) {
+    case 'workflow.started':
+      process.stderr.write(`[workflow] started ${event.workflowName} task=${event.taskId} run=${event.runId}\n`);
+      return;
+    case 'workflow.phase.planned':
+      process.stderr.write(`[phase-plan] ${event.title} (${event.plannedAgentCount} agents)${event.goal ? ` - ${event.goal}` : ''}\n`);
+      for (const agent of event.plannedAgents) {
+        process.stderr.write(`[phase-plan]    - ${agent.title}${agent.label ? ` (${agent.label})` : ''}${agent.focus ? `: ${agent.focus}` : ''}\n`);
+      }
+      return;
+    case 'workflow.phase.started':
+      process.stderr.write(`[phase] ${event.title}${event.plannedAgentCount ? ` (${event.plannedAgentCount} agents)` : ''}${event.detail ? ` - ${event.detail}` : ''}\n`);
+      if (event.plannedAgents) {
+        for (const agent of event.plannedAgents) {
+          process.stderr.write(`[phase]    - ${agent.title}${agent.label ? ` (${agent.label})` : ''}${agent.focus ? `: ${agent.focus}` : ''}\n`);
+        }
+      }
+      return;
+    case 'workflow.plan.ready':
+      process.stderr.write(`[plan] mode=${event.mode} phases=${event.phases.length}${event.rationale ? ` - ${event.rationale}` : ''}\n`);
+      for (const [phaseIndex, phase] of event.phases.entries()) {
+        process.stderr.write(`[plan] ${phaseIndex + 1}. ${phase.title}${phase.goal ? ` - ${phase.goal}` : ''}\n`);
+        for (const agent of phase.agents) {
+          process.stderr.write(`[plan]    - ${agent.title}${agent.label ? ` (${agent.label})` : ''}${agent.focus ? `: ${agent.focus}` : ''}\n`);
+        }
+      }
+      return;
+    case 'workflow.log':
+      process.stderr.write(`[log] ${event.message}\n`);
+      return;
+    case 'workflow.agent.started':
+      process.stderr.write(`[agent:${event.agentIndex + 1}] started ${event.label}\n`);
+      return;
+    case 'workflow.agent.completed':
+      process.stderr.write(`[agent:${event.agentIndex + 1}] completed ${event.label} | ${agentCompletionProgressSummary(event)} | tokens=${event.tokens} preview=${formatPreview(event.resultPreview)}${event.cached ? ' cached=true' : ''}\n`);
+      return;
+    case 'workflow.agent.failed':
+      process.stderr.write(`[agent:${event.agentIndex + 1}] failed ${event.label} ${event.error}\n`);
+      return;
+    case 'workflow.completed':
+      process.stderr.write(`[workflow] completed agents=${event.agentCount} tokens=${event.tokens} result=${event.resultPath}\n`);
+      return;
+    case 'workflow.failed':
+      process.stderr.write(`[workflow] failed ${event.recovery?.reason ?? ''} ${event.error}\n`);
+      return;
+  }
+}
+
+function renderFailedSnapshot(snapshot: WorkflowTaskSnapshot, progressMode: ProgressMode): void {
+  if (progressMode === 'jsonl') {
+    writeJsonlProgress({
+      event: 'workflow.terminal_failure',
+      status: 'failed',
+      summary: `Workflow terminal failure: ${snapshot.failureReason ?? 'unknown'}`,
+      taskId: snapshot.taskId,
+      runId: snapshot.runId,
+      workflowName: snapshot.workflowName,
+      reason: snapshot.failureReason ?? 'unknown',
+      error: snapshot.error ?? 'unknown',
+    });
+    return;
+  }
+  process.stderr.write(
+    `[workflow] terminal failure task=${snapshot.taskId} reason=${snapshot.failureReason ?? 'unknown'} error=${snapshot.error ?? 'unknown'}\n`,
+  );
+}
+
+function renderControlProgress(
+  event: string,
+  progressMode: ProgressMode,
+  payload: Omit<ProgressPayload, 'kind' | 'version' | 'event'>,
+  plainText: string,
+): void {
+  if (progressMode === 'jsonl') {
+    writeJsonlProgress({ event, ...payload });
+    return;
+  }
+  process.stderr.write(plainText);
+}
+
+interface ProgressPayload {
+  readonly kind?: typeof PROGRESS_KIND;
+  readonly version?: 1;
+  readonly event: string;
+  readonly status?: string;
+  readonly summary: string;
+  readonly taskId?: string;
+  readonly runId?: string;
+  readonly workflowName?: string;
+  readonly workflowSource?: string;
+  readonly workflowSourcePath?: string;
+  readonly scriptHash?: string;
+  readonly permissionRequestId?: string;
+  readonly riskSummary?: string;
+  readonly phases?: readonly string[];
+  readonly requestedIsolationModes?: readonly string[];
+  readonly phaseIndex?: number;
+  readonly title?: string;
+  readonly detail?: string;
+  readonly goal?: string;
+  readonly plannedAgentCount?: number;
+  readonly plannedAgents?: readonly unknown[];
+  readonly mode?: string;
+  readonly rationale?: string;
+  readonly phaseCount?: number;
+  readonly planPhases?: readonly unknown[];
+  readonly message?: string;
+  readonly agentIndex?: number;
+  readonly agentId?: string;
+  readonly label?: string;
+  readonly phase?: string;
+  readonly promptPreview?: string;
+  readonly tokens?: number;
+  readonly toolCalls?: number;
+  readonly resultPreview?: string;
+  readonly cached?: boolean;
+  readonly elapsedMs?: number;
+  readonly completedAgentCount?: number;
+  readonly knownAgentCount?: number;
+  readonly phaseCompletedAgentCount?: number;
+  readonly phaseKnownAgentCount?: number;
+  readonly skipped?: boolean;
+  readonly worktreePreserved?: boolean;
+  readonly preservedWorktrees?: readonly unknown[];
+  readonly resultPath?: string;
+  readonly agentCount?: number;
+  readonly durationMs?: number;
+  readonly retryable?: boolean;
+  readonly reason?: string;
+  readonly error?: string;
+  readonly signal?: string;
+  readonly retryIndex?: number;
+  readonly retryLimit?: number;
+}
+
+function writeJsonlProgress(payload: ProgressPayload): void {
+  process.stderr.write(`${JSON.stringify({
+    kind: PROGRESS_KIND,
+    version: 1,
+    ...payload,
+  })}\n`);
+}
+
+function phaseStartedSummary(event: Extract<WorkflowEvent, { type: 'workflow.phase.started' }>): string {
+  const agentText = event.plannedAgentCount
+    ? `${event.plannedAgentCount} planned agent${event.plannedAgentCount === 1 ? '' : 's'}`
+    : '';
+  const suffix = [agentText, event.detail ?? event.goal].filter(Boolean).join(': ');
+  return suffix ? `Phase ${event.title}: ${suffix}` : `Phase ${event.title}`;
+}
+
+function phasePlannedSummary(event: Extract<WorkflowEvent, { type: 'workflow.phase.planned' }>): string {
+  return `Phase ${event.title} planned: ${event.plannedAgentCount} planned agent${event.plannedAgentCount === 1 ? '' : 's'}`;
+}
+
+function agentCompletionProgressSummary(event: Extract<WorkflowEvent, { type: 'workflow.agent.completed' }>): string {
+  const parts: string[] = [];
+  if (
+    event.phase
+    && event.phaseCompletedAgentCount !== undefined
+    && event.phaseKnownAgentCount !== undefined
+  ) {
+    parts.push(`Phase ${event.phase} (${event.phaseCompletedAgentCount}/${event.phaseKnownAgentCount})`);
+  }
+  parts.push(`${event.completedAgentCount} out of ${event.knownAgentCount} agents have completed the task`);
+  parts.push(`${formatElapsedDuration(event.elapsedMs)} elapsed`);
+  return parts.join(', ');
+}
+
+function formatElapsedDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+function progressPayloadForEvent(event: WorkflowEvent): ProgressPayload {
+  switch (event.type) {
+    case 'workflow.started':
+      return {
+        event: event.type,
+        status: 'running',
+        summary: `Workflow ${event.workflowName} started`,
+        taskId: event.taskId,
+        runId: event.runId,
+        workflowName: event.workflowName,
+        workflowSource: event.workflowSource,
+        workflowSourcePath: event.workflowSourcePath,
+        scriptHash: event.scriptHash,
+      };
+    case 'workflow.phase.planned':
+      return {
+        event: event.type,
+        status: 'planned',
+        summary: phasePlannedSummary(event),
+        taskId: event.taskId,
+        runId: event.runId,
+        phaseIndex: event.phaseIndex,
+        title: event.title,
+        goal: event.goal,
+        plannedAgentCount: event.plannedAgentCount,
+        plannedAgents: event.plannedAgents,
+      };
+    case 'workflow.phase.started':
+      return {
+        event: event.type,
+        status: 'running',
+        summary: phaseStartedSummary(event),
+        taskId: event.taskId,
+        runId: event.runId,
+        phaseIndex: event.phaseIndex,
+        title: event.title,
+        detail: event.detail,
+        goal: event.goal,
+        plannedAgentCount: event.plannedAgentCount,
+        plannedAgents: event.plannedAgents,
+      };
+    case 'workflow.plan.ready':
+      return {
+        event: event.type,
+        status: 'planned',
+        summary: `Workflow planning snapshot: ${event.phases.length} known phase${event.phases.length === 1 ? '' : 's'}, mode=${event.mode}`,
+        taskId: event.taskId,
+        runId: event.runId,
+        mode: event.mode,
+        rationale: event.rationale,
+        phaseCount: event.phases.length,
+        planPhases: event.phases,
+      };
+    case 'workflow.log':
+      return {
+        event: event.type,
+        status: 'running',
+        summary: event.message,
+        taskId: event.taskId,
+        runId: event.runId,
+        message: event.message,
+      };
+    case 'workflow.agent.started':
+      return {
+        event: event.type,
+        status: 'running',
+        summary: `Agent ${event.agentIndex + 1} started: ${event.label}`,
+        taskId: event.taskId,
+        runId: event.runId,
+        agentIndex: event.agentIndex,
+        agentId: event.agentId,
+        label: event.label,
+        phase: event.phase,
+        promptPreview: event.promptPreview,
+      };
+    case 'workflow.agent.completed':
+      return {
+        event: event.type,
+        status: 'completed',
+        summary: `Agent ${event.agentIndex + 1} completed: ${event.label}. ${agentCompletionProgressSummary(event)}`,
+        taskId: event.taskId,
+        runId: event.runId,
+        agentIndex: event.agentIndex,
+        agentId: event.agentId,
+        label: event.label,
+        phase: event.phase,
+        tokens: event.tokens,
+        toolCalls: event.toolCalls,
+        resultPreview: event.resultPreview,
+        cached: event.cached,
+        elapsedMs: event.elapsedMs,
+        completedAgentCount: event.completedAgentCount,
+        knownAgentCount: event.knownAgentCount,
+        phaseCompletedAgentCount: event.phaseCompletedAgentCount,
+        phaseKnownAgentCount: event.phaseKnownAgentCount,
+        worktreePreserved: event.worktreePreserved,
+        preservedWorktrees: event.preservedWorktrees,
+      };
+    case 'workflow.agent.failed':
+      return {
+        event: event.type,
+        status: event.skipped ? 'skipped' : 'failed',
+        summary: `Agent ${event.agentIndex + 1} ${event.skipped ? 'skipped' : 'failed'}: ${event.error}`,
+        taskId: event.taskId,
+        runId: event.runId,
+        agentIndex: event.agentIndex,
+        agentId: event.agentId,
+        label: event.label,
+        phase: event.phase,
+        error: event.error,
+        skipped: event.skipped,
+        worktreePreserved: event.worktreePreserved,
+        preservedWorktrees: event.preservedWorktrees,
+      };
+    case 'workflow.completed':
+      return {
+        event: event.type,
+        status: 'completed',
+        summary: `Workflow completed with ${event.agentCount} agent${event.agentCount === 1 ? '' : 's'}`,
+        taskId: event.taskId,
+        runId: event.runId,
+        resultPath: event.resultPath,
+        agentCount: event.agentCount,
+        tokens: event.tokens,
+        toolCalls: event.toolCalls,
+        durationMs: event.durationMs,
+      };
+    case 'workflow.failed':
+      return {
+        event: event.type,
+        status: 'failed',
+        summary: `Workflow failed: ${event.recovery?.reason ?? event.error}`,
+        taskId: event.taskId,
+        runId: event.runId,
+        error: event.error,
+        reason: event.recovery?.reason,
+        retryable: event.recovery?.retryable,
+      };
+  }
+}
+
+function formatPreview(value: unknown): string {
+  if (value === undefined || value === null) return '';
+  return String(value).replace(/\s+/g, ' ').slice(0, 160);
+}
+
+function parseIntOption(value: string | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return parsed;
+}
+
+function parseRetryLimit(value: string | undefined): number {
+  if (value === undefined) return workflowDefaultRetryLimit();
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) throw new Error('retry-limit must be a non-negative integer.');
+  return parsed;
+}
+
+function parsePermissionPolicy(value: string | undefined): PermissionPolicy {
+  if (value === undefined) return workflowDefaultPermissionPolicy();
+  if (isWorkflowPermissionPolicy(value)) return value;
+  throw new Error('permission must be one of ask, allow, or deny.');
+}
+
+function parseProgressMode(value: string | undefined): ProgressMode {
+  if (value === undefined) return workflowDefaultProgressMode();
+  if (isWorkflowProgressMode(value)) return value;
+  throw new Error('progress must be one of jsonl or plain.');
+}
+
+function parseExecutionMode(value: string | undefined): ExecutionMode {
+  if (value === undefined) return workflowDefaultExecutionMode();
+  if (isWorkflowExecutionMode(value)) return value;
+  throw new Error('execution must be one of background or attached.');
+}
+
+function parseReasoningEffort(value: string | undefined): ReasoningEffort {
+  if (value === undefined) return codexDefaultReasoningEffort();
+  if (isReasoningEffort(value)) return value;
+  throw new Error('reasoning effort must be one of none, minimal, low, medium, high, or xhigh.');
+}
+
+function parseVerbosity(value: string | undefined): Verbosity {
+  if (value === undefined) return codexDefaultVerbosity();
+  if (isVerbosity(value)) return value;
+  throw new Error('verbosity must be one of low, medium, or high.');
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof UltracodeRequestError && err.code) return `${err.code}: ${err.message}`;
+  return err instanceof Error ? err.message : String(err);
+}
+
+function helpText(): string {
+  return `ultracode-for-codex
+
+Commands:
+  run        Run a workflow as a local CLI command.
+
+Options:
+  --version, -v                     Print the package version.
+  --llm-guide                       Print the Ultracode install and usage guide.
+  --accept-llm-guide <version>       Required for run. Current version: ${ULTRACODE_INSTALL_GUIDE_ACCEPT_VERSION}.
+  --script <js>                      Inline workflow script.
+  --script-file <path>               Workflow script file. A positional file path is also accepted.
+  --script-path <path>               Runtime-owned persisted workflow script path.
+  --name <name>                      Named workflow from .codex/workflows or built-ins.
+  --args <json>                      Workflow args JSON. Default: {}.
+  --args-file <path>                 Read workflow args JSON from a file.
+  --permission <ask|allow|deny>      Permission review behavior. Default: settings.json (${workflowDefaultPermissionPolicy()}).
+  --retry-limit <number>             Retry failed workflows in the same process. Default: settings.json (${workflowDefaultRetryLimit()}).
+  --progress <jsonl|plain>           Progress format on stderr. Default: settings.json (${workflowDefaultProgressMode()}).
+  --execution <background|attached>  Execution mode. Default: settings.json (${workflowDefaultExecutionMode()}).
+  --command <path>                   Override Codex CLI binary path.
+  --model <model>                    Pass a model to Codex app-server.
+  --timeout-ms <number>              Runtime timeout; 0 waits for completion/cancel. Default: settings.json (${workflowDefaultTimeoutMs()}).
+  --cwd <dir>                        Working directory for workflow execution. Default: current cwd.
+  --reasoning-effort <effort>        Codex reasoning effort. Default: settings.json (${codexDefaultReasoningEffort()}).
+  --verbosity <verbosity>            Codex verbosity. Default: settings.json (${codexDefaultVerbosity()}).
+`;
+}
+
+function isMainModule(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(entry)).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
+  main(process.argv.slice(2)).then((code) => {
+    process.exitCode = code;
+  }).catch((err) => {
+    process.stderr.write(`${errorMessage(err)}\n`);
+    process.exitCode = 1;
+  });
+}
