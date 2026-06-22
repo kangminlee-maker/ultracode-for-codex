@@ -1,7 +1,7 @@
 # Ultracode for Codex
 
-Ultracode for Codex helps Codex work in phases, use focused parallel subagents,
-and keep progress visible while it reviews, plans, implements, or verifies work.
+Dynamic workflows redesigned for Codex, with parallel subagents, visible
+progress, and an optional local CLI runtime.
 
 The default experience is Codex-native: you ask for `$ultracode-for-codex`, and
 the main Codex chat becomes the orchestrator. It plans the next useful phase,
