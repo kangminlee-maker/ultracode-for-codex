@@ -1,6 +1,6 @@
 {
   "name": "ultracode-for-codex",
-  "version": "0.2.6",
+  "version": "0.3.0",
   "description": "Run local Codex-backed workflows from a command-owned CLI runtime.",
   "keywords": [
     "codex",
@@ -58,6 +58,7 @@
     "publish:dry-run": "npm publish --dry-run --access public",
     "publish:npm": "npm publish --access public",
     "publish:npm:provenance": "npm publish --access public --provenance",
+    "smoke:live": "node scripts/live-smoke-ultracode-for-codex.mjs",
     "test:e2e:ultracode-for-codex": "node scripts/e2e-installed-ultracode-for-codex.mjs",
     "test:all": "npm test && npm run test:e2e:ultracode-for-codex",
     "test": "npm run build && npm run verify:runtime-boundary && node --test --test-concurrency=2 test/*.test.mjs",

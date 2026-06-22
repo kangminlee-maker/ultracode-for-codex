@@ -311,8 +311,15 @@ async function validateConsumerInstall(consumerDir, tarballPath) {
     .split(/\r?\n/)
     .filter((line) => /^  [a-z][a-z-]*\s+/.test(line));
   const exposedCommands = commandLines.map((line) => line.trim().split(/\s+/)[0]);
-  if (exposedCommands.some((command) => command !== 'run')) {
-    throw new Error('Installed CLI exposes commands other than run.');
+  const expectedCommands = ['run', 'status', 'wait', 'logs', 'result', 'cancel', 'jobs', 'list', 'archive', 'export'];
+  const unexpectedCommands = exposedCommands.filter((command) => !expectedCommands.includes(command));
+  const missingCommands = expectedCommands.filter((command) => !exposedCommands.includes(command));
+  if (unexpectedCommands.length > 0 || missingCommands.length > 0) {
+    throw new Error([
+      'Installed CLI command surface does not match the expected workflow command set.',
+      `expected=${expectedCommands.join(',')}`,
+      `actual=${exposedCommands.join(',')}`,
+    ].join(' '));
   }
 }
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
-import { mkdir, open, readFile, writeFile } from 'node:fs/promises';
-import { isAbsolute, join, resolve } from 'node:path';
+import { chmod, mkdir, open, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { CodexSubagentBackend } from './codex/subagent-backend.js';
@@ -69,6 +69,13 @@ async function main(argv: readonly string[]): Promise<number> {
     return 0;
   }
   if (command === 'run') return runWorkflow(args);
+  if (command === 'status') return showBackgroundStatus(args);
+  if (command === 'wait') return waitForBackgroundJob(args);
+  if (command === 'logs') return showBackgroundLogs(args);
+  if (command === 'result') return showBackgroundResult(args);
+  if (command === 'cancel') return cancelBackgroundJob(args);
+  if (command === 'jobs' || command === 'list') return listBackgroundJobs(args);
+  if (command === 'archive' || command === 'export') return archiveBackgroundJob(args);
   process.stderr.write(`Unknown command: ${command}\n\n${helpText()}`);
   return 1;
 }
@@ -112,6 +119,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
       const snapshot = await streamCommandWorkflow(runtime, launch, progressMode);
       if (snapshot.status === 'completed') {
         process.stdout.write(`${JSON.stringify(snapshot.result ?? null, null, 2)}\n`);
+        renderWorkflowCompletionGuidance(snapshot, progressMode);
         return 0;
       }
       renderFailedSnapshot(snapshot, progressMode);
@@ -155,6 +163,21 @@ interface ParsedOptions {
   readonly resumeFromRunId?: string;
   readonly permission?: string;
   readonly retryLimit?: string;
+  readonly jobId?: string;
+  readonly metadataPath?: string;
+  readonly resultPath?: string;
+  readonly progressPath?: string;
+  readonly pidPath?: string;
+  readonly intervalMs?: string;
+  readonly tail?: string;
+  readonly signal?: string;
+  readonly plain?: string;
+  readonly format?: string;
+  readonly event?: string;
+  readonly result?: string;
+  readonly wait?: string;
+  readonly outDir?: string;
+  readonly outputPath?: string;
 }
 
 export function parseOptions(args: readonly string[]): ParsedOptions {
@@ -192,10 +215,11 @@ async function launchBackgroundWorkflow(args: readonly string[], cwd: string): P
 
   const stdout = await open(resultPath, 'w');
   const stderr = await open(progressPath, 'w');
+  const entryPath = cliEntryPath();
   let childPid = 0;
   try {
     const child = spawn(process.execPath, [
-      cliEntryPath(),
+      entryPath,
       'run',
       ...args,
       '--execution',
@@ -226,6 +250,9 @@ async function launchBackgroundWorkflow(args: readonly string[], cwd: string): P
     progressPath,
     metadataPath,
     pidPath,
+    nodePath: process.execPath,
+    cliEntryPath: entryPath,
+    commandLineHint: `${process.execPath} ${entryPath} run`,
   }, null, 2)}\n`);
   process.stdout.write(`${JSON.stringify({
     kind: 'ultracode.workflow.background',
@@ -239,6 +266,728 @@ async function launchBackgroundWorkflow(args: readonly string[], cwd: string): P
     pidPath,
   }, null, 2)}\n`);
   return 0;
+}
+
+interface BackgroundJobRef {
+  readonly jobId?: string;
+  readonly cwd: string;
+  readonly metadataPath: string;
+  readonly resultPath: string;
+  readonly progressPath: string;
+  readonly pidPath: string;
+}
+
+interface BackgroundJobMetadata {
+  readonly kind: 'ultracode.workflow.background';
+  readonly version: 1;
+  readonly status: 'launched';
+  readonly jobId: string;
+  readonly pid: number;
+  readonly launchedAt: string;
+  readonly cwd: string;
+  readonly resultPath: string;
+  readonly progressPath: string;
+  readonly metadataPath: string;
+  readonly pidPath: string;
+  readonly nodePath?: string;
+  readonly cliEntryPath?: string;
+  readonly commandLineHint?: string;
+}
+
+interface BackgroundProgressRead {
+  readonly exists: boolean;
+  readonly events: readonly ProgressPayload[];
+  readonly malformedLineCount: number;
+}
+
+interface BackgroundJobStatus {
+  readonly kind: 'ultracode.workflow.background.status';
+  readonly version: 1;
+  readonly status: 'running' | 'completed' | 'failed' | 'exited_unknown';
+  readonly jobId?: string;
+  readonly pid?: number;
+  readonly alive: boolean;
+  readonly launchedAt?: string;
+  readonly cwd: string;
+  readonly resultPath: string;
+  readonly progressPath: string;
+  readonly metadataPath: string;
+  readonly pidPath: string;
+  readonly resultReady: boolean;
+  readonly progressEventCount: number;
+  readonly malformedProgressLineCount: number;
+  readonly lastEvent?: string;
+  readonly lastStatus?: string;
+  readonly lastSummary?: string;
+  readonly reason?: string;
+  readonly error?: string;
+  readonly completedAgentCount?: number;
+  readonly knownAgentCount?: number;
+  readonly phase?: string;
+  readonly phaseCompletedAgentCount?: number;
+  readonly phaseKnownAgentCount?: number;
+  readonly elapsedMs?: number;
+}
+
+interface BackgroundJobsList {
+  readonly kind: 'ultracode.workflow.background.jobs';
+  readonly version: 1;
+  readonly cwd: string;
+  readonly backgroundRoot: string;
+  readonly count: number;
+  readonly jobs: readonly BackgroundJobStatus[];
+  readonly invalidJobs: readonly {
+    readonly path: string;
+    readonly error: string;
+  }[];
+}
+
+interface BackgroundCancelResult {
+  readonly kind: 'ultracode.workflow.background.cancel';
+  readonly version: 1;
+  readonly status: 'signalled' | 'not_running' | 'identity_mismatch';
+  readonly jobId: string;
+  readonly pid: number;
+  readonly signal: NodeJS.Signals;
+  readonly identityVerified: boolean;
+  readonly processCommandLine?: string;
+  readonly metadataPath: string;
+  readonly resultPath: string;
+  readonly progressPath: string;
+  readonly pidPath: string;
+}
+
+interface BackgroundArchiveRecord {
+  readonly kind: 'ultracode.workflow.background.archive';
+  readonly version: 1;
+  readonly archivedAt: string;
+  readonly archivePath: string;
+  readonly status: BackgroundJobStatus;
+  readonly metadata: BackgroundJobMetadata;
+  readonly progressEvents: readonly ProgressPayload[];
+  readonly malformedProgressLineCount: number;
+  readonly resultText: string | null;
+}
+
+async function showBackgroundStatus(args: readonly string[]): Promise<number> {
+  const options = parseOptions(args);
+  const status = await inspectBackgroundJob(options);
+  if (wantsPlain(options)) {
+    process.stdout.write(renderBackgroundStatusPlain(status));
+    return 0;
+  }
+  process.stdout.write(`${JSON.stringify(status, null, 2)}\n`);
+  return 0;
+}
+
+async function waitForBackgroundJob(args: readonly string[]): Promise<number> {
+  const options = parseOptions(args);
+  const timeoutMs = parseNonNegativeIntOption(options.timeoutMs, 0, 'timeout-ms');
+  const intervalMs = parsePositiveIntOption(options.intervalMs, 1_000, 'interval-ms');
+  const waited = await waitForTerminalBackgroundJob(options, timeoutMs, intervalMs);
+  if (waited.timedOut) {
+    const payload: BackgroundJobStatus & { readonly waitTimedOut: true; readonly waitTimeoutMs: number } = {
+      ...waited.status,
+      waitTimedOut: true,
+      waitTimeoutMs: timeoutMs,
+    };
+    if (wantsPlain(options)) process.stdout.write(renderBackgroundStatusPlain(payload));
+    else process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+    return 124;
+  }
+  if (wantsResult(options) && waited.status.status === 'completed') {
+    return await printBackgroundResult(await resolveBackgroundJobRef(options), waited.status);
+  }
+  if (wantsPlain(options)) process.stdout.write(renderBackgroundStatusPlain(waited.status));
+  else process.stdout.write(`${JSON.stringify(waited.status, null, 2)}\n`);
+  return waited.status.status === 'completed' ? 0 : 1;
+}
+
+async function showBackgroundLogs(args: readonly string[]): Promise<number> {
+  const options = parseOptions(args);
+  const ref = await resolveBackgroundJobRef(options);
+  const progress = await readBackgroundProgress(ref.progressPath);
+  if (!progress.exists) {
+    process.stderr.write(`Background progress file not found: ${ref.progressPath}\n`);
+    return 1;
+  }
+  const filtered = options.event
+    ? progress.events.filter((event) => event.event === options.event)
+    : progress.events;
+  const tail = options.tail === undefined ? 0 : parseNonNegativeIntOption(options.tail, 0, 'tail');
+  const selected = tail > 0 ? filtered.slice(-tail) : filtered;
+  if (wantsPlain(options)) {
+    process.stdout.write(selected.map(renderProgressEventPlain).join(''));
+  } else {
+    process.stdout.write(selected.map((event) => JSON.stringify(event)).join('\n'));
+    if (selected.length > 0) process.stdout.write('\n');
+  }
+  return 0;
+}
+
+async function showBackgroundResult(args: readonly string[]): Promise<number> {
+  const options = parseOptions(args);
+  const ref = await resolveBackgroundJobRef(options);
+  const status = await inspectBackgroundJob(options);
+  return await printBackgroundResult(ref, status);
+}
+
+async function printBackgroundResult(ref: BackgroundJobRef, status: BackgroundJobStatus): Promise<number> {
+  const text = await readTextFileIfPresent(ref.resultPath);
+  if (text !== null && text.trim()) {
+    process.stdout.write(text.endsWith('\n') ? text : `${text}\n`);
+    return 0;
+  }
+  process.stderr.write(`Background result is not ready: ${status.status}${status.reason ? ` (${status.reason})` : ''}\n`);
+  return status.status === 'failed' ? 1 : 2;
+}
+
+async function cancelBackgroundJob(args: readonly string[]): Promise<number> {
+  const options = parseOptions(args);
+  const ref = await resolveBackgroundJobRef(options);
+  const metadata = await readBackgroundMetadata(ref.metadataPath);
+  const pid = metadata.pid || await readPid(ref.pidPath);
+  if (!pid || pid <= 0) {
+    process.stderr.write(`Background job pid not found: ${ref.pidPath}\n`);
+    return 1;
+  }
+  const signal = parseSignalOption(options.signal);
+  const alive = isProcessAlive(pid);
+  const commandLine = alive ? backgroundProcessCommandLine(pid) : undefined;
+  const identityVerified = !alive || backgroundProcessIdentityMatches(metadata, commandLine);
+  const cancelResult: BackgroundCancelResult = {
+    kind: 'ultracode.workflow.background.cancel',
+    version: 1,
+    status: alive
+      ? identityVerified ? 'signalled' : 'identity_mismatch'
+      : 'not_running',
+    jobId: metadata.jobId,
+    pid,
+    signal,
+    identityVerified,
+    ...(commandLine ? { processCommandLine: commandLine } : {}),
+    metadataPath: ref.metadataPath,
+    resultPath: ref.resultPath,
+    progressPath: ref.progressPath,
+    pidPath: ref.pidPath,
+  };
+  if (alive && !identityVerified) {
+    if (wantsPlain(options)) process.stdout.write(renderBackgroundCancelPlain(cancelResult));
+    else process.stdout.write(`${JSON.stringify(cancelResult, null, 2)}\n`);
+    return 1;
+  }
+  if (alive) {
+    process.kill(pid, signal);
+  }
+  if (wantsWait(options)) {
+    const timeoutMs = parseNonNegativeIntOption(options.timeoutMs, 0, 'timeout-ms');
+    const intervalMs = parsePositiveIntOption(options.intervalMs, 1_000, 'interval-ms');
+    const waited = await waitForTerminalBackgroundJob(options, timeoutMs, intervalMs);
+    const payload = {
+      kind: 'ultracode.workflow.background.cancel.wait',
+      version: 1,
+      cancel: cancelResult,
+      terminalStatus: waited.status,
+      waitTimedOut: waited.timedOut,
+      ...(waited.timedOut ? { waitTimeoutMs: timeoutMs } : {}),
+    };
+    if (wantsPlain(options)) {
+      process.stdout.write(`${renderBackgroundCancelPlain(cancelResult)}${renderBackgroundStatusPlain(waited.status)}`);
+    } else {
+      process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+    }
+    return waited.timedOut ? 124 : 0;
+  }
+  if (wantsPlain(options)) process.stdout.write(renderBackgroundCancelPlain(cancelResult));
+  else process.stdout.write(`${JSON.stringify(cancelResult, null, 2)}\n`);
+  return 0;
+}
+
+async function listBackgroundJobs(args: readonly string[]): Promise<number> {
+  const options = parseOptions(args);
+  const list = await backgroundJobsList(options);
+  if (wantsPlain(options)) {
+    process.stdout.write(renderBackgroundJobsPlain(list));
+    return 0;
+  }
+  process.stdout.write(`${JSON.stringify(list, null, 2)}\n`);
+  return 0;
+}
+
+async function archiveBackgroundJob(args: readonly string[]): Promise<number> {
+  const options = parseOptions(args);
+  const ref = await resolveBackgroundJobRef(options);
+  const metadata = await readBackgroundMetadata(ref.metadataPath);
+  const status = await inspectBackgroundJob(options);
+  const progress = await readBackgroundProgress(ref.progressPath);
+  const resultText = await readTextFileIfPresent(ref.resultPath);
+  const archivePath = await backgroundArchivePath(options, metadata.jobId);
+  const record: BackgroundArchiveRecord = {
+    kind: 'ultracode.workflow.background.archive',
+    version: 1,
+    archivedAt: new Date().toISOString(),
+    archivePath,
+    status,
+    metadata,
+    progressEvents: progress.events,
+    malformedProgressLineCount: progress.malformedLineCount,
+    resultText,
+  };
+  await mkdir(dirname(archivePath), { recursive: true });
+  await writeFile(archivePath, `${JSON.stringify(record, null, 2)}\n`);
+  await chmod(archivePath, 0o600).catch(() => undefined);
+  const projection = {
+    kind: 'ultracode.workflow.background.archive.created',
+    version: 1,
+    jobId: metadata.jobId,
+    archivePath,
+    status: status.status,
+    progressEventCount: progress.events.length,
+  };
+  if (wantsPlain(options)) {
+    process.stdout.write(`[archive] ${metadata.jobId} ${status.status} -> ${archivePath}\n`);
+  } else {
+    process.stdout.write(`${JSON.stringify(projection, null, 2)}\n`);
+  }
+  return 0;
+}
+
+async function inspectBackgroundJob(options: ParsedOptions): Promise<BackgroundJobStatus> {
+  const ref = await resolveBackgroundJobRef(options);
+  const metadata = await readBackgroundMetadata(ref.metadataPath);
+  const pid = metadata.pid || await readPid(ref.pidPath);
+  const alive = pid ? isProcessAlive(pid) : false;
+  const progress = await readBackgroundProgress(ref.progressPath);
+  const resultText = await readTextFileIfPresent(ref.resultPath);
+  const resultReady = Boolean(resultText?.trim());
+  const statusEvents = progress.events.filter((event) => !isPostCompletionGuidanceEvent(event));
+  const lastEvent = statusEvents.at(-1);
+  const terminalEvent = [...statusEvents].reverse().find((event) => (
+    event.event === 'workflow.completed'
+    || event.event === 'workflow.failed'
+    || event.event === 'workflow.terminal_failure'
+  ));
+  const status = backgroundStatusFrom({ terminalEvent, resultReady, alive });
+  return {
+    kind: 'ultracode.workflow.background.status',
+    version: 1,
+    status,
+    jobId: metadata.jobId ?? ref.jobId,
+    pid,
+    alive,
+    launchedAt: metadata.launchedAt,
+    cwd: metadata.cwd ?? ref.cwd,
+    resultPath: ref.resultPath,
+    progressPath: ref.progressPath,
+    metadataPath: ref.metadataPath,
+    pidPath: ref.pidPath,
+    resultReady,
+    progressEventCount: progress.events.length,
+    malformedProgressLineCount: progress.malformedLineCount,
+    lastEvent: lastEvent?.event,
+    lastStatus: lastEvent?.status,
+    lastSummary: lastEvent?.summary,
+    reason: terminalEvent?.reason,
+    error: terminalEvent?.error,
+    completedAgentCount: lastNumericField(progress.events, 'completedAgentCount'),
+    knownAgentCount: lastNumericField(progress.events, 'knownAgentCount'),
+    phase: lastStringField(progress.events, 'phase'),
+    phaseCompletedAgentCount: lastNumericField(progress.events, 'phaseCompletedAgentCount'),
+    phaseKnownAgentCount: lastNumericField(progress.events, 'phaseKnownAgentCount'),
+    elapsedMs: lastNumericField(progress.events, 'elapsedMs'),
+  };
+}
+
+async function waitForTerminalBackgroundJob(
+  options: ParsedOptions,
+  timeoutMs: number,
+  intervalMs: number,
+): Promise<{ readonly status: BackgroundJobStatus; readonly timedOut: boolean }> {
+  const startedAt = Date.now();
+  while (true) {
+    const status = await inspectBackgroundJob(options);
+    if (isTerminalBackgroundStatus(status.status)) return { status, timedOut: false };
+    if (timeoutMs > 0 && Date.now() - startedAt >= timeoutMs) return { status, timedOut: true };
+    await delay(intervalMs);
+  }
+}
+
+async function backgroundJobsList(options: ParsedOptions): Promise<BackgroundJobsList> {
+  const cwd = options.cwd ?? process.cwd();
+  const settings = workflowBackgroundDefaults();
+  const backgroundRoot = resolveBackgroundJobsRoot(cwd, settings.runDir);
+  const jobs: BackgroundJobStatus[] = [];
+  const invalidJobs: { path: string; error: string }[] = [];
+  let entries: readonly string[] = [];
+  try {
+    entries = await readdir(backgroundRoot);
+  } catch (err) {
+    if (!isNodeErrorCode(err, 'ENOENT')) throw err;
+  }
+  for (const entry of entries) {
+    const candidateDir = join(backgroundRoot, entry);
+    const candidateMetadataPath = join(candidateDir, settings.metadataFile);
+    const candidateStat = await stat(candidateMetadataPath).catch((err) => {
+      if (isNodeErrorCode(err, 'ENOENT') || isNodeErrorCode(err, 'ENOTDIR')) return null;
+      throw err;
+    });
+    if (!candidateStat?.isFile()) continue;
+    try {
+      const metadata = await readBackgroundMetadata(candidateMetadataPath);
+      jobs.push(await inspectBackgroundJob({
+        ...options,
+        _: [],
+        metadataPath: metadata.metadataPath || candidateMetadataPath,
+        cwd,
+      }));
+    } catch (err) {
+      invalidJobs.push({ path: candidateMetadataPath, error: errorMessage(err) });
+    }
+  }
+  jobs.sort((a, b) => String(b.launchedAt ?? '').localeCompare(String(a.launchedAt ?? '')));
+  return {
+    kind: 'ultracode.workflow.background.jobs',
+    version: 1,
+    cwd,
+    backgroundRoot,
+    count: jobs.length,
+    jobs,
+    invalidJobs,
+  };
+}
+
+async function resolveBackgroundJobRef(options: ParsedOptions): Promise<BackgroundJobRef> {
+  if (options._.length > 1) {
+    throw new Error('Background commands accept at most one positional job id or metadata path.');
+  }
+  const cwd = options.cwd ?? process.cwd();
+  const positional = options._[0];
+  const positionalLooksLikePath = positional
+    ? positional.includes('/') || positional.includes('\\') || positional.endsWith('.json')
+    : false;
+  const jobId = options.jobId ?? (positional && !positionalLooksLikePath ? positional : undefined);
+  const metadataPathOption = options.metadataPath ?? (positional && positionalLooksLikePath ? positional : undefined);
+  let ref: BackgroundJobRef;
+  if (metadataPathOption) {
+    const metadataPath = resolve(metadataPathOption);
+    const metadata = await readBackgroundMetadata(metadataPath);
+    ref = {
+      jobId: metadata.jobId,
+      cwd: metadata.cwd,
+      metadataPath,
+      resultPath: options.resultPath ? resolve(options.resultPath) : requireMetadataPath(metadata.resultPath, 'resultPath'),
+      progressPath: options.progressPath ? resolve(options.progressPath) : requireMetadataPath(metadata.progressPath, 'progressPath'),
+      pidPath: options.pidPath ? resolve(options.pidPath) : requireMetadataPath(metadata.pidPath, 'pidPath'),
+    };
+  } else if (jobId) {
+    const settings = workflowBackgroundDefaults();
+    const runDir = resolveBackgroundRunDir(cwd, settings.runDir, jobId);
+    ref = {
+      jobId,
+      cwd,
+      metadataPath: options.metadataPath ? resolve(options.metadataPath) : join(runDir, settings.metadataFile),
+      resultPath: options.resultPath ? resolve(options.resultPath) : join(runDir, settings.resultFile),
+      progressPath: options.progressPath ? resolve(options.progressPath) : join(runDir, settings.progressFile),
+      pidPath: options.pidPath ? resolve(options.pidPath) : join(runDir, settings.pidFile),
+    };
+  } else {
+    throw new Error('Background command requires a job id, metadata path, or --job-id.');
+  }
+  assertDistinctBackgroundPaths([ref.resultPath, ref.progressPath, ref.metadataPath, ref.pidPath]);
+  return ref;
+}
+
+async function readBackgroundMetadata(metadataPath: string): Promise<BackgroundJobMetadata> {
+  const text = await readTextFileIfPresent(metadataPath);
+  if (text === null) throw new Error(`Background metadata file not found: ${metadataPath}`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch (err) {
+    throw new Error(`Background metadata file is not valid JSON: ${errorMessage(err)}`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Background metadata must contain a JSON object.');
+  }
+  return validateBackgroundMetadata(parsed as Record<string, unknown>, metadataPath);
+}
+
+async function readPid(pidPath: string): Promise<number | undefined> {
+  const text = await readTextFileIfPresent(pidPath);
+  if (text === null) return undefined;
+  const pid = Number.parseInt(text.trim(), 10);
+  return Number.isFinite(pid) ? pid : undefined;
+}
+
+function validateBackgroundMetadata(value: Record<string, unknown>, metadataPath: string): BackgroundJobMetadata {
+  const kind = requiredString(value.kind, 'kind');
+  if (kind !== 'ultracode.workflow.background') {
+    throw new Error(`Background metadata kind must be ultracode.workflow.background: ${metadataPath}`);
+  }
+  const version = requiredInteger(value.version, 'version');
+  if (version !== 1) throw new Error(`Background metadata version must be 1: ${metadataPath}`);
+  const status = requiredString(value.status, 'status');
+  if (status !== 'launched') throw new Error(`Background metadata status must be launched: ${metadataPath}`);
+  const pid = requiredInteger(value.pid, 'pid');
+  if (pid < 0) throw new Error(`Background metadata pid must be non-negative: ${metadataPath}`);
+  const metadata: BackgroundJobMetadata = {
+    kind: 'ultracode.workflow.background',
+    version: 1,
+    status: 'launched',
+    jobId: requiredString(value.jobId, 'jobId'),
+    pid,
+    launchedAt: requiredString(value.launchedAt, 'launchedAt'),
+    cwd: requiredString(value.cwd, 'cwd'),
+    resultPath: requiredString(value.resultPath, 'resultPath'),
+    progressPath: requiredString(value.progressPath, 'progressPath'),
+    metadataPath: requiredString(value.metadataPath, 'metadataPath'),
+    pidPath: requiredString(value.pidPath, 'pidPath'),
+    ...(typeof value.nodePath === 'string' && value.nodePath ? { nodePath: value.nodePath } : {}),
+    ...(typeof value.cliEntryPath === 'string' && value.cliEntryPath ? { cliEntryPath: value.cliEntryPath } : {}),
+    ...(typeof value.commandLineHint === 'string' && value.commandLineHint ? { commandLineHint: value.commandLineHint } : {}),
+  };
+  for (const [key, path] of Object.entries({
+    cwd: metadata.cwd,
+    resultPath: metadata.resultPath,
+    progressPath: metadata.progressPath,
+    metadataPath: metadata.metadataPath,
+    pidPath: metadata.pidPath,
+  })) {
+    if (!isAbsolute(path)) throw new Error(`Background metadata ${key} must be an absolute path: ${metadataPath}`);
+  }
+  return metadata;
+}
+
+function requiredString(value: unknown, key: string): string {
+  if (typeof value === 'string' && value.trim()) return value;
+  throw new Error(`Background metadata ${key} must be a non-empty string.`);
+}
+
+function requiredInteger(value: unknown, key: string): number {
+  if (typeof value === 'number' && Number.isInteger(value)) return value;
+  throw new Error(`Background metadata ${key} must be an integer.`);
+}
+
+function backgroundProcessCommandLine(pid: number): string | undefined {
+  try {
+    return execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function backgroundProcessIdentityMatches(
+  metadata: BackgroundJobMetadata,
+  commandLine: string | undefined,
+): boolean {
+  if (!metadata.cliEntryPath || !commandLine) return true;
+  return commandLine.includes(metadata.cliEntryPath)
+    && (!metadata.nodePath || commandLine.includes(metadata.nodePath) || commandLine.includes('node'));
+}
+
+async function backgroundArchivePath(options: ParsedOptions, jobId: string): Promise<string> {
+  if (options.outputPath) return resolve(options.outputPath);
+  const cwd = options.cwd ?? process.cwd();
+  const archiveDir = options.outDir
+    ? resolve(options.outDir)
+    : resolve(cwd, '.ultracode-for-codex', 'archive');
+  return join(archiveDir, `${jobId}.json`);
+}
+
+async function readBackgroundProgress(progressPath: string): Promise<BackgroundProgressRead> {
+  const text = await readTextFileIfPresent(progressPath);
+  if (text === null) return { exists: false, events: [], malformedLineCount: 0 };
+  if (!text.trim()) return { exists: true, events: [], malformedLineCount: 0 };
+  const lines = text.split(/\r?\n/);
+  if (lines.at(-1) === '') lines.pop();
+  const events: ProgressPayload[] = [];
+  let malformedLineCount = 0;
+  for (const [index, line] of lines.entries()) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      if (
+        parsed
+        && typeof parsed === 'object'
+        && !Array.isArray(parsed)
+        && (parsed as { kind?: unknown }).kind === PROGRESS_KIND
+        && (parsed as { version?: unknown }).version === 1
+        && typeof (parsed as { event?: unknown }).event === 'string'
+      ) {
+        events.push(parsed as ProgressPayload);
+      } else {
+        malformedLineCount += 1;
+      }
+    } catch {
+      if (index !== lines.length - 1) malformedLineCount += 1;
+    }
+  }
+  return { exists: true, events, malformedLineCount };
+}
+
+async function readTextFileIfPresent(path: string): Promise<string | null> {
+  try {
+    return await readFile(path, 'utf8');
+  } catch (err) {
+    if (isNodeErrorCode(err, 'ENOENT')) return null;
+    throw err;
+  }
+}
+
+function requireMetadataPath(value: string | undefined, key: string): string {
+  if (!value) throw new Error(`Background metadata is missing ${key}.`);
+  return value;
+}
+
+function backgroundStatusFrom(input: {
+  readonly terminalEvent?: ProgressPayload;
+  readonly resultReady: boolean;
+  readonly alive: boolean;
+}): BackgroundJobStatus['status'] {
+  if (input.terminalEvent?.event === 'workflow.completed') return 'completed';
+  if (input.terminalEvent?.event === 'workflow.failed' || input.terminalEvent?.event === 'workflow.terminal_failure') return 'failed';
+  if (input.resultReady) return 'completed';
+  return input.alive ? 'running' : 'exited_unknown';
+}
+
+function isTerminalBackgroundStatus(status: BackgroundJobStatus['status']): boolean {
+  return status === 'completed' || status === 'failed' || status === 'exited_unknown';
+}
+
+function resolveBackgroundJobsRoot(cwd: string, template: string): string {
+  const marker = '__ultracode_job_marker__';
+  return dirname(resolveBackgroundRunDir(cwd, template, marker));
+}
+
+function wantsPlain(options: ParsedOptions): boolean {
+  return options.plain === 'true' || options.format === 'plain' || options.progress === 'plain';
+}
+
+function wantsResult(options: ParsedOptions): boolean {
+  return options.result === 'true';
+}
+
+function wantsWait(options: ParsedOptions): boolean {
+  return options.wait === 'true';
+}
+
+function renderBackgroundStatusPlain(status: BackgroundJobStatus & {
+  readonly waitTimedOut?: boolean;
+  readonly waitTimeoutMs?: number;
+}): string {
+  const parts = [
+    `[job] ${status.jobId ?? 'unknown'} ${status.status}`,
+    status.pid !== undefined ? `pid=${status.pid}` : '',
+    `alive=${status.alive}`,
+    status.resultReady ? 'result=ready' : 'result=pending',
+    status.waitTimedOut ? `wait=timeout(${status.waitTimeoutMs}ms)` : '',
+  ].filter(Boolean);
+  const lines = [parts.join(' ')];
+  if (status.lastEvent || status.lastSummary) {
+    lines.push(`[job] last=${status.lastEvent ?? 'unknown'} ${status.lastSummary ?? ''}`.trimEnd());
+  }
+  if (status.completedAgentCount !== undefined && status.knownAgentCount !== undefined) {
+    lines.push(`[job] agents=${status.completedAgentCount}/${status.knownAgentCount}${status.phase ? ` phase=${status.phase}` : ''}`);
+  }
+  if (status.reason || status.error) {
+    lines.push(`[job] failure=${status.reason ?? 'unknown'} ${status.error ?? ''}`.trimEnd());
+  }
+  lines.push(`[job] resultPath=${status.resultPath}`);
+  lines.push(`[job] progressPath=${status.progressPath}`);
+  return `${lines.join('\n')}\n`;
+}
+
+function renderBackgroundJobsPlain(list: BackgroundJobsList): string {
+  const lines = [`[jobs] ${list.count} jobs in ${list.backgroundRoot}`];
+  for (const job of list.jobs) {
+    lines.push(`[jobs] ${job.jobId ?? 'unknown'} ${job.status} pid=${job.pid ?? 'unknown'} alive=${job.alive} result=${job.resultReady ? 'ready' : 'pending'}`);
+  }
+  for (const invalid of list.invalidJobs) {
+    lines.push(`[jobs] invalid ${invalid.path}: ${invalid.error}`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+function renderBackgroundCancelPlain(cancel: BackgroundCancelResult): string {
+  return `[cancel] ${cancel.jobId} ${cancel.status} pid=${cancel.pid} signal=${cancel.signal} identity=${cancel.identityVerified ? 'verified' : 'unverified'}\n`;
+}
+
+function renderProgressEventPlain(event: ProgressPayload): string {
+  const label = [
+    `[${event.event}]`,
+    event.status ? `status=${event.status}` : '',
+    event.phase ? `phase=${event.phase}` : '',
+    event.label ? `agent=${event.label}` : '',
+    event.summary,
+  ].filter(Boolean).join(' ');
+  return `${label}\n`;
+}
+
+function isPostCompletionGuidanceEvent(event: ProgressPayload): boolean {
+  return event.event === 'workflow.summary.ready'
+    || event.event === 'workflow.review.recommended';
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    if (isNodeErrorCode(err, 'ESRCH')) return false;
+    if (isNodeErrorCode(err, 'EPERM')) return true;
+    throw err;
+  }
+}
+
+function parseSignalOption(value: string | undefined): NodeJS.Signals {
+  if (value === undefined) return 'SIGINT';
+  const normalized = value.startsWith('SIG') ? value : `SIG${value}`;
+  const allowed = new Set<NodeJS.Signals>(['SIGINT', 'SIGTERM', 'SIGHUP']);
+  if (allowed.has(normalized as NodeJS.Signals)) return normalized as NodeJS.Signals;
+  throw new Error('signal must be one of SIGINT, SIGTERM, or SIGHUP.');
+}
+
+function parsePositiveIntOption(value: string | undefined, fallback: number, label: string): number {
+  if (value === undefined) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`${label} must be a positive integer.`);
+  return parsed;
+}
+
+function parseNonNegativeIntOption(value: string | undefined, fallback: number, label: string): number {
+  if (value === undefined) return fallback;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`${label} must be a non-negative integer.`);
+  return parsed;
+}
+
+function lastNumericField(events: readonly ProgressPayload[], key: keyof ProgressPayload): number | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const value = events[index]?.[key];
+    if (typeof value === 'number') return value;
+  }
+  return undefined;
+}
+
+function lastStringField(events: readonly ProgressPayload[], key: keyof ProgressPayload): string | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const value = events[index]?.[key];
+    if (typeof value === 'string') return value;
+  }
+  return undefined;
+}
+
+function isNodeErrorCode(err: unknown, code: string): boolean {
+  return err instanceof Error && (err as NodeJS.ErrnoException).code === code;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolveDelay) => {
+    setTimeout(resolveDelay, ms);
+  });
 }
 
 function resolveBackgroundRunDir(cwd: string, template: string, jobId: string): string {
@@ -495,6 +1244,123 @@ function renderFailedSnapshot(snapshot: WorkflowTaskSnapshot, progressMode: Prog
   );
 }
 
+interface WorkflowAgentAngleSummary {
+  readonly title: string;
+  readonly label?: string;
+  readonly angle?: string;
+}
+
+interface WorkflowPhaseExecutionSummary {
+  readonly title: string;
+  readonly goal?: string;
+  readonly agentCount: number;
+  readonly agents: readonly WorkflowAgentAngleSummary[];
+}
+
+function renderWorkflowCompletionGuidance(
+  snapshot: WorkflowTaskSnapshot,
+  progressMode: ProgressMode,
+): void {
+  const phasesSummary = workflowPhaseExecutionSummary(snapshot.events);
+  const totalPlannedAgentCount = phasesSummary.reduce((sum, phase) => sum + phase.agentCount, 0);
+  const reviewRecommendation = criticalReviewRecommendation();
+  if (progressMode === 'jsonl') {
+    writeJsonlProgress({
+      event: 'workflow.summary.ready',
+      status: 'completed',
+      summary: `Workflow completed with ${phasesSummary.length} phase${phasesSummary.length === 1 ? '' : 's'} and ${totalPlannedAgentCount} planned phase agent${totalPlannedAgentCount === 1 ? '' : 's'}`,
+      taskId: snapshot.taskId,
+      runId: snapshot.runId,
+      workflowName: snapshot.workflowName,
+      phasesSummary,
+      totalPhaseCount: phasesSummary.length,
+      totalPlannedAgentCount,
+    });
+    writeJsonlProgress({
+      event: 'workflow.review.recommended',
+      status: 'review_recommended',
+      summary: reviewRecommendation,
+      taskId: snapshot.taskId,
+      runId: snapshot.runId,
+      workflowName: snapshot.workflowName,
+      recommendation: reviewRecommendation,
+    });
+    return;
+  }
+  if (phasesSummary.length > 0) {
+    process.stderr.write('[workflow-summary] phase/agent angles\n');
+    for (const phase of phasesSummary) {
+      process.stderr.write(`[workflow-summary] Phase ${phase.title}: ${phase.agentCount} agent${phase.agentCount === 1 ? '' : 's'}${phase.goal ? ` - ${phase.goal}` : ''}\n`);
+      for (const agent of phase.agents) {
+        process.stderr.write(`[workflow-summary]   - ${agent.title}${agent.label ? ` (${agent.label})` : ''}${agent.angle ? `: ${agent.angle}` : ''}\n`);
+      }
+    }
+  } else {
+    process.stderr.write('[workflow-summary] no phase-level agent plan was recorded\n');
+  }
+  process.stderr.write(`[review-recommendation] ${reviewRecommendation}\n`);
+}
+
+function workflowPhaseExecutionSummary(events: readonly WorkflowEvent[]): readonly WorkflowPhaseExecutionSummary[] {
+  const phases = new Map<string, WorkflowPhaseExecutionSummary>();
+  const phaseTitlesWithPlannedAgents = new Set<string>();
+  for (const event of events) {
+    if (event.type !== 'workflow.phase.planned' && event.type !== 'workflow.phase.started') continue;
+    const plannedAgents = event.plannedAgents ?? [];
+    if (plannedAgents.length > 0) phaseTitlesWithPlannedAgents.add(event.title);
+    const existing = phases.get(event.title);
+    const agents = plannedAgents.length > 0
+      ? plannedAgents.map((agent) => ({
+          title: agent.title,
+          ...(agent.label ? { label: agent.label } : {}),
+          ...(agent.focus ? { angle: agent.focus } : {}),
+        }))
+      : existing?.agents ?? [];
+    phases.set(event.title, {
+      title: event.title,
+      ...(event.goal ?? existing?.goal ? { goal: event.goal ?? existing?.goal } : {}),
+      agentCount: agents.length || existing?.agentCount || 0,
+      agents,
+    });
+  }
+  for (const event of events) {
+    if (event.type !== 'workflow.agent.started' || !event.phase) continue;
+    const existing = phases.get(event.phase);
+    if (!existing) {
+      phases.set(event.phase, {
+        title: event.phase,
+        agentCount: 1,
+        agents: [{
+          title: event.label,
+          label: event.label,
+          angle: event.promptPreview,
+        }],
+      });
+      continue;
+    }
+    if (phaseTitlesWithPlannedAgents.has(event.phase)) continue;
+    if (existing.agents.some((agent) => agent.label === event.label || agent.title === event.label)) continue;
+    const agents = [
+      ...existing.agents,
+      {
+        title: event.label,
+        label: event.label,
+        angle: event.promptPreview,
+      },
+    ];
+    phases.set(event.phase, {
+      ...existing,
+      agentCount: agents.length,
+      agents,
+    });
+  }
+  return [...phases.values()];
+}
+
+function criticalReviewRecommendation(): string {
+  return 'Session LLM should critically re-check the final result before acting: verify whether the conclusion is justified, internally consistent, supported by the observed workflow evidence, and missing material counterarguments.';
+}
+
 function renderControlProgress(
   event: string,
   progressMode: ProgressMode,
@@ -561,6 +1427,10 @@ interface ProgressPayload {
   readonly signal?: string;
   readonly retryIndex?: number;
   readonly retryLimit?: number;
+  readonly phasesSummary?: readonly WorkflowPhaseExecutionSummary[];
+  readonly totalPhaseCount?: number;
+  readonly totalPlannedAgentCount?: number;
+  readonly recommendation?: string;
 }
 
 function writeJsonlProgress(payload: ProgressPayload): void {
@@ -807,6 +1677,15 @@ function helpText(): string {
 
 Commands:
   run        Run a workflow as a local CLI command.
+  status     Show a background workflow status record.
+  wait       Wait for a background workflow to reach a terminal state.
+  logs       Print a background workflow progress JSONL file.
+  result     Print a completed background workflow result JSON.
+  cancel     Send SIGINT to a background workflow command.
+  jobs       List background workflow jobs.
+  list       Alias for jobs.
+  archive    Export one background workflow job state to an archive JSON file.
+  export     Alias for archive.
 
 Options:
   --version, -v                     Print the package version.
@@ -828,6 +1707,23 @@ Options:
   --cwd <dir>                        Working directory for workflow execution. Default: current cwd.
   --reasoning-effort <effort>        Codex reasoning effort. Default: settings.json (${codexDefaultReasoningEffort()}).
   --verbosity <verbosity>            Codex verbosity. Default: settings.json (${codexDefaultVerbosity()}).
+
+Background command options:
+  <jobId|metadataPath>               Background job id or metadata.json path.
+  --job-id <id>                      Background job id.
+  --metadata-path <path>             Path to metadata.json from a launch record.
+  --result-path <path>               Override result.json path.
+  --progress-path <path>             Override progress.jsonl path.
+  --pid-path <path>                  Override pid path.
+  --interval-ms <number>             wait polling interval. Default: 1000.
+  --tail <number>                    logs line count. Default: all lines.
+  --event <event>                    logs event filter, such as workflow.agent.completed.
+  --signal <SIGINT|SIGTERM|SIGHUP>   cancel signal. Default: SIGINT.
+  --plain                            Print a human-readable background summary.
+  --result                           wait prints the workflow result on completion.
+  --wait                             cancel waits for terminal workflow status.
+  --out-dir <dir>                    archive output directory. Default: .ultracode-for-codex/archive.
+  --output-path <path>               archive output file path.
 `;
 }
 

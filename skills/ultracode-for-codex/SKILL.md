@@ -15,8 +15,8 @@ Workflow execution runs through the local CLI command. Progress,
 cancellation, permission review, retry, and result projection stay in that
 command process. `settings.json` defaults runs to OS background execution; use
 that path for long Codex-launched work so Codex can keep doing other tasks and
-inspect `progressPath` or `resultPath` later. Attached runs stream stderr JSONL
-for Codex-readable status, while stdout remains the final workflow result JSON.
+inspect the background job later. Attached runs stream stderr JSONL for
+Codex-readable status, while stdout remains the final workflow result JSON.
 
 The default Ultracode work shape is phase-wise parallel execution: built-in
 `task` and `code-review` first call a planner agent, then execute each planned
@@ -45,7 +45,7 @@ For source-checkout validation before publish:
 
 ```bash
 npm run pack:ultracode-for-codex
-npm install --save-dev ./artifacts/ultracode-for-codex-0.2.6.tgz
+npm install --save-dev ./artifacts/ultracode-for-codex-<version>.tgz
 ```
 
 CLI behavior:
@@ -53,6 +53,12 @@ CLI behavior:
 - `--version` or `-v` prints the installed package version;
 - default execution is `background`; stdout contains a launch record with
   `jobId`, `pid`, `resultPath`, `progressPath`, `metadataPath`, and `pidPath`;
+- background jobs can be inspected with `status`, waited with `wait`, read with
+  `logs` and `result`, and cancelled with `cancel`;
+- background jobs can be enumerated with `jobs` or `list`, and exported without
+  deletion with `archive` or `export`;
+- `wait --result`, `cancel --wait`, `logs --event <event>`, and `--plain`
+  provide focused foreground checks;
 - attached execution is available with `--execution attached` when the caller
   should stay connected until completion;
 - attached progress prints to stderr as JSONL by default;
@@ -67,6 +73,9 @@ CLI behavior:
   phase begins;
 - each `workflow.agent.completed` record includes phase progress, total known
   agent progress, and elapsed time;
+- after a completed run, `workflow.summary.ready` reports phase-level agent
+  counts and angles, then `workflow.review.recommended` asks the current
+  session LLM to critically re-check the final result before acting on it;
 - `Ctrl-C` cancels the active attached workflow;
 - `--retry-limit <n>` retries failed workflows inside the same process;
 - `--timeout-ms 0` waits for completion, cancellation, or app-server exit;

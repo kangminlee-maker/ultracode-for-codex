@@ -62,6 +62,7 @@ try {
   await assertPermissionAllow(installedCli);
   await assertRetry(installedCli);
   await assertCancel(installedCli);
+  await assertBackgroundCancel(installedCli);
 
   const journals = await findFiles(join(consumerDir, '.ultracode-for-codex'), 'journal.jsonl');
   assert.ok(journals.length >= 4);
@@ -168,9 +169,106 @@ async function assertBackgroundDefault(installedCli) {
   assertProgressEvent(progress, 'workflow.phase.started', { title: 'Background', detail: 'Verify default execution mode' });
   assertProgressEvent(progress, 'workflow.log', { message: 'background default done' });
   assertProgressEvent(progress, 'workflow.completed', { status: 'completed' });
+  await waitForProgressEvent(launch.progressPath, 'workflow.review.recommended', REQUEST_TIMEOUT_MS);
   const metadata = JSON.parse(await readFile(launch.metadataPath, 'utf8'));
   assert.equal(metadata.jobId, launch.jobId);
   assert.equal(metadata.pid, launch.pid);
+
+  const waitResult = runCliCommand(installedCli, 'wait', [
+    launch.jobId,
+    '--cwd',
+    consumerDir,
+    '--timeout-ms',
+    String(REQUEST_TIMEOUT_MS),
+    '--interval-ms',
+    '50',
+  ]);
+  assert.equal(waitResult.status, 0);
+  const waitStatus = JSON.parse(waitResult.stdout);
+  assert.equal(waitStatus.kind, 'ultracode.workflow.background.status');
+  assert.equal(waitStatus.status, 'completed');
+  assert.equal(waitStatus.jobId, launch.jobId);
+  assert.equal(waitStatus.resultReady, true);
+
+  const waitResultJson = runCliCommand(installedCli, 'wait', [
+    launch.jobId,
+    '--cwd',
+    consumerDir,
+    '--result',
+    '--timeout-ms',
+    String(REQUEST_TIMEOUT_MS),
+    '--interval-ms',
+    '50',
+  ]);
+  assert.equal(waitResultJson.status, 0);
+  assert.deepEqual(JSON.parse(waitResultJson.stdout), { background: true });
+
+  const statusResult = runCliCommand(installedCli, 'status', [launch.jobId, '--cwd', consumerDir]);
+  assert.equal(statusResult.status, 0);
+  const status = JSON.parse(statusResult.stdout);
+  assert.equal(status.status, 'completed');
+  assert.equal(status.lastEvent, 'workflow.completed');
+
+  const statusPlain = runCliCommand(installedCli, 'status', [launch.jobId, '--cwd', consumerDir, '--plain']);
+  assert.equal(statusPlain.status, 0);
+  assert.match(statusPlain.stdout, new RegExp(`\\[job\\] ${launch.jobId} completed`));
+
+  const logsResult = runCliCommand(installedCli, 'logs', [launch.jobId, '--cwd', consumerDir, '--tail', '20']);
+  assert.equal(logsResult.status, 0);
+  const logEvents = progressEvents(logsResult.stdout);
+  assertProgressEvent(logEvents, 'workflow.completed', { status: 'completed' });
+  const summaryEvent = assertProgressEvent(logEvents, 'workflow.summary.ready', { status: 'completed' });
+  assert.equal(summaryEvent.totalPhaseCount, 1);
+  assert.equal(summaryEvent.phasesSummary[0].title, 'Background');
+  assert.equal(summaryEvent.phasesSummary[0].agentCount, 0);
+  assertProgressEvent(logEvents, 'workflow.review.recommended', { status: 'review_recommended' });
+
+  const logsFiltered = runCliCommand(installedCli, 'logs', [launch.jobId, '--cwd', consumerDir, '--event', 'workflow.completed']);
+  assert.equal(logsFiltered.status, 0);
+  const filteredEvents = progressEvents(logsFiltered.stdout);
+  assert.equal(filteredEvents.length, 1);
+  assert.equal(filteredEvents[0].event, 'workflow.completed');
+
+  const logsPlain = runCliCommand(installedCli, 'logs', [launch.jobId, '--cwd', consumerDir, '--event', 'workflow.completed', '--plain']);
+  assert.equal(logsPlain.status, 0);
+  assert.match(logsPlain.stdout, /\[workflow\.completed\] status=completed/);
+
+  const resultCommand = runCliCommand(installedCli, 'result', [launch.jobId, '--cwd', consumerDir]);
+  assert.equal(resultCommand.status, 0);
+  assert.deepEqual(JSON.parse(resultCommand.stdout), { background: true });
+
+  const jobsCommand = runCliCommand(installedCli, 'jobs', ['--cwd', consumerDir]);
+  assert.equal(jobsCommand.status, 0);
+  const jobs = JSON.parse(jobsCommand.stdout);
+  assert.equal(jobs.kind, 'ultracode.workflow.background.jobs');
+  assert.ok(jobs.jobs.some((job) => job.jobId === launch.jobId && job.status === 'completed'));
+
+  const listPlain = runCliCommand(installedCli, 'list', ['--cwd', consumerDir, '--plain']);
+  assert.equal(listPlain.status, 0);
+  assert.match(listPlain.stdout, new RegExp(`${launch.jobId} completed`));
+
+  const archiveCommand = runCliCommand(installedCli, 'archive', [launch.jobId, '--cwd', consumerDir]);
+  assert.equal(archiveCommand.status, 0);
+  const archive = JSON.parse(archiveCommand.stdout);
+  assert.equal(archive.kind, 'ultracode.workflow.background.archive.created');
+  assert.equal(archive.jobId, launch.jobId);
+  const archiveRecord = JSON.parse(await readFile(archive.archivePath, 'utf8'));
+  assert.equal(archiveRecord.kind, 'ultracode.workflow.background.archive');
+  assert.equal(archiveRecord.status.status, 'completed');
+  assert.deepEqual(JSON.parse(archiveRecord.resultText), { background: true });
+
+  const exportPath = join(consumerDir, '.ultracode-for-codex', 'archive', `${launch.jobId}-export.json`);
+  const exportCommand = runCliCommand(installedCli, 'export', [
+    launch.jobId,
+    '--cwd',
+    consumerDir,
+    '--output-path',
+    exportPath,
+    '--plain',
+  ]);
+  assert.equal(exportCommand.status, 0);
+  assert.match(exportCommand.stdout, /\[archive\]/);
+  JSON.parse(await readFile(exportPath, 'utf8'));
 }
 
 async function assertCliSmoke(installedCli) {
@@ -219,6 +317,14 @@ return { topic: args.topic, result, structured };`);
   });
   assert.match(firstCompletion.summary, /Phase Run \(1\/1\), 1 out of 1 agents have completed the task, \d+s elapsed/);
   assertProgressEvent(progress, 'workflow.completed', { status: 'completed', agentCount: 2 });
+  const summary = assertProgressEvent(progress, 'workflow.summary.ready', { status: 'completed' });
+  assert.deepEqual(summary.phasesSummary.map((phase) => phase.title), ['Run']);
+  assert.deepEqual(summary.phasesSummary[0].agents.map((agent) => agent.label), [
+    'installed-agent',
+    'installed-structured-agent',
+  ]);
+  const recommendation = assertProgressEvent(progress, 'workflow.review.recommended', { status: 'review_recommended' });
+  assert.match(recommendation.recommendation, /critically re-check/);
   assert.deepEqual(JSON.parse(result.stdout), {
     topic: 'installed-e2e',
     result: 'OK',
@@ -260,6 +366,13 @@ async function assertBuiltinPlanProgress(installedCli) {
   assertProgressEvent(progress, 'workflow.agent.started', { label: 'task-inspect-runtime' });
   assertProgressEvent(progress, 'workflow.agent.started', { label: 'task-inspect-tests' });
   assertProgressEvent(progress, 'workflow.completed', { status: 'completed' });
+  const summary = assertProgressEvent(progress, 'workflow.summary.ready', { status: 'completed' });
+  assert.equal(summary.totalPhaseCount, 1);
+  assert.deepEqual(summary.phasesSummary[0].agents.map((agent) => agent.label), [
+    'task-inspect-runtime',
+    'task-inspect-tests',
+  ]);
+  assertProgressEvent(progress, 'workflow.review.recommended', { status: 'review_recommended' });
 }
 
 async function assertPlainProgress(installedCli) {
@@ -335,10 +448,57 @@ async function assertCancel(installedCli) {
   assertProgressEvent(progress, 'workflow.cancel.requested', { status: 'cancelling' });
   assertProgressEvent(progress, 'workflow.failed', { reason: 'workflow_aborted' });
   assertProgressEvent(progress, 'workflow.terminal_failure', { reason: 'workflow_aborted' });
+  assert.equal(progress.some((event) => event.event === 'workflow.review.recommended'), false);
+}
+
+async function assertBackgroundCancel(installedCli) {
+  const result = runCli(installedCli, [
+    '--script',
+    'export const meta = { name: "installed-background-cancel" };\nawait agent("WAIT");\nreturn "never";',
+    '--permission',
+    'allow',
+  ]);
+  assert.equal(result.status, 0);
+  const launch = JSON.parse(result.stdout);
+  await waitForProgressEvent(launch.progressPath, 'workflow.agent.started', REQUEST_TIMEOUT_MS);
+
+  const cancelResult = runCliCommand(installedCli, 'cancel', [
+    launch.jobId,
+    '--cwd',
+    consumerDir,
+    '--wait',
+    '--timeout-ms',
+    String(REQUEST_TIMEOUT_MS),
+    '--interval-ms',
+    '50',
+  ]);
+  assert.equal(cancelResult.status, 0);
+  const cancel = JSON.parse(cancelResult.stdout);
+  assert.equal(cancel.kind, 'ultracode.workflow.background.cancel.wait');
+  assert.equal(cancel.cancel.status, 'signalled');
+  assert.equal(cancel.cancel.jobId, launch.jobId);
+  assert.equal(cancel.cancel.signal, 'SIGINT');
+  assert.equal(cancel.cancel.identityVerified, true);
+  assert.equal(cancel.terminalStatus.status, 'failed');
+  assert.equal(cancel.terminalStatus.reason, 'workflow_aborted');
+
+  const logsResult = runCliCommand(installedCli, 'logs', [launch.jobId, '--cwd', consumerDir]);
+  assert.equal(logsResult.status, 0);
+  const progress = progressEvents(logsResult.stdout);
+  assertProgressEvent(progress, 'workflow.cancel.requested', { status: 'cancelling' });
+  assertProgressEvent(progress, 'workflow.terminal_failure', { reason: 'workflow_aborted' });
 }
 
 function runCli(installedCli, extraArgs) {
   return spawnSync(process.execPath, [installedCli, ...baseCliArgs(), ...extraArgs], {
+    cwd: consumerDir,
+    encoding: 'utf8',
+    env: cliEnv(),
+  });
+}
+
+function runCliCommand(installedCli, command, extraArgs = []) {
+  return spawnSync(process.execPath, [installedCli, command, ...extraArgs], {
     cwd: consumerDir,
     encoding: 'utf8',
     env: cliEnv(),
@@ -474,6 +634,22 @@ async function waitForProgressFile(path, timeoutMs) {
     await delay(50);
   }
   throw new Error(`Timed out waiting for progress file: ${path}`);
+}
+
+async function waitForProgressEvent(path, eventName, timeoutMs) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const text = await readFile(path, 'utf8');
+      const events = progressEvents(text);
+      const match = events.find((event) => event.event === eventName);
+      if (match) return match;
+    } catch (err) {
+      if (err.code !== 'ENOENT' && !(err instanceof SyntaxError)) throw err;
+    }
+    await delay(50);
+  }
+  throw new Error(`Timed out waiting for progress event ${eventName}: ${path}`);
 }
 
 function delay(ms) {

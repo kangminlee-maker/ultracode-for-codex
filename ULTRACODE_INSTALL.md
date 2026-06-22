@@ -13,6 +13,15 @@ workflow runs to OS background execution with result and progress files under
 Production surface:
 
 - `ultracode-for-codex run`
+- `ultracode-for-codex status`
+- `ultracode-for-codex wait`
+- `ultracode-for-codex logs`
+- `ultracode-for-codex result`
+- `ultracode-for-codex cancel`
+- `ultracode-for-codex jobs`
+- `ultracode-for-codex list`
+- `ultracode-for-codex archive`
+- `ultracode-for-codex export`
 
 Progress, cancellation, permission review, retry, and final result projection
 are handled inside the CLI process. Progress is JSONL on stderr by
@@ -31,7 +40,7 @@ npm exec -- ultracode-for-codex --llm-guide
 For source-checkout validation, install the generated tarball instead:
 
 ```bash
-npm install --save-dev ./ultracode-for-codex-0.2.6.tgz
+npm install --save-dev ./ultracode-for-codex-<version>.tgz
 ```
 
 Optional Codex companion skill:
@@ -57,8 +66,20 @@ npm exec -- ultracode-for-codex run \
 
 The default run prints a background launch record to stdout. Prefer that
 background path for long Codex-launched work so Codex can continue other tasks
-and inspect `progressPath` or `resultPath` later. Use `--execution attached`
-only when the caller must block until completion.
+and inspect the job later with `status`, `logs`, or `result`. Use
+`--execution attached` only when the caller must block until completion.
+
+Use the background `jobId` from the launch record to inspect or control the run:
+
+```bash
+npm exec -- ultracode-for-codex status <jobId> --cwd /path/to/project
+npm exec -- ultracode-for-codex wait <jobId> --cwd /path/to/project
+npm exec -- ultracode-for-codex logs <jobId> --cwd /path/to/project --tail 40
+npm exec -- ultracode-for-codex result <jobId> --cwd /path/to/project
+npm exec -- ultracode-for-codex cancel <jobId> --cwd /path/to/project
+npm exec -- ultracode-for-codex jobs --cwd /path/to/project
+npm exec -- ultracode-for-codex archive <jobId> --cwd /path/to/project
+```
 
 Use built-in `task` for general work and `code-review` for review-specific work.
 Both start with an LLM planner, execute phase by phase, run multiple focused
@@ -93,6 +114,13 @@ Settings defaults:
 Useful controls:
 
 - `--version` or `-v` prints the installed package version.
+- `status`, `wait`, `logs`, `result`, and `cancel` accept a background `jobId`
+  or `metadata.json` path.
+- `jobs` and `list` enumerate local background runs.
+- `archive` and `export` write a sensitive local JSON bundle for one run without
+  deleting runtime state.
+- `wait --result`, `cancel --wait`, `logs --event <event>`, and `--plain` are
+  available for shorter foreground checks.
 - Progress events are printed to stderr as JSONL by default.
 - The final workflow result is printed as JSON to stdout.
 - The package default workflow timeout is `0`, meaning the workflow waits until
@@ -107,6 +135,10 @@ Useful controls:
   begins.
 - Each `workflow.agent.completed` record includes phase progress, total known
   agent progress, and elapsed time.
+- After a completed run, `workflow.summary.ready` reports each phase with its
+  planned agent count and angle/focus list, then `workflow.review.recommended`
+  asks the current session LLM to critically re-check the final result before
+  acting on it.
 - Press `Ctrl-C` once to cancel the running workflow.
 - Use `--retry-limit <n>` to retry failed runs in the same process.
 - `--timeout-ms 0` waits for completion, cancellation, or app-server exit.

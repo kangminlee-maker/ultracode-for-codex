@@ -158,10 +158,10 @@
     <p>Current state of the local CLI runtime and npm package release path.</p>
 
     <section class="grid" aria-label="Current status">
-      <div class="tile"><strong>Current goal</strong><span>Run workflows as an npm-installed CLI package</span></div>
+      <div class="tile"><strong>Current goal</strong><span>Run and inspect workflows as an npm-installed CLI package</span></div>
       <div class="tile"><strong>Runtime health</strong><span>Latest npm release installed and test suite green</span></div>
       <div class="tile"><strong>Main risk</strong><span>Cross-process resume remains intentionally out of scope</span></div>
-      <div class="tile"><strong>Next decision</strong><span>Add cross-process resume only if background job recovery becomes necessary</span></div>
+      <div class="tile"><strong>Next decision</strong><span>Keep resume same-session unless durable recovery becomes necessary</span></div>
     </section>
 
     <h2>Service Blueprint</h2>
@@ -186,7 +186,7 @@
 
         <rect x="40" y="64" width="180" height="116" rx="8" fill="var(--input)" stroke="var(--input-stroke)"></rect>
         <text class="node-title" x="58" y="92">CLI command</text>
-        <text class="node-line" x="58" y="116">run CLI</text>
+        <text class="node-line" x="58" y="116">run/status/jobs</text>
         <text class="node-line" x="58" y="136">settings.json</text>
         <text class="node-line" x="58" y="156">script/name/args</text>
 
@@ -225,8 +225,8 @@
         <rect x="760" y="230" width="160" height="116" rx="8" fill="var(--view)" stroke="var(--view-stroke)"></rect>
         <text class="node-title" x="778" y="258">CLI projection</text>
         <text class="node-line" x="778" y="282">background files</text>
-        <text class="node-line" x="778" y="302">attached stdio</text>
-        <text class="node-line" x="778" y="322">path internal</text>
+        <text class="node-line" x="778" y="302">status/logs/result</text>
+        <text class="node-line" x="778" y="322">summary/recheck</text>
 
         <rect x="760" y="396" width="160" height="116" rx="8" fill="var(--quality)" stroke="var(--quality-stroke)"></rect>
         <text class="node-title" x="778" y="424">Verification</text>
@@ -248,7 +248,7 @@
     <h2>Current Architecture</h2>
     <table>
       <tr><th>Area</th><th>Current contract</th></tr>
-      <tr><td>CLI</td><td><code>src/cli.ts</code> exposes <code>run</code>, help, install guide, and package-version reporting. <code>settings.json</code> defaults to OS background execution so long Codex-launched runs can continue while Codex performs other work; <code>--execution attached</code> keeps progress on stderr JSONL and result on stdout JSON when blocking is desired.</td></tr>
+      <tr><td>CLI</td><td><code>src/cli.ts</code> exposes <code>run</code>, background <code>status</code>/<code>wait</code>/<code>logs</code>/<code>result</code>/<code>cancel</code>/<code>jobs</code>/<code>archive</code>, help, install guide, and package-version reporting. <code>settings.json</code> defaults to OS background execution so long Codex-launched runs can continue while Codex performs other work; <code>--execution attached</code> keeps progress on stderr JSONL and result on stdout JSON when blocking is desired. Completed runs add a phase/agent angle summary and a critical re-check recommendation for the current session LLM.</td></tr>
       <tr><td>Settings</td><td><code>settings.json</code> owns workflow execution mode, progress mode, permission default, retry limit, opt-in timeout, background file names, and Codex model controls. The packaged timeout default is <code>0</code>, so workflows wait for completion, cancellation, or app-server exit.</td></tr>
       <tr><td>Runtime</td><td><code>src/runtime/workflow-runtime.ts</code> owns parsing, validation, phase-wise parallel scheduling, permission, retry, cancel, and progress events. Built-in <code>task</code> and <code>code-review</code> use planner-selected dynamic workflow patterns, run parallel focused subagents by default, emit planning snapshots, emit phase-level plans immediately before each phase, repeat current agent roles on each phase-start event, and include completion counts plus elapsed time on agent completion. Runtime-owned workflow state and isolated worktrees are preserved for review.</td></tr>
       <tr><td>Journal</td><td><code>src/runtime/workflow-journal.ts</code> owns durable hash-chained workflow truth.</td></tr>
@@ -263,6 +263,7 @@
       <tr><td><code>npm run test:e2e:ultracode-for-codex</code></td><td>Packaged CLI E2E with fake Codex app-server boundary.</td></tr>
       <tr><td><code>npm run pack:ultracode-for-codex</code></td><td>Tarball contents, companion skill, exports, and install checks.</td></tr>
       <tr><td><code>npm run publish:dry-run</code></td><td>npm registry publish payload and lifecycle checks before release.</td></tr>
+      <tr><td><code>ULTRACODE_LIVE_SMOKE=1 npm run smoke:live</code></td><td>Opt-in local Codex CLI smoke outside CI.</td></tr>
     </table>
   </main>
 </body>

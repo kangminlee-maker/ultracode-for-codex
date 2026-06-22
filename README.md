@@ -26,7 +26,7 @@ npm run pack:ultracode-for-codex
 Install the tarball from a target project:
 
 ```bash
-npm install --save-dev /path/to/ultracode-for-codex-0.2.6.tgz
+npm install --save-dev /path/to/ultracode-for-codex-<version>.tgz
 ```
 
 Run a workflow:
@@ -41,6 +41,17 @@ npm exec -- ultracode-for-codex run \
 
 By default this prints a background launch record to stdout. The record contains
 `jobId`, `pid`, `resultPath`, `progressPath`, `metadataPath`, and `pidPath`.
+Use the job id to inspect or control the background run:
+
+```bash
+npm exec -- ultracode-for-codex status <jobId> --cwd /path/to/target-repo
+npm exec -- ultracode-for-codex wait <jobId> --cwd /path/to/target-repo
+npm exec -- ultracode-for-codex logs <jobId> --cwd /path/to/target-repo --tail 40
+npm exec -- ultracode-for-codex result <jobId> --cwd /path/to/target-repo
+npm exec -- ultracode-for-codex cancel <jobId> --cwd /path/to/target-repo
+npm exec -- ultracode-for-codex jobs --cwd /path/to/target-repo
+npm exec -- ultracode-for-codex archive <jobId> --cwd /path/to/target-repo
+```
 
 Run attached to the current terminal:
 
@@ -102,12 +113,21 @@ The package default workflow timeout is `0`, meaning the workflow waits until it
 completes, is cancelled, or the Codex app-server exits. Set `--timeout-ms` to a
 positive value to opt into a deadline for one run.
 Use the default background execution for long Codex-launched work so Codex can
-continue other tasks and inspect `progressPath` or `resultPath` later. Use
+continue other tasks and inspect the job later with `status`, `logs`, or
+`result`. Use
 `--execution attached` only when the caller must block until the final result.
 
 ## CLI Controls
 
 - Use `--version` or `-v` to print the installed package version.
+- Use `status`, `wait`, `logs`, `result`, and `cancel` with a background
+  `jobId` or `metadata.json` path to inspect, wait for, read, or cancel OS
+  background runs.
+- Use `jobs` or `list` to enumerate local background runs.
+- Use `archive` or `export` to write a sensitive local JSON bundle for one run
+  without deleting runtime state.
+- Use `wait --result`, `cancel --wait`, `logs --event <event>`, and `--plain`
+  for shorter foreground checks.
 - Progress is printed to stderr as JSONL by default.
 - The final workflow result is printed as JSON to stdout.
 - JSONL records include `kind`, `version`, `event`, `status`, and `summary`;
@@ -120,6 +140,10 @@ continue other tasks and inspect `progressPath` or `resultPath` later. Use
   begins.
 - Each `workflow.agent.completed` record includes phase progress, total known
   agent progress, and elapsed time.
+- After a completed run, `workflow.summary.ready` reports each phase with its
+  planned agent count and angle/focus list, then `workflow.review.recommended`
+  asks the current session LLM to critically re-check the final result before
+  acting on it.
 - Press `Ctrl-C` once to cancel the active workflow.
 - Use `--retry-limit <n>` to retry failed workflows inside the same process.
 - `--timeout-ms 0` waits for completion, cancellation, or app-server exit.
@@ -194,6 +218,12 @@ For supported CI/CD environments, provenance is available as an explicit opt-in:
 
 ```bash
 npm run publish:npm:provenance
+```
+
+Optional live smoke against the local Codex CLI:
+
+```bash
+ULTRACODE_LIVE_SMOKE=1 npm run smoke:live
 ```
 
 Useful local run:
