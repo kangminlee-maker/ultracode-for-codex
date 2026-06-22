@@ -1,11 +1,12 @@
 # Ultracode for Codex
 
-Ultracode for Codex runs local workflows as CLI commands backed by an
-already-authenticated Codex CLI session. Progress streams to stderr as JSONL by
-default, the final result prints to stdout as JSON, and cancellation/retry stay
-inside the same command process.
-The packaged `settings.json` defaults workflow runs to OS background execution
-with result and progress files under `.ultracode-for-codex/background/{jobId}`.
+Ultracode for Codex ships two Codex skill commands plus a local npm CLI runtime.
+`$ultracode-for-codex` is the default high-visibility mode: the Codex main
+context plans adaptive phases, spawns focused parallel subagents, synthesizes
+their results, and reports progress directly in the chat.
+`$ultracode-for-codex-cli` is the explicit runtime path for package validation,
+background jobs, attached CLI runs, release checks, and reproducible local
+workflow artifacts.
 
 ## Quick Start
 
@@ -14,6 +15,35 @@ Install from npm:
 ```bash
 npm install --save-dev ultracode-for-codex
 npm exec -- ultracode-for-codex --llm-guide
+```
+
+Or install the CLI globally:
+
+```bash
+npm install -g ultracode-for-codex
+ultracode-for-codex --version
+ultracode-for-codex --llm-guide
+```
+
+Install the Codex skill commands from a project install:
+
+```bash
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+cp -R ./node_modules/ultracode-for-codex/skills/ultracode-for-codex \
+  "${CODEX_HOME:-$HOME/.codex}/skills/"
+cp -R ./node_modules/ultracode-for-codex/skills/ultracode-for-codex-cli \
+  "${CODEX_HOME:-$HOME/.codex}/skills/"
+```
+
+Or install the skill commands from a global npm install:
+
+```bash
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+GLOBAL_NODE_MODULES="$(npm root -g)"
+cp -R "$GLOBAL_NODE_MODULES/ultracode-for-codex/skills/ultracode-for-codex" \
+  "${CODEX_HOME:-$HOME/.codex}/skills/"
+cp -R "$GLOBAL_NODE_MODULES/ultracode-for-codex/skills/ultracode-for-codex-cli" \
+  "${CODEX_HOME:-$HOME/.codex}/skills/"
 ```
 
 Build and verify a local installable tarball from a source checkout:
@@ -29,7 +59,7 @@ Install the tarball from a target project:
 npm install --save-dev /path/to/ultracode-for-codex-<version>.tgz
 ```
 
-Run a workflow:
+Run through the CLI runtime when that path is explicitly wanted:
 
 ```bash
 npm exec -- ultracode-for-codex run \
@@ -75,14 +105,14 @@ npm exec -- ultracode-for-codex run \
   --args '{"prompt":"review correctness risks and propose fixes"}'
 ```
 
-The built-in `task` and `code-review` workflows use an LLM planner first, then
-run work phase by phase. Within each phase, multiple focused Codex subagents run
-in parallel by default, followed by phase and final synthesis. The planner may
-choose a single-agent path only when parallel execution would add risk or waste.
-Planner guidance includes dynamic workflow patterns such as classify-and-act,
-fan-out-and-synthesize, adversarial verification, generate-and-filter,
-tournament, and loop-until-done, so different work types can use different
-phase shapes.
+The CLI built-in `task` and `code-review` workflows use an LLM planner first,
+then run work phase by phase. Within each phase, multiple focused Codex
+subagents run in parallel by default, followed by phase and final synthesis. The
+planner may choose a single-agent path only when parallel execution would add
+risk or waste. Planner guidance includes dynamic workflow patterns such as
+classify-and-act, fan-out-and-synthesize, adversarial verification,
+generate-and-filter, tournament, and loop-until-done, so different work types
+can use different phase shapes.
 
 ## Settings
 
@@ -155,14 +185,18 @@ continue other tasks and inspect the job later with `status`, `logs`, or
 - Use `--execution background` for OS background runs and `--execution attached`
   only when the caller should stay connected until completion.
 
-## Codex Companion Skill
+## Codex Skill Commands
 
-The npm package is the runtime artifact. The companion Codex skill in
-`skills/ultracode-for-codex` is a lightweight operating guide for agents using
-the package; it contains no runtime code.
+The npm package includes two Codex skill command folders:
 
-Install or copy that folder into `${CODEX_HOME:-$HOME/.codex}/skills` when you
-want Codex to auto-load the package boundaries and verification routine.
+- `skills/ultracode-for-codex`: default Codex-native orchestration. The main
+  context plans adaptive phases, spawns parallel subagents, synthesizes each
+  phase, reports completion progress, and recommends a final critical re-check.
+  Live progress uses test-runner-style visual snapshots; completion reporting
+  uses a diffstat-style impact summary plus a plan-style result summary.
+- `skills/ultracode-for-codex-cli`: explicit CLI runtime operations, including
+  background jobs, attached runs, packaging, release checks, runtime-boundary
+  validation, and installed E2E tests.
 
 ## Runtime Boundaries
 
@@ -171,7 +205,7 @@ want Codex to auto-load the package boundaries and verification routine.
   environment.
 - Codex subagents run against the requested workflow cwd and receive bounded
   read-only workspace tools for text file reads and directory listings.
-- Built-in `task` and `code-review` inject deterministic workspace context into
+- CLI built-in `task` and `code-review` inject deterministic workspace context into
   planner-selected phase-wise parallel subagents, then synthesize each phase and
   the final result.
 - Workflow execution is local and command-owned; settings default to OS
@@ -235,8 +269,11 @@ node dist/cli.js run --accept-llm-guide=v1 --script-file ./workflow.js
 
 ## Docs
 
-- `skills/ultracode-for-codex/SKILL.md`: Codex companion skill for operating
-  the npm runtime safely.
+- `skills/ultracode-for-codex/SKILL.md`: default Codex-native orchestrator
+  skill command.
+- `skills/ultracode-for-codex/references/progress-visuals.md`: golden visual
+  progress and completion summary examples for native orchestration.
+- `skills/ultracode-for-codex-cli/SKILL.md`: explicit CLI runtime skill command.
 - `ULTRACODE_INSTALL.md`: install and operating guide for LLM agents.
 - `docs/ultracode-p3a-journal-design.md`: journal contract.
 - `docs/ultracode-p3b-resume-cache.md`: runtime-internal resume/cache contract.

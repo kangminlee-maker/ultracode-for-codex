@@ -4,6 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import {
   chmod,
+  cp,
   mkdir,
   mkdtemp,
   readFile,
@@ -53,8 +54,12 @@ try {
   run(npm, ['install', '--save-dev', '--no-audit', '--no-fund', artifactPath], { cwd: consumerDir });
   await initializeGitRepo(consumerDir);
 
-  const installedCli = join(consumerDir, 'node_modules', 'ultracode-for-codex', 'dist', 'cli.js');
+  const installedPackageDir = join(consumerDir, 'node_modules', 'ultracode-for-codex');
+  const installedCli = join(installedPackageDir, 'dist', 'cli.js');
   assertInstalledVersion(installedCli);
+  await assertSkillCommandPackageContents(installedPackageDir);
+  await assertSkillCommandInstall(installedPackageDir);
+  await assertNpmExecRun();
   await assertBackgroundDefault(installedCli);
   await assertCliSmoke(installedCli);
   await assertBuiltinPlanProgress(installedCli);
@@ -127,6 +132,85 @@ function assertInstalledVersion(installedCli) {
   assert.equal(result.status, 0);
   assert.equal(result.stdout, `ultracode-for-codex ${pkg.version}\n`);
   assert.equal(result.stderr, '');
+}
+
+async function assertSkillCommandPackageContents(installedPackageDir) {
+  const nativeSkill = await readFile(join(installedPackageDir, 'skills', 'ultracode-for-codex', 'SKILL.md'), 'utf8');
+  const nativeAgent = await readFile(join(installedPackageDir, 'skills', 'ultracode-for-codex', 'agents', 'openai.yaml'), 'utf8');
+  const nativeProgressVisuals = await readFile(join(installedPackageDir, 'skills', 'ultracode-for-codex', 'references', 'progress-visuals.md'), 'utf8');
+  const cliSkill = await readFile(join(installedPackageDir, 'skills', 'ultracode-for-codex-cli', 'SKILL.md'), 'utf8');
+  const cliAgent = await readFile(join(installedPackageDir, 'skills', 'ultracode-for-codex-cli', 'agents', 'openai.yaml'), 'utf8');
+  assert.match(nativeSkill, /^name: ultracode-for-codex$/m);
+  assert.match(nativeSkill, /Codex main context as the orchestrator/);
+  assert.match(nativeSkill, /Use the CLI runtime only when the user explicitly asks/);
+  assert.match(nativeSkill, /references\/progress-visuals\.md/);
+  assert.match(nativeAgent, /Run Codex-native phase-wise parallel orchestration/);
+  assert.match(nativeProgressVisuals, /Default Live Snapshot/);
+  assert.match(nativeProgressVisuals, /Completion Impact Summary/);
+  assert.match(nativeProgressVisuals, /Plan-Style Result Summary/);
+  assert.match(cliSkill, /^name: ultracode-for-codex-cli$/m);
+  assert.match(cliSkill, /npm package and CLI runtime surface/);
+  assert.match(cliSkill, /The default `\$ultracode-for-codex` skill is Codex-native/);
+  assert.match(cliAgent, /Operate the Ultracode for Codex npm CLI runtime/);
+}
+
+async function assertSkillCommandInstall(installedPackageDir) {
+  const skillsRoot = join(codexHome, 'skills');
+  await mkdir(skillsRoot, { recursive: true });
+  for (const name of ['ultracode-for-codex', 'ultracode-for-codex-cli']) {
+    const source = join(installedPackageDir, 'skills', name);
+    const destination = join(skillsRoot, name);
+    await rm(destination, { recursive: true, force: true });
+    await cp(source, destination, { recursive: true });
+    const installedSkill = await readFile(join(destination, 'SKILL.md'), 'utf8');
+    const installedAgent = await readFile(join(destination, 'agents', 'openai.yaml'), 'utf8');
+    assert.match(installedSkill, new RegExp(`^name: ${name}$`, 'm'));
+    assert.match(installedAgent, /display_name:/);
+    assert.match(installedAgent, /default_prompt:/);
+  }
+  const installedVisuals = await readFile(join(skillsRoot, 'ultracode-for-codex', 'references', 'progress-visuals.md'), 'utf8');
+  assert.match(installedVisuals, /Default Live Snapshot/);
+  assert.match(installedVisuals, /Completion Impact Summary/);
+}
+
+async function assertNpmExecRun() {
+  const result = spawnSync(npm, [
+    'exec',
+    '--',
+    'ultracode-for-codex',
+    'run',
+    '--accept-llm-guide',
+    'v1',
+    '--command',
+    fakeCodexPath,
+    '--cwd',
+    consumerDir,
+    '--timeout-ms',
+    String(REQUEST_TIMEOUT_MS),
+    '--execution',
+    'attached',
+    '--script',
+    'export const meta = { name: "installed-npm-exec-run" };\nphase("NpmExec");\nreturn await agent("Return OK for npm exec workflow.", { label: "npm-exec-agent" });',
+    '--permission',
+    'allow',
+  ], {
+    cwd: consumerDir,
+    encoding: 'utf8',
+    env: cliEnv(),
+  });
+  if (result.status !== 0) {
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+  }
+  assert.equal(result.status, 0);
+  assertProgressEvent(progressEvents(result.stderr), 'workflow.started', {
+    status: 'running',
+    workflowName: 'installed-npm-exec-run',
+  });
+  assertProgressEvent(progressEvents(result.stderr), 'workflow.agent.completed', {
+    label: 'npm-exec-agent',
+  });
+  assert.equal(JSON.parse(result.stdout), 'OK');
 }
 
 function packageArtifactName(name, version) {

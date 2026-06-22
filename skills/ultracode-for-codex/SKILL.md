@@ -1,139 +1,114 @@
 ---
 name: ultracode-for-codex
-description: Operate, package, validate, or update the Ultracode for Codex npm runtime. Use when installing or running local workflows, checking runtime boundaries, packaging release tarballs, updating docs, or maintaining the companion Codex skill.
+description: Run Ultracode for Codex in Codex-native mode, with the main Codex context planning phases, spawning parallel subagents, synthesizing results, and showing progress directly in the chat.
 ---
 
 # Ultracode for Codex
 
 ## Core Rule
 
-Treat the npm package as the runtime artifact. This skill is only a companion
-guide for Codex agents. Runtime authority remains in the `ultracode-for-codex`
-binary, tests, package exports, journal layer, and workflow runtime code.
+This skill is the primary Codex-native Ultracode command. Treat the current
+Codex main context as the orchestrator. Plan adaptive phases, spawn focused
+subagents directly from Codex, synthesize phase outputs, and keep the user
+informed in the chat.
 
-Workflow execution runs through the local CLI command. Progress,
-cancellation, permission review, retry, and result projection stay in that
-command process. `settings.json` defaults runs to OS background execution; use
-that path for long Codex-launched work so Codex can keep doing other tasks and
-inspect the background job later. Attached runs stream stderr JSONL for
-Codex-readable status, while stdout remains the final workflow result JSON.
+Use the CLI runtime only when the user explicitly asks for `$ultracode-for-codex-cli`,
+CLI execution, background jobs, packaging, publish preparation, installed
+runtime validation, or reproducible local runtime artifacts.
 
-The default Ultracode work shape is phase-wise parallel execution: built-in
-`task` and `code-review` first call a planner agent, then execute each planned
-phase with parallel focused subagents by default, followed by phase and final
-synthesis. A single-agent path is reserved for cases where the planner judges
-parallel execution risky or wasteful.
-Planner guidance includes classify-and-act, fan-out-and-synthesize,
-adversarial verification, generate-and-filter, tournament, and loop-until-done
-patterns so workflow shape can follow the task instead of a fixed template.
+## Required Capability Surface
 
-## Install And Run
+Use Codex subagent tools for delegated work. If subagent tools are not visible,
+search for the multi-agent tools first. If no subagent surface is available,
+state that native parallel orchestration is unavailable in this session and
+continue with the best single-context workflow.
 
-Use the npm package for consumer installs.
+Do not make the CLI process the default orchestrator for this skill. The npm
+runtime remains available through `$ultracode-for-codex-cli`, but this command's
+value is high-visibility orchestration in the main context.
 
-```bash
-npm install --save-dev ultracode-for-codex
-npm exec -- ultracode-for-codex --llm-guide
-npm exec -- ultracode-for-codex run \
-  --accept-llm-guide=v1 \
-  --cwd /path/to/project \
-  --script-file .codex/workflows/review.js \
-  --args '{"prompt":"review the current change"}'
+## Native Workflow
+
+1. Identify the user goal, scope, constraints, likely completion condition, and
+   whether the work is review, implementation, planning, verification, or mixed.
+2. Design only the next useful phase when later phases depend on earlier
+   results. A first plan may be partial.
+3. Before each phase starts, show a compact phase plan in the chat:
+
+```text
+Phase Inspect - 3 agents
+- Runtime contracts: verify the active execution path and failure semantics.
+- UX/progress: check visibility, summaries, and user-facing wording.
+- Tests/package: check coverage, package contents, and install behavior.
 ```
 
-For source-checkout validation before publish:
+4. Spawn independent phase agents in parallel by default. Use a single agent
+   only when parallel work is risky, wasteful, or blocked by a strictly
+   sequential dependency.
+5. Keep subagent prompts concrete and bounded. Give each agent a distinct angle,
+   expected output shape, and file or responsibility boundary when relevant.
+6. While agents run, do non-overlapping main-context work such as deterministic
+   file inspection, test execution, or integration planning.
+7. As agents complete, report progress with a visual snapshot rather than a
+   dense sentence. Use the Default Live Snapshot golden shape from
+   `references/progress-visuals.md` by default.
 
-```bash
-npm run pack:ultracode-for-codex
-npm install --save-dev ./artifacts/ultracode-for-codex-<version>.tgz
+```text
+Phase E2E Validate
+
+  + Native routing review        done      34s
+  + CLI package review           done      48s
+
+  > npm-exec-run-shim            running   1/2 checks
+  > skill-copy-detection         running   3/6 files
+
+Agents 2 completed | 2 running
+Checks 5 passed | 0 failed | 2 running
+Elapsed 1m 12s
 ```
 
-CLI behavior:
+8. Synthesize each phase before deciding the next phase. Preserve disagreement,
+   uncertainty, material risks, and exact evidence.
+9. After the final synthesis, include the Completion Impact Summary and
+   Plan-Style Result Summary golden shapes from `references/progress-visuals.md`,
+   followed by a short phase/agent summary.
+10. Recommend that the current session LLM critically re-check the final result
+    before the user relies on it, especially for code, security, release, or
+    architecture decisions.
 
-- `--version` or `-v` prints the installed package version;
-- default execution is `background`; stdout contains a launch record with
-  `jobId`, `pid`, `resultPath`, `progressPath`, `metadataPath`, and `pidPath`;
-- background jobs can be inspected with `status`, waited with `wait`, read with
-  `logs` and `result`, and cancelled with `cancel`;
-- background jobs can be enumerated with `jobs` or `list`, and exported without
-  deletion with `archive` or `export`;
-- `wait --result`, `cancel --wait`, `logs --event <event>`, and `--plain`
-  provide focused foreground checks;
-- attached execution is available with `--execution attached` when the caller
-  should stay connected until completion;
-- attached progress prints to stderr as JSONL by default;
-- attached final workflow result prints as JSON to stdout;
-- JSONL records include `kind`, `version`, `event`, `status`, and `summary`,
-  with agent identity and label fields on agent records;
-- built-in `task` and `code-review` emit `workflow.plan.ready` as a planning
-  snapshot, not a promise that every later phase is already known;
-- `workflow.phase.planned` is emitted immediately before each phase starts and
-  carries that phase's current planned agent role labels;
-- each `workflow.phase.started` record repeats the same role labels when the
-  phase begins;
-- each `workflow.agent.completed` record includes phase progress, total known
-  agent progress, and elapsed time;
-- after a completed run, `workflow.summary.ready` reports phase-level agent
-  counts and angles, then `workflow.review.recommended` asks the current
-  session LLM to critically re-check the final result before acting on it;
-- `Ctrl-C` cancels the active attached workflow;
-- `--retry-limit <n>` retries failed workflows inside the same process;
-- `--timeout-ms 0` waits for completion, cancellation, or app-server exit;
-  positive values opt into a workflow deadline and per-agent silence budget,
-  and that budget is not divided by the retry budget.
-- `--permission ask|allow|deny` handles project/user/plugin/scriptPath reviews.
-- `--progress plain` switches to human-readable progress lines.
-- background file locations are controlled by `workflow.background` in
-  `settings.json`.
+## Planning Heuristics
 
-## Runtime Boundaries
+Default to phase-wise parallel execution. Useful patterns include:
 
-- Use Codex app-server over stdio as the production backend.
-- Keep direct provider credentials out of Codex child process environments.
-- Codex subagents run against the requested workflow cwd and have bounded
-  read-only workspace tools for text file reads and directory listings.
-- Built-in `task` and `code-review` inject deterministic workspace context into
-  planner-selected phase-wise parallel subagents.
-- Keep workflow execution local and command-owned; settings default to OS
-  background execution so long runs can keep waiting while Codex does other
-  work.
-- Keep `journalPath`, `journal.jsonl`, and journal contents out of CLI output.
-- Treat `.ultracode-for-codex` workflow state as sensitive local data.
-- Keep `resumeFromRunId` runtime-internal unless cross-process resume
-  gets an explicit durable design.
-- Use `isolation: "worktree"` only inside a git repo with at least one commit;
-  isolated worktrees are intentionally preserved for review, including clean
-  worktrees.
+- classify-and-act: classify request type, risk, or repo area before choosing
+  the phase shape;
+- fan-out-and-synthesize: split independent lenses across parallel agents, then
+  merge evidence;
+- adversarial verification: assign at least one agent to challenge correctness,
+  security, assumptions, or test adequacy;
+- generate-and-filter: create candidate approaches or fixes, then select by
+  evidence and constraints;
+- tournament: compare competing alternatives when the best path is unclear;
+- loop-until-done: iterate repair and verification only when there is a clear
+  stop condition.
 
-## Packaging And Verification
+For code review, common parallel angles are runtime correctness,
+security/capability boundaries, API/CLI contracts, persistence/retry/cancel
+behavior, user-visible progress, package contents, and test coverage.
 
-For source checkout changes, run the narrowest relevant check first, then a
-release-level check before handoff:
+For implementation, split by disjoint write ownership where possible. Tell
+subagents they are not alone in the codebase and must not revert unrelated or
+parallel edits.
 
-```bash
-npm test
-npm run test:e2e:ultracode-for-codex
-npm run test:all
-```
+## Output Contract
 
-Build an installable artifact with:
+Keep progress visible but concise. Prefer stable visual summaries over prose-only
+status sentences. Use `references/progress-visuals.md` for the golden examples.
+The final answer should include:
 
-```bash
-npm run pack:ultracode-for-codex
-```
-
-Check the npm publish payload with:
-
-```bash
-npm run publish:dry-run
-```
-
-Publish after npm login with:
-
-```bash
-npm run publish:npm
-```
-
-When architecture, runtime boundaries, package exports, or release scope
-changes, update active docs such as `README.md`, `ULTRACODE_INSTALL.md`, and
-`IMPLEMENTATION_MAP.html`.
+- the completed result or findings;
+- evidence and verification performed;
+- a phase/agent summary;
+- residual risk or unverified items;
+- a critical re-check recommendation for the current session LLM when the result
+  will drive action.

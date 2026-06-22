@@ -117,6 +117,9 @@ function validateTarballEntries(entries) {
     'package/dist/runtime/workflow-journal.js',
     'package/skills/ultracode-for-codex/SKILL.md',
     'package/skills/ultracode-for-codex/agents/openai.yaml',
+    'package/skills/ultracode-for-codex/references/progress-visuals.md',
+    'package/skills/ultracode-for-codex-cli/SKILL.md',
+    'package/skills/ultracode-for-codex-cli/agents/openai.yaml',
     'package/docs/ultracode-p3a-journal-design.md',
     'package/docs/ultracode-p3b-resume-cache.md',
     'package/docs/ultracode-p3c-worktree-isolation.md',
@@ -176,7 +179,23 @@ async function validateExtractedPackage(packageDir) {
   if (packageJson.dependencies && Object.keys(packageJson.dependencies).length > 0) {
     throw new Error('Installable ultracode package must not declare runtime dependencies.');
   }
-  await validateCompanionSkill(join(packageDir, 'skills', 'ultracode-for-codex'));
+  await validateSkillCommand(join(packageDir, 'skills', 'ultracode-for-codex'), {
+    name: 'ultracode-for-codex',
+    requiredText: [
+      'Codex main context as the orchestrator',
+      'Use the CLI runtime only when the user explicitly asks',
+      'references/progress-visuals.md',
+      'Completion Impact Summary',
+    ],
+  });
+  await validateSkillCommand(join(packageDir, 'skills', 'ultracode-for-codex-cli'), {
+    name: 'ultracode-for-codex-cli',
+    requiredText: [
+      'npm package and CLI runtime surface',
+      'The default `$ultracode-for-codex` skill is Codex-native',
+      'npm run pack:ultracode-for-codex',
+    ],
+  });
 
   const forbidden = [
     /link:\.\.\//,
@@ -195,22 +214,27 @@ async function validateExtractedPackage(packageDir) {
   }
 }
 
-async function validateCompanionSkill(skillDir) {
+async function validateSkillCommand(skillDir, expected) {
   const skill = await readFile(join(skillDir, 'SKILL.md'), 'utf8');
   const metadata = /^---\n([\s\S]*?)\n---\n/.exec(skill)?.[1] ?? '';
-  if (!/^name:\s*ultracode-for-codex\s*$/m.test(metadata)) {
-    throw new Error('Companion skill must declare name: ultracode-for-codex.');
+  if (!new RegExp(`^name:\\s*${escapeRegExp(expected.name)}\\s*$`, 'm').test(metadata)) {
+    throw new Error(`Skill command must declare name: ${expected.name}.`);
   }
   const description = /^description:\s*(.+)$/m.exec(metadata)?.[1] ?? '';
   if (!description || /\bTODO\b/i.test(description)) {
-    throw new Error('Companion skill must declare a completed description.');
+    throw new Error(`Skill command ${expected.name} must declare a completed description.`);
   }
   if (/\bTODO\b/i.test(skill)) {
-    throw new Error('Companion skill must not contain TODO placeholders.');
+    throw new Error(`Skill command ${expected.name} must not contain TODO placeholders.`);
+  }
+  for (const required of expected.requiredText) {
+    if (!skill.includes(required)) {
+      throw new Error(`Skill command ${expected.name} is missing required guidance: ${required}`);
+    }
   }
   const openaiYaml = await readFile(join(skillDir, 'agents', 'openai.yaml'), 'utf8');
   for (const required of ['display_name:', 'short_description:', 'default_prompt:']) {
-    if (!openaiYaml.includes(required)) throw new Error(`Companion skill metadata missing ${required}`);
+    if (!openaiYaml.includes(required)) throw new Error(`Skill command ${expected.name} metadata missing ${required}`);
   }
 }
 

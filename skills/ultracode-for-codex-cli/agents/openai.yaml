@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ultracode for Codex CLI"
+  short_description: "Operate the Ultracode for Codex npm CLI runtime."
+  default_prompt: "Use the Ultracode for Codex CLI runtime for explicit package, background job, validation, and release work."

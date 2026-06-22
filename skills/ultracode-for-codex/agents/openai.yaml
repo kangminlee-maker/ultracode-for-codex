@@ -1,4 +1,4 @@
 interface:
   display_name: "Ultracode for Codex"
-  short_description: "Operate the Ultracode for Codex npm runtime safely."
-  default_prompt: "Use the Ultracode for Codex npm package as the runtime and follow its local CLI boundaries."
+  short_description: "Run Codex-native phase-wise parallel orchestration."
+  default_prompt: "Use the Codex main context as the Ultracode orchestrator, plan adaptive phases, spawn focused parallel subagents, synthesize results, and keep progress visible."

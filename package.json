@@ -1,7 +1,7 @@
 {
   "name": "ultracode-for-codex",
-  "version": "0.3.0",
-  "description": "Run local Codex-backed workflows from a command-owned CLI runtime.",
+  "version": "0.3.1",
+  "description": "Run Codex-native Ultracode orchestration with an optional local CLI runtime.",
   "keywords": [
     "codex",
     "workflow",
@@ -41,6 +41,7 @@
     "dist/codex/",
     "dist/runtime/",
     "skills/ultracode-for-codex/",
+    "skills/ultracode-for-codex-cli/",
     "settings.json",
     "README.md",
     "docs/provenance-audit.md",

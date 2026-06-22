@@ -155,21 +155,21 @@
 <body>
   <main>
     <h1>Ultracode for Codex Implementation Map</h1>
-    <p>Current state of the local CLI runtime and npm package release path.</p>
+    <p>Current state of the Codex-native skill command, explicit CLI runtime, and npm package release path.</p>
 
     <section class="grid" aria-label="Current status">
-      <div class="tile"><strong>Current goal</strong><span>Run and inspect workflows as an npm-installed CLI package</span></div>
+      <div class="tile"><strong>Current goal</strong><span>Expose native Codex orchestration as the default skill command</span></div>
       <div class="tile"><strong>Runtime health</strong><span>Latest npm release installed and test suite green</span></div>
-      <div class="tile"><strong>Main risk</strong><span>Cross-process resume remains intentionally out of scope</span></div>
-      <div class="tile"><strong>Next decision</strong><span>Keep resume same-session unless durable recovery becomes necessary</span></div>
+      <div class="tile"><strong>Main risk</strong><span>Skill routing must keep native and CLI authority distinct</span></div>
+      <div class="tile"><strong>Next decision</strong><span>Keep CLI runtime as explicit validation and backup execution path</span></div>
     </section>
 
     <h2>Service Blueprint</h2>
-    <p>Judgment question: where does authority live during local workflow execution?</p>
+    <p>Judgment question: which surface owns orchestration for the requested workflow?</p>
     <div class="svg-wrap">
       <svg role="img" aria-labelledby="bp-title bp-desc" width="940" height="620" viewBox="0 0 940 620">
-        <title id="bp-title">CLI workflow blueprint</title>
-        <desc id="bp-desc">Shows settings and user input flowing through CLI gates, background launch or attached execution, Codex subagents, journal artifacts, projections, and verification.</desc>
+        <title id="bp-title">Ultracode skill and CLI blueprint</title>
+        <desc id="bp-desc">Shows native skill requests and explicit CLI runtime requests flowing through route selection, main-context orchestration, CLI runtime execution, artifacts, projections, and verification.</desc>
         <defs>
           <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
             <path d="M0,0 L0,6 L9,3 z" fill="#475569"></path>
@@ -180,41 +180,41 @@
         </defs>
 
         <text class="lane-title" x="40" y="42">Inputs</text>
-        <text class="lane-title" x="260" y="42">Runtime/tools</text>
-        <text class="lane-title" x="520" y="42">Codex semantic work</text>
+        <text class="lane-title" x="260" y="42">Route and runtime</text>
+        <text class="lane-title" x="520" y="42">Codex orchestration</text>
         <text class="lane-title" x="760" y="42">Artifacts and projection</text>
 
         <rect x="40" y="64" width="180" height="116" rx="8" fill="var(--input)" stroke="var(--input-stroke)"></rect>
-        <text class="node-title" x="58" y="92">CLI command</text>
-        <text class="node-line" x="58" y="116">run/status/jobs</text>
-        <text class="node-line" x="58" y="136">settings.json</text>
-        <text class="node-line" x="58" y="156">script/name/args</text>
+        <text class="node-title" x="58" y="92">Skill commands</text>
+        <text class="node-line" x="58" y="116">$ultracode-for-codex</text>
+        <text class="node-line" x="58" y="136">$ultracode-for-codex-cli</text>
+        <text class="node-line" x="58" y="156">task intent</text>
 
         <rect x="40" y="230" width="180" height="116" rx="8" fill="var(--input)" stroke="var(--input-stroke)"></rect>
-        <text class="node-title" x="58" y="258">Workflow source</text>
-        <text class="node-line" x="58" y="282">inline or file</text>
-        <text class="node-line" x="58" y="302">named registry</text>
-        <text class="node-line" x="58" y="322">runtime scriptPath</text>
+        <text class="node-title" x="58" y="258">CLI command</text>
+        <text class="node-line" x="58" y="282">run/status/jobs</text>
+        <text class="node-line" x="58" y="302">script/name/args</text>
+        <text class="node-line" x="58" y="322">settings.json</text>
 
         <rect x="260" y="64" width="210" height="116" rx="8" fill="var(--gate)" stroke="var(--gate-stroke)"></rect>
-        <text class="node-title" x="278" y="92">CLI gates</text>
-        <text class="node-line" x="278" y="116">guide accepted</text>
-        <text class="node-line" x="278" y="136">source selector valid</text>
-        <text class="node-line" x="278" y="156">permission review</text>
+        <text class="node-title" x="278" y="92">Route selection</text>
+        <text class="node-line" x="278" y="116">native by default</text>
+        <text class="node-line" x="278" y="136">CLI when explicit</text>
+        <text class="node-line" x="278" y="156">package gates</text>
 
         <rect x="260" y="230" width="210" height="136" rx="8" fill="var(--runtime)" stroke="var(--runtime-stroke)"></rect>
-        <text class="node-title" x="278" y="258">Workflow runtime</text>
+        <text class="node-title" x="278" y="258">CLI runtime</text>
         <text class="node-line" x="278" y="282">parse pure meta</text>
         <text class="node-line" x="278" y="302">validate VM script</text>
         <text class="node-line" x="278" y="322">schedule agents</text>
         <text class="node-line" x="278" y="342">retry/cancel authority</text>
 
         <rect x="520" y="230" width="190" height="116" rx="8" fill="#fef3c7" stroke="#d97706"></rect>
-        <text class="node-title" x="538" y="258">Codex subagents</text>
-        <text class="node-line" x="538" y="282">semantic prompts</text>
-        <text class="node-line" x="538" y="302">raw result text</text>
-        <text class="node-line" x="538" y="322">structured output</text>
-        <text class="node-line" x="538" y="342">workspace reads</text>
+        <text class="node-title" x="538" y="258">Main orchestrator</text>
+        <text class="node-line" x="538" y="282">phase planning</text>
+        <text class="node-line" x="538" y="302">parallel subagents</text>
+        <text class="node-line" x="538" y="322">phase synthesis</text>
+        <text class="node-line" x="538" y="342">chat progress</text>
 
         <rect x="760" y="64" width="160" height="116" rx="8" fill="var(--artifact)" stroke="var(--artifact-stroke)"></rect>
         <text class="node-title" x="778" y="92">Journal</text>
@@ -223,10 +223,10 @@
         <text class="node-line" x="778" y="156">canonical</text>
 
         <rect x="760" y="230" width="160" height="116" rx="8" fill="var(--view)" stroke="var(--view-stroke)"></rect>
-        <text class="node-title" x="778" y="258">CLI projection</text>
+        <text class="node-title" x="778" y="258">Projection</text>
         <text class="node-line" x="778" y="282">background files</text>
-        <text class="node-line" x="778" y="302">status/logs/result</text>
-        <text class="node-line" x="778" y="322">summary/recheck</text>
+        <text class="node-line" x="778" y="302">chat summaries</text>
+        <text class="node-line" x="778" y="322">critical recheck</text>
 
         <rect x="760" y="396" width="160" height="116" rx="8" fill="var(--quality)" stroke="var(--quality-stroke)"></rect>
         <text class="node-title" x="778" y="424">Verification</text>
@@ -248,12 +248,14 @@
     <h2>Current Architecture</h2>
     <table>
       <tr><th>Area</th><th>Current contract</th></tr>
+      <tr><td>Native skill</td><td><code>skills/ultracode-for-codex/SKILL.md</code> is the default user-facing command. The Codex main context owns adaptive phase planning, direct subagent spawning, visual progress snapshots from <code>references/progress-visuals.md</code>, phase synthesis, final synthesis, phase/agent summary, and final critical re-check recommendation.</td></tr>
+      <tr><td>CLI skill</td><td><code>skills/ultracode-for-codex-cli/SKILL.md</code> owns explicit CLI runtime operations: background jobs, attached runs, packaging, release checks, runtime-boundary validation, installed E2E, and local runtime artifacts.</td></tr>
       <tr><td>CLI</td><td><code>src/cli.ts</code> exposes <code>run</code>, background <code>status</code>/<code>wait</code>/<code>logs</code>/<code>result</code>/<code>cancel</code>/<code>jobs</code>/<code>archive</code>, help, install guide, and package-version reporting. <code>settings.json</code> defaults to OS background execution so long Codex-launched runs can continue while Codex performs other work; <code>--execution attached</code> keeps progress on stderr JSONL and result on stdout JSON when blocking is desired. Completed runs add a phase/agent angle summary and a critical re-check recommendation for the current session LLM.</td></tr>
       <tr><td>Settings</td><td><code>settings.json</code> owns workflow execution mode, progress mode, permission default, retry limit, opt-in timeout, background file names, and Codex model controls. The packaged timeout default is <code>0</code>, so workflows wait for completion, cancellation, or app-server exit.</td></tr>
       <tr><td>Runtime</td><td><code>src/runtime/workflow-runtime.ts</code> owns parsing, validation, phase-wise parallel scheduling, permission, retry, cancel, and progress events. Built-in <code>task</code> and <code>code-review</code> use planner-selected dynamic workflow patterns, run parallel focused subagents by default, emit planning snapshots, emit phase-level plans immediately before each phase, repeat current agent roles on each phase-start event, and include completion counts plus elapsed time on agent completion. Runtime-owned workflow state and isolated worktrees are preserved for review.</td></tr>
       <tr><td>Journal</td><td><code>src/runtime/workflow-journal.ts</code> owns durable hash-chained workflow truth.</td></tr>
       <tr><td>Subagent backend</td><td><code>src/codex/subagent-backend.ts</code> talks to Codex app-server over stdio, strips direct provider credentials, runs turns in the requested workflow cwd, and serves bounded read-only workspace tools.</td></tr>
-      <tr><td>Package</td><td>Package contents are the CLI runtime, install guide, companion skill, docs, and public type exports. CLI <code>--version</code> and Codex <code>clientInfo.version</code> read package metadata, so packaging and npm version bumps update both surfaces together.</td></tr>
+      <tr><td>Package</td><td>Package contents are the CLI runtime, install guide, both Codex skill command folders, docs, and public type exports. CLI <code>--version</code> and Codex <code>clientInfo.version</code> read package metadata, so packaging and npm version bumps update runtime surfaces together.</td></tr>
     </table>
 
     <h2>Verification</h2>
@@ -261,7 +263,7 @@
       <tr><th>Check</th><th>Status</th></tr>
       <tr><td><code>npm test</code></td><td>Build, runtime boundary verification, unit and integration tests.</td></tr>
       <tr><td><code>npm run test:e2e:ultracode-for-codex</code></td><td>Packaged CLI E2E with fake Codex app-server boundary.</td></tr>
-      <tr><td><code>npm run pack:ultracode-for-codex</code></td><td>Tarball contents, companion skill, exports, and install checks.</td></tr>
+      <tr><td><code>npm run pack:ultracode-for-codex</code></td><td>Tarball contents, both skill command folders, exports, and install checks.</td></tr>
       <tr><td><code>npm run publish:dry-run</code></td><td>npm registry publish payload and lifecycle checks before release.</td></tr>
       <tr><td><code>ULTRACODE_LIVE_SMOKE=1 npm run smoke:live</code></td><td>Opt-in local Codex CLI smoke outside CI.</td></tr>
     </table>
