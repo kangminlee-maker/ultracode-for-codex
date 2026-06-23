@@ -134,6 +134,12 @@ npm exec -- ultracode-for-codex run \
   --args '{"prompt":"review the current change"}'
 ```
 
+The built-in `code-review` workflow collects bounded repository evidence,
+chooses review lenses, runs finder agents in parallel, verifies each candidate,
+and returns JSON with `findings`, `provenance`, `synthesis`, and `stats`.
+Use `{"level":"high"}` to skip the final sweep, or omit it for the default
+`xhigh` review.
+
 CLI runs use OS background execution by default. The command prints a launch
 record with a `jobId`, then you can inspect or control the job:
 

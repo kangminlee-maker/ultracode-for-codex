@@ -99,13 +99,19 @@ npm exec -- ultracode-for-codex archive <jobId> --cwd /path/to/project
 ```
 
 Use CLI built-in `task` for general work and `code-review` for review-specific
-work. Both start with an LLM planner, execute phase by phase, run multiple
-focused Codex subagents in parallel within each phase by default, and synthesize
-phase and final results. The planner chooses a single-agent path only when
-parallel execution would add risk or waste.
-Planner guidance includes classify-and-act, fan-out-and-synthesize,
-adversarial verification, generate-and-filter, tournament, and loop-until-done
-patterns so different work types can use different phase shapes.
+work. `task` starts with an LLM planner, executes phase by phase, runs multiple
+focused Codex subagents in parallel within each phase by default, and chooses a
+single-agent path only when parallel execution would add risk or waste. Planner
+guidance includes classify-and-act, fan-out-and-synthesize, adversarial
+verification, generate-and-filter, tournament, and loop-until-done patterns so
+different work types can use different phase shapes.
+
+`code-review` uses a specialized review harness. It collects bounded repository
+evidence, selects active review lenses, runs one finder per lens in parallel,
+verifies every emitted candidate with a candidate-scoped subagent, optionally
+runs an `xhigh` sweep, then synthesizes final findings by verified candidate
+index. The final JSON includes `findings`, `provenance`, `synthesis`, and
+`stats`.
 
 Settings defaults:
 
@@ -145,7 +151,9 @@ Useful controls:
 - JSONL records include `kind`, `version`, `event`, `status`, and `summary`;
   agent records also include stable agent identity and label fields.
 - Built-in `task` and `code-review` emit `workflow.plan.ready` as a planning
-  snapshot, not a promise that every later phase is already known.
+  snapshot, not a promise that every later phase is already known. In
+  `code-review`, later verifier agents are discovered after finder agents emit
+  candidates.
 - `workflow.phase.planned` is emitted immediately before each phase starts and
   carries that phase's current planned agent role labels. Each
   `workflow.phase.started` record repeats the same role labels when the phase
@@ -180,9 +188,10 @@ Useful controls:
 - Strip direct provider credentials from child CLI environments.
 - Run Codex subagents against the requested workflow cwd and provide bounded
   read-only workspace tools for text file reads and directory listings.
-- Built-in `task` and `code-review` add deterministic workspace context to
-  planner-selected phase-wise parallel subagents, then synthesize each phase and
-  the final result.
+- Built-in `task` adds deterministic workspace context to planner-selected
+  phase-wise parallel subagents. Built-in `code-review` uses deterministic
+  review evidence, allowed evidence refs, dynamic lenses, candidate verification,
+  and bounded final synthesis.
 - Install consumers from a packaged artifact.
 - Keep `journalPath`, `journal.jsonl`, and journal contents out of CLI output.
   Local runtime state may still contain runtime-owned

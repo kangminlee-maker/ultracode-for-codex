@@ -17,6 +17,7 @@ export interface WorkflowAgentSemanticOpts {
   readonly effort?: string;
   readonly isolation?: string;
   readonly agentType?: string;
+  readonly logicalKey?: string;
 }
 
 export type WorkflowJournalEntry =
@@ -356,6 +357,9 @@ export function computeWorkflowAgentCallKey(input: {
   if (!HASH_RE.test(input.previousAgentCallKey)) {
     throw new WorkflowJournalValidationError('previousAgentCallKey must be a 64-character sha256 hex digest.');
   }
+  if (input.semanticOpts.logicalKey) {
+    return sha256(`logical\0${input.semanticOpts.logicalKey}\0${input.prompt}\0${stableJson(input.semanticOpts)}`);
+  }
   return sha256(`${input.previousAgentCallKey}\0${input.prompt}\0${stableJson(input.semanticOpts)}`);
 }
 
@@ -581,9 +585,9 @@ function assertUsage(value: unknown): void {
 function assertWorkflowAgentSemanticOpts(value: unknown): void {
   const opts = asRecord(value);
   if (!opts) throw new WorkflowJournalValidationError('semanticOpts must be an object.');
-  rejectUnknownKeys(opts, ['schema', 'model', 'effort', 'isolation', 'agentType'], 'semanticOpts');
+  rejectUnknownKeys(opts, ['schema', 'model', 'effort', 'isolation', 'agentType', 'logicalKey'], 'semanticOpts');
   if (typeof opts.model !== 'string' || !opts.model) throw new WorkflowJournalValidationError('semanticOpts.model must be a string.');
-  for (const key of ['effort', 'isolation', 'agentType']) {
+  for (const key of ['effort', 'isolation', 'agentType', 'logicalKey']) {
     if (opts[key] !== undefined && typeof opts[key] !== 'string') {
       throw new WorkflowJournalValidationError(`semanticOpts.${key} must be a string.`);
     }

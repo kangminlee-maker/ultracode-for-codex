@@ -70,6 +70,10 @@ CLI behavior:
   phase begins;
 - each `workflow.agent.completed` record includes phase progress, total known
   agent progress, and elapsed time;
+- built-in `task` uses the generic phase planner; built-in `code-review`
+  collects bounded review evidence, selects dynamic lenses, runs parallel finder
+  agents, verifies each emitted candidate, optionally runs an `xhigh` sweep, and
+  synthesizes final findings by verified candidate index;
 - after a completed run, `workflow.summary.ready` reports phase-level agent
   counts and angles, then `workflow.review.recommended` asks the current
   session LLM to critically re-check the final result before acting on it;
@@ -89,8 +93,10 @@ CLI behavior:
 - Keep direct provider credentials out of Codex child process environments.
 - Codex subagents run against the requested workflow cwd and have bounded
   read-only workspace tools for text file reads and directory listings.
-- Built-in `task` and `code-review` inject deterministic workspace context into
-  planner-selected phase-wise parallel subagents.
+- Built-in `task` injects deterministic workspace context into planner-selected
+  phase-wise parallel subagents. Built-in `code-review` uses deterministic
+  review evidence, allowed evidence refs, dynamic lenses, candidate verification,
+  and bounded final synthesis.
 - Keep workflow execution local and command-owned; settings default to OS
   background execution so long runs can keep waiting while Codex does other
   work.

@@ -26,6 +26,27 @@ test('workflow journal stableJson sorts object keys and rejects nondeterministic
   assert.throws(() => stableJson(cyclic), WorkflowJournalValidationError);
 });
 
+test('workflow journal logical agent keys are independent of prefix order', () => {
+  const semanticOpts = { model: 'fake-local-model', effort: 'xhigh', logicalKey: 'review/candidate-1' };
+  const first = computeWorkflowAgentCallKey({
+    previousAgentCallKey: WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+    prompt: 'Verify candidate one.',
+    semanticOpts,
+  });
+  const reordered = computeWorkflowAgentCallKey({
+    previousAgentCallKey: 'a'.repeat(64),
+    prompt: 'Verify candidate one.',
+    semanticOpts,
+  });
+  const changedPrompt = computeWorkflowAgentCallKey({
+    previousAgentCallKey: WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+    prompt: 'Verify candidate two.',
+    semanticOpts,
+  });
+  assert.equal(reordered, first);
+  assert.notEqual(changedPrompt, first);
+});
+
 test('workflow journal writer appends durable hash-chained entries and reader validates them', async () => {
   const root = await mkdtemp(join(tmpdir(), 'workflow-journal-'));
   try {

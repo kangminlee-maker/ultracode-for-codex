@@ -1325,29 +1325,27 @@ function workflowPhaseExecutionSummary(events: readonly WorkflowEvent[]): readon
   }
   for (const event of events) {
     if (event.type !== 'workflow.agent.started' || !event.phase) continue;
+    const startedAgent = {
+      title: event.label,
+      label: event.label,
+      angle: event.promptPreview,
+    };
     const existing = phases.get(event.phase);
     if (!existing) {
       phases.set(event.phase, {
         title: event.phase,
         agentCount: 1,
-        agents: [{
-          title: event.label,
-          label: event.label,
-          angle: event.promptPreview,
-        }],
+        agents: [startedAgent],
       });
       continue;
     }
-    if (phaseTitlesWithPlannedAgents.has(event.phase)) continue;
+    if (
+      phaseTitlesWithPlannedAgents.has(event.phase)
+      && existing.agents.length > 0
+      && !phaseSummaryAllowsDynamicStartedAgents(existing)
+    ) continue;
     if (existing.agents.some((agent) => agent.label === event.label || agent.title === event.label)) continue;
-    const agents = [
-      ...existing.agents,
-      {
-        title: event.label,
-        label: event.label,
-        angle: event.promptPreview,
-      },
-    ];
+    const agents = [...existing.agents, startedAgent];
     phases.set(event.phase, {
       ...existing,
       agentCount: agents.length,
@@ -1355,6 +1353,15 @@ function workflowPhaseExecutionSummary(events: readonly WorkflowEvent[]): readon
     });
   }
   return [...phases.values()];
+}
+
+function phaseSummaryAllowsDynamicStartedAgents(phase: WorkflowPhaseExecutionSummary): boolean {
+  return phase.agents.some((agent) => {
+    const label = agent.label ?? '';
+    const title = agent.title ?? '';
+    const angle = agent.angle ?? '';
+    return /\bdynamic\b/i.test(`${label} ${title} ${angle}`);
+  });
 }
 
 function criticalReviewRecommendation(): string {

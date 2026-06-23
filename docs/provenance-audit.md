@@ -7,7 +7,7 @@ Date: 2026-06-22
 This audit checked:
 
 - tracked repository files;
-- generated npm package contents for `ultracode-for-codex@0.3.0`;
+- generated npm package contents for `ultracode-for-codex@0.3.3`;
 - the locally installed companion Codex skill.
 
 Generated build output and package tarballs were checked as projections of the
@@ -23,8 +23,8 @@ License transition completed:
 
 - Apache-2.0 `LICENSE` file is present;
 - `package.json` and `package-lock.json` declare `Apache-2.0`;
-- release-candidate package version is `0.3.0`;
-- npm latest before this release remains `0.2.6`.
+- audited package metadata version is `0.3.3`;
+- npm publish state is verified separately during release preparation.
 
 ## Evidence
 

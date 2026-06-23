@@ -16,6 +16,7 @@ import {
   isWorkflowJournalError,
   normalizeJournalJsonValue,
   readWorkflowJournal,
+  stableJson,
   workflowJournalPath,
 } from './workflow-journal.js';
 import type {
@@ -390,9 +391,12 @@ interface WorkflowScriptMetadata {
 interface WorkspaceContextOptions {
   readonly query?: string;
   readonly files: readonly string[];
+  readonly includeDiff: boolean;
+  readonly diffBaseRef?: string;
   readonly maxFiles: number;
   readonly maxFileBytes: number;
   readonly maxBytes: number;
+  readonly maxDiffBytes: number;
 }
 
 interface WorkflowPermissionRequestMutable {
@@ -428,6 +432,8 @@ interface WorkflowResumePlan {
 
 interface WorkflowResumeCache {
   readonly entries: readonly WorkflowResumeAgentCacheEntry[];
+  readonly byCallKey: Map<string, WorkflowResumeAgentCacheEntry>;
+  readonly usedCallKeys: Set<string>;
   nextIndex: number;
   prefixOpen: boolean;
 }
@@ -461,6 +467,7 @@ interface WorkflowAgentAttemptOutcome {
 
 interface AgentOptions {
   readonly label?: string;
+  readonly key?: string;
   readonly model?: string;
   readonly phase?: string;
   readonly schema?: unknown;
@@ -474,6 +481,7 @@ const DEFAULT_AGENT_STALL_RETRY_LIMIT = 5;
 const DEFAULT_WORKSPACE_CONTEXT_MAX_FILES = 24;
 const DEFAULT_WORKSPACE_CONTEXT_MAX_FILE_BYTES = 12_000;
 const DEFAULT_WORKSPACE_CONTEXT_MAX_BYTES = 80_000;
+const DEFAULT_WORKSPACE_CONTEXT_MAX_DIFF_BYTES = 60_000;
 const execFileAsync = promisify(execFile);
 const PROJECT_WORKFLOW_DIRS = ['.codex/workflows'];
 const WORKFLOW_PERMISSION_REQUIRED_SOURCES = new Set<WorkflowSource>(['script_path', 'project', 'user', 'plugin']);
@@ -583,15 +591,7 @@ const DEFAULT_BUILTIN_WORKFLOWS: readonly BuiltinWorkflow[] = [
   },
   {
     name: 'code-review',
-    script: phaseWiseBuiltinWorkflowScript({
-      name: 'code-review',
-      description: 'Run an LLM-planned phase-wise parallel code review workflow',
-      defaultPrompt: 'Review the current repository for correctness risks.',
-      plannerKind: 'code review',
-      plannerGuidance: 'Plan an effective code review. Default to phase_parallel with multiple focused reviewers per phase. Commonly useful lenses include runtime correctness, security/capability boundaries, API/CLI contracts, persistence/retry/cancel behavior, and test coverage. Prefer fan-out-and-synthesize plus adversarial verification unless the diff is tiny or one indivisible failure mode.',
-      agentGuidance: 'Return material findings only. Prioritize root cause, severity, exact file/line evidence, reproduction or impact, and residual risk.',
-      finalGuidance: 'Return findings ordered by severity with exact file/line references. Deduplicate overlaps, preserve dissent or uncertainty, and say clearly if there are no material findings.',
-    }),
+    script: codeReviewBuiltinWorkflowScript(),
   },
   {
     name: 'batch',
@@ -617,6 +617,741 @@ return await parallel(prompts.map((prompt, index) => () => agent(
 )));`,
   },
 ];
+
+function codeReviewBuiltinWorkflowScript(): string {
+  return `export const meta = {
+  name: "code-review",
+  description: "Run a dynamic evidence-bound code review workflow"
+};
+const workflowInput = args && typeof args === "object" ? args : {};
+const prompt = typeof workflowInput.prompt === "string" && workflowInput.prompt.trim()
+  ? workflowInput.prompt
+  : "Review the current repository for correctness risks.";
+const level = workflowInput.level === "high" ? "high" : "xhigh";
+const caps = level === "high"
+  ? { maxFinders: 8, maxCandidatesPerLens: 6, sweep: false, reportCap: 10 }
+  : { maxFinders: 10, maxCandidatesPerLens: 8, sweep: true, reportCap: 15 };
+const seedLenses = [
+  { id: "diff-correctness", title: "Diff correctness", kind: "correctness", focus: "Inspect touched hunks and enclosing behavior for runtime bugs." },
+  { id: "removed-behavior", title: "Removed behavior", kind: "correctness", focus: "Check deleted or replaced guards, validation, errors, and tests." },
+  { id: "cross-file-contract", title: "Cross-file contract", kind: "contract", focus: "Trace callers, callees, preconditions, and return shapes." },
+  { id: "language-platform", title: "Language/platform pitfalls", kind: "correctness", focus: "Look for language, framework, and environment-sensitive footguns." },
+  { id: "wrapper-delegation", title: "Wrapper/delegation correctness", kind: "contract", focus: "Check adapters, proxies, caches, decorators, and delegation paths." },
+  { id: "security-boundary", title: "Security/capability boundary", kind: "security", focus: "Check authority, permissions, credential handling, and local state exposure." },
+  { id: "persistence-retry-cancel", title: "Persistence/retry/cancel", kind: "persistence", focus: "Check journals, resume/cache, retries, cancellation, and terminal states." },
+  { id: "cli-user-contract", title: "CLI/user contract", kind: "contract", focus: "Check commands, settings, progress, package contents, and documented behavior." },
+  { id: "tests-package-coverage", title: "Tests/package coverage", kind: "coverage", focus: "Check whether tests and packaged artifacts cover changed behavior." },
+  { id: "maintainability", title: "Maintainability/conventions", kind: "maintainability", focus: "Check duplication, altitude, and repository instruction alignment." }
+];
+const scopeSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["files", "summary", "lensDecisions", "lenses"],
+  properties: {
+    files: { type: "array", items: { type: "string", minLength: 1, maxLength: 240 } },
+    summary: { type: "string", minLength: 1 },
+    instructions: { type: "string" },
+    lensDecisions: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["seedId", "action", "reasonCategory", "decisionRefs", "reason"],
+        properties: {
+          seedId: { type: "string", minLength: 1 },
+          action: { type: "string", enum: ["select", "skip"] },
+          selectedLensId: { type: "string" },
+          reasonCategory: { type: "string", enum: ["matched_change", "prompt_risk", "no_evidence", "cap_limit", "redundant", "out_of_scope", "tiny_change"] },
+          decisionRefs: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+          reason: { type: "string", minLength: 1 }
+        }
+      }
+    },
+    lenses: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id", "title", "focus", "kind"],
+        properties: {
+          id: { type: "string", minLength: 1, maxLength: 80 },
+          title: { type: "string", minLength: 1, maxLength: 120 },
+          focus: { type: "string", minLength: 1, maxLength: 1000 },
+          kind: { type: "string", enum: ["correctness", "security", "contract", "persistence", "coverage", "maintainability"] }
+        }
+      }
+    }
+  }
+};
+const finderSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["candidates"],
+  properties: {
+    candidates: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["file", "summary", "failureScenario", "evidenceRefs"],
+        properties: {
+          file: { type: "string", minLength: 1, maxLength: 240 },
+          line: { type: "integer", minimum: 1 },
+          summary: { type: "string", minLength: 1 },
+          failureScenario: { type: "string", minLength: 1 },
+          evidenceRefs: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+          kind: { type: "string" }
+        }
+      }
+    }
+  }
+};
+const verifierSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["verdict", "evidence", "evidenceRefs"],
+  properties: {
+    verdict: { type: "string", enum: ["CONFIRMED", "PLAUSIBLE", "REFUTED"] },
+    evidence: { type: "string", minLength: 1 },
+    evidenceRefs: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
+    severity: { type: "string", enum: ["P0", "P1", "P2", "P3"] }
+  }
+};
+const synthesisSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["summary", "decisions"],
+  properties: {
+    summary: { type: "string", minLength: 1 },
+    decisions: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["index", "action", "reasonCategory", "reason"],
+        properties: {
+          index: { type: "integer", minimum: 0 },
+          action: { type: "string", enum: ["report", "merge", "drop"] },
+          merge: { type: "array", minItems: 1, items: { type: "integer", minimum: 0 } },
+          severity: { type: "string", enum: ["P0", "P1", "P2", "P3"] },
+          reasonCategory: { type: "string", enum: ["material", "duplicate", "not_material", "report_cap", "unsupported_evidence", "superseded"] },
+          reason: { type: "string", minLength: 1 }
+        }
+      }
+    }
+  }
+};
+function fail(message) {
+  throw "code-review invalid: " + message;
+}
+function text(value) {
+  return value == null ? "" : "" + value;
+}
+function errorText(err) {
+  if (err && typeof err.message === "string") return err.message;
+  try {
+    const json = JSON.stringify(err);
+    if (json) return json;
+  } catch (_err) {}
+  return text(err);
+}
+function lines(value) {
+  return text(value).split(/\\r?\\n/);
+}
+function firstLineValue(context, prefix) {
+  const all = lines(context);
+  for (let index = 0; index < all.length; index += 1) {
+    if (all[index].indexOf(prefix) === 0) return all[index].slice(prefix.length).trim();
+  }
+  return "";
+}
+function sectionLines(context, title, endTitles) {
+  const all = lines(context);
+  let start = -1;
+  for (let index = 0; index < all.length; index += 1) {
+    if (all[index] === title) {
+      start = index + 1;
+      break;
+    }
+  }
+  if (start < 0) return [];
+  const out = [];
+  for (let index = start; index < all.length; index += 1) {
+    if (endTitles.indexOf(all[index]) >= 0) break;
+    const line = all[index].trim();
+    if (line && line !== "(none)") out.push(line);
+  }
+  return out;
+}
+function objectMap(values) {
+  const map = {};
+  for (let index = 0; index < values.length; index += 1) map[values[index]] = true;
+  return map;
+}
+function normalizeKey(value, fallback) {
+  const raw = text(value || fallback).trim().toLowerCase();
+  const replaced = raw.replace(/[^a-z0-9_.:/@+-]+/g, "-").replace(/^-+|-+$/g, "");
+  return replaced ? replaced.slice(0, 80) : fallback;
+}
+function uniquePush(list, item) {
+  if (list.indexOf(item) < 0) list.push(item);
+}
+function assertDecisionRefs(refs, label) {
+  if (!Array.isArray(refs) || refs.length < 1) fail(label + " must include evidence or decision refs.");
+  for (let index = 0; index < refs.length; index += 1) {
+    const ref = text(refs[index]);
+    if (!allowedEvidenceRefMap[ref] && !unavailableEvidenceRefMap[ref] && ref !== "prompt:request") {
+      fail(label + " includes unsupported decision ref " + ref);
+    }
+  }
+}
+function assertEvidenceRefs(refs, label) {
+  if (!Array.isArray(refs) || refs.length < 1) fail(label + " must include at least one evidence ref.");
+  for (let index = 0; index < refs.length; index += 1) {
+    const ref = text(refs[index]);
+    if (!allowedEvidenceRefMap[ref]) fail(label + " includes unsupported evidence ref " + ref);
+  }
+}
+function validateFile(file, label) {
+  const ref = "file:" + text(file);
+  if (!allowedFileRefMap[ref]) fail(label + " references unsupported file " + text(file));
+}
+function selectedDecisionMatches(decision, lens) {
+  if (decision.action !== "select") return false;
+  const selected = normalizeKey(decision.selectedLensId || decision.seedId, decision.seedId);
+  return selected === lens.lensKey || selected === normalizeKey(lens.id, lens.lensKey);
+}
+function validateScope(scope) {
+  for (let index = 0; index < scope.files.length; index += 1) validateFile(scope.files[index], "scope.files[" + index + "]");
+  for (let index = 0; index < scope.lensDecisions.length; index += 1) {
+    assertDecisionRefs(scope.lensDecisions[index].decisionRefs, "scope.lensDecisions[" + index + "]");
+  }
+  const selected = [];
+  const seen = {};
+  for (let index = 0; index < scope.lenses.length; index += 1) {
+    const rawLens = scope.lenses[index];
+    const lensKey = normalizeKey(rawLens.id, "lens-" + (index + 1));
+    if (seen[lensKey]) fail("duplicate selected lens " + lensKey);
+    const lens = {
+      id: text(rawLens.id),
+      lensKey: lensKey,
+      title: text(rawLens.title),
+      focus: text(rawLens.focus),
+      kind: text(rawLens.kind),
+      position: index
+    };
+    let matched = false;
+    for (let decisionIndex = 0; decisionIndex < scope.lensDecisions.length; decisionIndex += 1) {
+      if (selectedDecisionMatches(scope.lensDecisions[decisionIndex], lens)) matched = true;
+    }
+    if (!matched) fail("selected lens lacks matching select decision " + lensKey);
+    seen[lensKey] = true;
+    if (selected.length < caps.maxFinders) selected.push(lens);
+  }
+  return selected;
+}
+function validateCandidate(candidate, label) {
+  validateFile(candidate.file, label + ".file");
+  assertEvidenceRefs(candidate.evidenceRefs, label + ".evidenceRefs");
+  return {
+    file: text(candidate.file),
+    line: Number.isInteger(candidate.line) ? candidate.line : null,
+    summary: text(candidate.summary),
+    failureScenario: text(candidate.failureScenario),
+    evidenceRefs: candidate.evidenceRefs.map((item) => text(item)),
+    kind: text(candidate.kind || "unspecified")
+  };
+}
+function validateVerifier(verifier, label) {
+  assertEvidenceRefs(verifier.evidenceRefs, label + ".evidenceRefs");
+  return {
+    verdict: verifier.verdict,
+    evidence: text(verifier.evidence),
+    evidenceRefs: verifier.evidenceRefs.map((item) => text(item)),
+    severity: verifier.severity || "P2"
+  };
+}
+function finderLabel(lens) {
+  return "code-review-find-" + lens.lensKey;
+}
+function verifierLabel(envelope) {
+  return "code-review-verify-" + envelope.lensKey + "-c" + (envelope.candidateIndex + 1);
+}
+function verifierKey(envelope) {
+  return [
+    "code-review/verify",
+    envelope.lensKey,
+    "" + envelope.candidateIndex,
+    envelope.candidateDigest.slice(7, 23),
+    contextHash.slice(7, 23),
+    allowedEvidenceIndexDigest.slice(7, 23)
+  ].join("/");
+}
+function reviewLensStage(lens) {
+  return agent([
+    "Code-review Finder",
+    "Lens: " + lens.title,
+    "Lens key: " + lens.lensKey,
+    "Focus: " + lens.focus,
+    "",
+    "Return only concrete defect candidates with a failure scenario and evidence refs from the allowed index.",
+    "User request:",
+    prompt,
+    "",
+    "Scope:",
+    JSON.stringify(scopeBlock, null, 2),
+    "",
+    context
+  ].join("\\n"), {
+    label: finderLabel(lens),
+    phase: "Find",
+    schema: finderSchema,
+    key: "code-review/find/" + lens.lensKey + "/" + sourceSnapshotHashKey
+  }).then((finderOutput) => {
+    const rawCandidates = Array.isArray(finderOutput.candidates) ? finderOutput.candidates : [];
+    const capped = rawCandidates.slice(0, caps.maxCandidatesPerLens);
+    const envelopes = [];
+    for (let index = 0; index < capped.length; index += 1) {
+      const candidate = validateCandidate(capped[index], "candidate " + lens.lensKey + "/" + index);
+      const candidateDigest = hash({
+        sourceSnapshotId: sourceSnapshotId,
+        contextHash: contextHash,
+        allowedEvidenceIndexDigest: allowedEvidenceIndexDigest,
+        truncation: truncation,
+        scopeDigest: scopeDigest,
+        lensKey: lens.lensKey,
+        candidateIndex: index,
+        candidate: candidate
+      });
+      envelopes.push({
+        candidateId: "candidate_" + lens.lensKey + "_" + (index + 1),
+        candidateIndex: index,
+        candidateDigest: candidateDigest,
+        lensKey: lens.lensKey,
+        lensTitle: lens.title,
+        candidate: candidate
+      });
+    }
+    if (envelopes.length === 0) return [];
+    return parallel(envelopes.map((envelope) => () => agent([
+      "Code-review Verifier",
+      "Verify exactly one candidate. Confirm, refute, or mark plausible using only allowed evidence refs.",
+      "Candidate envelope:",
+      JSON.stringify(envelope, null, 2),
+      "",
+      "Review evidence:",
+      context
+    ].join("\\n"), {
+      label: verifierLabel(envelope),
+      phase: "Verify",
+      schema: verifierSchema,
+      key: verifierKey(envelope)
+    }))).then((verifierResults) => {
+      if (verifierResults.length !== envelopes.length) fail("verifier count mismatch for " + lens.lensKey);
+      const verified = [];
+      for (let index = 0; index < envelopes.length; index += 1) {
+        if (verifierResults[index] == null) fail("missing verifier result for " + envelopes[index].candidateId);
+        verified.push({
+          candidateId: envelopes[index].candidateId,
+          candidateIndex: envelopes[index].candidateIndex,
+          candidateDigest: envelopes[index].candidateDigest,
+          lensKey: envelopes[index].lensKey,
+          lensTitle: envelopes[index].lensTitle,
+          candidate: envelopes[index].candidate,
+          verifier: validateVerifier(verifierResults[index], "verifier " + envelopes[index].candidateId)
+        });
+      }
+      return verified;
+    });
+  }).catch((err) => ({
+    failed: true,
+    error: errorText(err)
+  }));
+}
+function runSweep(kept, refutedCount) {
+  return agent([
+    "Code-review Sweep Finder",
+    "Find only new material candidates missed by the lens pass.",
+    "Kept candidate count: " + kept.length,
+    "Refuted candidate count: " + refutedCount,
+    "Scope:",
+    JSON.stringify(scopeBlock, null, 2),
+    "",
+    context
+  ].join("\\n"), {
+    label: "code-review-sweep-finder",
+    phase: "Sweep",
+    schema: finderSchema,
+    key: "code-review/sweep/" + sourceSnapshotHashKey + "/" + scopeDigest.slice(7, 23)
+  }).then((sweepOutput) => {
+    const sweepLens = { id: "sweep", lensKey: "sweep", title: "Sweep", focus: "Final gap search", kind: "correctness", position: activeLenses.length };
+    const raw = Array.isArray(sweepOutput.candidates) ? sweepOutput.candidates : [];
+    if (raw.length === 0) return [];
+    return reviewSweepCandidates(sweepLens, raw.slice(0, 8));
+  });
+}
+function reviewSweepCandidates(lens, rawCandidates) {
+  const envelopes = [];
+  for (let index = 0; index < rawCandidates.length; index += 1) {
+    const candidate = validateCandidate(rawCandidates[index], "sweep candidate " + index);
+    const candidateDigest = hash({
+      sourceSnapshotId: sourceSnapshotId,
+      contextHash: contextHash,
+      allowedEvidenceIndexDigest: allowedEvidenceIndexDigest,
+      truncation: truncation,
+      scopeDigest: scopeDigest,
+      lensKey: "sweep",
+      candidateIndex: index,
+      candidate: candidate
+    });
+    envelopes.push({
+      candidateId: "candidate_sweep_" + (index + 1),
+      candidateIndex: index,
+      candidateDigest: candidateDigest,
+      lensKey: "sweep",
+      lensTitle: "Sweep",
+      candidate: candidate
+    });
+  }
+  return parallel(envelopes.map((envelope) => () => agent([
+    "Code-review Verifier",
+    "Verify exactly one sweep candidate.",
+    JSON.stringify(envelope, null, 2),
+    "",
+    context
+  ].join("\\n"), {
+    label: verifierLabel(envelope),
+    phase: "Verify",
+    schema: verifierSchema,
+    key: verifierKey(envelope)
+  }))).then((verifierResults) => {
+    if (verifierResults.length !== envelopes.length) fail("sweep verifier count mismatch");
+    const verified = [];
+    for (let index = 0; index < envelopes.length; index += 1) {
+      if (verifierResults[index] == null) fail("missing sweep verifier result");
+      verified.push({
+        candidateId: envelopes[index].candidateId,
+        candidateIndex: envelopes[index].candidateIndex,
+        candidateDigest: envelopes[index].candidateDigest,
+        lensKey: envelopes[index].lensKey,
+        lensTitle: envelopes[index].lensTitle,
+        candidate: envelopes[index].candidate,
+        verifier: validateVerifier(verifierResults[index], "sweep verifier " + index)
+      });
+    }
+    return verified;
+  });
+}
+function fallbackDecisions(items, reason) {
+  const decisions = [];
+  for (let index = 0; index < items.length; index += 1) {
+    decisions.push({
+      index: index,
+      action: index < caps.reportCap ? "report" : "drop",
+      severity: items[index].verifier.severity || "P2",
+      reasonCategory: index < caps.reportCap ? "material" : "report_cap",
+      reason: reason,
+      merge: []
+    });
+  }
+  return { mode: "script_fallback", summary: "Script fallback synthesis.", fallbackReason: reason, decisions: decisions };
+}
+function normalizeSynthesis(raw, items) {
+  try {
+    const decisions = Array.isArray(raw.decisions) ? raw.decisions : [];
+    const covered = {};
+    const normalized = [];
+    for (let index = 0; index < decisions.length; index += 1) {
+      const decision = decisions[index];
+      if (!Number.isInteger(decision.index) || decision.index < 0 || decision.index >= items.length) fail("synthesis index out of range");
+      if (covered[decision.index]) fail("duplicate synthesis coverage");
+      covered[decision.index] = true;
+      const merge = Array.isArray(decision.merge) ? decision.merge : [];
+      if (decision.action === "merge" && merge.length < 1) fail("merge decision requires merge indexes");
+      for (let mergeIndex = 0; mergeIndex < merge.length; mergeIndex += 1) {
+        if (!Number.isInteger(merge[mergeIndex]) || merge[mergeIndex] < 0 || merge[mergeIndex] >= items.length) {
+          fail("merge index out of range");
+        }
+        if (covered[merge[mergeIndex]]) fail("duplicate merge coverage");
+        covered[merge[mergeIndex]] = true;
+      }
+      normalized.push({
+        index: decision.index,
+        action: decision.action,
+        severity: decision.severity || items[decision.index].verifier.severity || "P2",
+        reasonCategory: decision.reasonCategory,
+        reason: text(decision.reason),
+        merge: merge
+      });
+    }
+    for (let index = 0; index < items.length; index += 1) {
+      if (!covered[index]) fail("missing synthesis coverage for index " + index);
+    }
+    return { mode: "agent", summary: text(raw.summary), fallbackReason: null, decisions: normalized };
+  } catch (err) {
+    return fallbackDecisions(items, text(err && err.message ? err.message : err));
+  }
+}
+function finalDecisionRows(synthesis, items) {
+  const rows = [];
+  for (let index = 0; index < synthesis.decisions.length; index += 1) {
+    const decision = synthesis.decisions[index];
+    const item = items[decision.index];
+    const mergeCandidates = [];
+    for (let mergeIndex = 0; mergeIndex < decision.merge.length; mergeIndex += 1) {
+      const merged = items[decision.merge[mergeIndex]];
+      mergeCandidates.push({ candidateId: merged.candidateId, candidateDigest: merged.candidateDigest });
+    }
+    rows.push({
+      candidateId: item.candidateId,
+      candidateDigest: item.candidateDigest,
+      action: decision.action,
+      reasonCategory: decision.reasonCategory,
+      reason: decision.reason,
+      mergeCandidates: mergeCandidates,
+      severity: decision.severity
+    });
+  }
+  return rows;
+}
+function droppedStats(decisions) {
+  const stats = { duplicate: 0, notMaterial: 0, reportCap: 0, unsupportedEvidence: 0, superseded: 0 };
+  for (let index = 0; index < decisions.length; index += 1) {
+    const row = decisions[index];
+    if (row.action !== "drop" && row.action !== "merge") continue;
+    if (row.reasonCategory === "duplicate") stats.duplicate += 1;
+    else if (row.reasonCategory === "not_material") stats.notMaterial += 1;
+    else if (row.reasonCategory === "report_cap") stats.reportCap += 1;
+    else if (row.reasonCategory === "unsupported_evidence") stats.unsupportedEvidence += 1;
+    else if (row.reasonCategory === "superseded") stats.superseded += 1;
+  }
+  return stats;
+}
+announcePlan({
+  mode: "phase_parallel",
+  rationale: "Collect bounded repository evidence, choose review lenses, verify every candidate, then synthesize by index.",
+  phases: [{
+    id: "scope",
+    title: "Scope",
+    goal: "Choose active review lenses from runtime-owned evidence.",
+    agents: [{ id: "scope", title: "Scope", label: "code-review-scope", focus: "Select lenses and evidence-bound review scope." }]
+  }]
+});
+phase("Evidence");
+const context = await workspaceContext({
+  query: prompt,
+  includeDiff: true,
+  diffBaseRef: workflowInput.diffBaseRef
+});
+const allowedEvidenceRefs = sectionLines(context, "### Allowed Evidence Refs", ["### Unavailable Evidence", "### Git Status"]);
+const unavailableEvidenceRefs = sectionLines(context, "### Unavailable Evidence", ["### Git Status"]);
+const allowedEvidenceRefMap = objectMap(allowedEvidenceRefs);
+const unavailableEvidenceRefMap = objectMap(unavailableEvidenceRefs);
+const allowedFileRefs = [];
+for (let index = 0; index < allowedEvidenceRefs.length; index += 1) {
+  if (allowedEvidenceRefs[index].indexOf("file:") === 0) uniquePush(allowedFileRefs, allowedEvidenceRefs[index]);
+}
+const allowedFileRefMap = objectMap(allowedFileRefs);
+const sourceSnapshotId = firstLineValue(context, "Source Snapshot: ") || firstLineValue(context, "sourceSnapshotId: ") || hash(context);
+const contextHash = firstLineValue(context, "Context Hash: ") || firstLineValue(context, "contextHash: ") || hash({ context: context });
+const allowedEvidenceIndexDigest = firstLineValue(context, "allowedEvidenceIndexDigest: ") || hash(allowedEvidenceRefs);
+const diffBaseRef = firstLineValue(context, "diffBaseRef: ");
+const truncation = firstLineValue(context, "truncation: ") || "{}";
+const sourceSnapshotHashKey = hash({ sourceSnapshotId: sourceSnapshotId, contextHash: contextHash, allowedEvidenceIndexDigest: allowedEvidenceIndexDigest }).slice(7, 39);
+announcePhasePlan({
+  id: "scope",
+  title: "Scope",
+  goal: "Select active review lenses from the bounded evidence context.",
+  agents: [{ id: "scope", title: "Scope", label: "code-review-scope", focus: "Return files, lens decisions, and active lenses." }]
+});
+phase("Scope");
+const scope = await agent([
+  "Code-review Scope",
+  "Select active lenses from the seed list and the runtime-owned evidence context.",
+  "Use decisionRefs only from allowed evidence refs, unavailable evidence refs, or prompt:request.",
+  "Level: " + level,
+  "Max active lenses: " + caps.maxFinders,
+  "",
+  "Seed lenses:",
+  JSON.stringify(seedLenses, null, 2),
+  "",
+  "User request:",
+  prompt,
+  "",
+  context
+].join("\\n"), {
+  label: "code-review-scope",
+  phase: "Scope",
+  schema: scopeSchema,
+  key: "code-review/scope/" + sourceSnapshotHashKey
+});
+const activeLenses = validateScope(scope);
+const scopeBlock = {
+  files: scope.files,
+  summary: scope.summary,
+  instructions: scope.instructions || "",
+  lenses: activeLenses,
+  lensDecisions: scope.lensDecisions
+};
+const scopeDigest = hash({ sourceSnapshotId: sourceSnapshotId, contextHash: contextHash, scope: scopeBlock });
+if (activeLenses.length === 0) {
+  return {
+    level: level,
+    provenance: {
+      sourceSnapshotId: sourceSnapshotId,
+      contextHash: contextHash,
+      allowedEvidenceIndexDigest: allowedEvidenceIndexDigest,
+      diffBaseRef: diffBaseRef || null,
+      truncation: { raw: truncation }
+    },
+    summary: scope.summary,
+    findings: [],
+    synthesis: { mode: "script_fallback", fallbackReason: "no active lenses", decisions: [] },
+    stats: { finders: 0, candidates: 0, verifierAttempts: 0, verified: 0, refuted: 0, invalid: 0, reported: 0, dropped: droppedStats([]) }
+  };
+}
+announcePhasePlan({
+  id: "find",
+  title: "Find",
+  goal: "Run one finder per active review lens.",
+  agents: activeLenses.map((lens) => ({
+    id: lens.lensKey,
+    title: lens.title,
+    label: finderLabel(lens),
+    focus: lens.focus
+  }))
+});
+announcePhasePlan({
+  id: "verify",
+  title: "Verify",
+  goal: "Verify candidates as soon as each finder emits them.",
+  agents: [{ id: "dynamic-candidates", title: "Dynamic candidate verifiers", label: "code-review-verify-dynamic", focus: "One verifier runs for each emitted candidate." }]
+});
+phase("Find");
+phase("Verify");
+const lensResults = await pipeline(activeLenses, reviewLensStage);
+const verifiedCandidates = [];
+for (let lensIndex = 0; lensIndex < lensResults.length; lensIndex += 1) {
+  if (lensResults[lensIndex] && lensResults[lensIndex].failed) fail(lensResults[lensIndex].error);
+  if (lensResults[lensIndex] == null) fail("lens review failed for " + activeLenses[lensIndex].lensKey);
+  for (let candidateIndex = 0; candidateIndex < lensResults[lensIndex].length; candidateIndex += 1) {
+    verifiedCandidates.push(lensResults[lensIndex][candidateIndex]);
+  }
+}
+const nonRefuted = [];
+let refuted = 0;
+for (let index = 0; index < verifiedCandidates.length; index += 1) {
+  if (verifiedCandidates[index].verifier.verdict === "REFUTED") refuted += 1;
+  else nonRefuted.push(verifiedCandidates[index]);
+}
+let sweepResults = [];
+if (caps.sweep) {
+  announcePhasePlan({
+    id: "sweep",
+    title: "Sweep",
+    goal: "Search for missed candidates after initial verification.",
+    agents: [{ id: "sweep", title: "Sweep Finder", label: "code-review-sweep-finder", focus: "Find only new material missed candidates." }]
+  });
+  phase("Sweep");
+  sweepResults = await runSweep(nonRefuted, refuted);
+  for (let index = 0; index < sweepResults.length; index += 1) {
+    verifiedCandidates.push(sweepResults[index]);
+    if (sweepResults[index].verifier.verdict === "REFUTED") refuted += 1;
+    else nonRefuted.push(sweepResults[index]);
+  }
+}
+let synthesis = { mode: "script_fallback", summary: "No confirmed or plausible candidates.", fallbackReason: "no reportable candidates", decisions: [] };
+if (nonRefuted.length > 0) {
+  announcePhasePlan({
+    id: "synthesize",
+    title: "Synthesize",
+    goal: "Select final findings by verified candidate index.",
+    agents: [{ id: "synthesis", title: "Synthesis", label: "code-review-synthesis", focus: "Report, merge, or drop every verified non-refuted candidate." }]
+  });
+  phase("Synthesize");
+  const rawSynthesis = await agent([
+    "Code-review Synthesis",
+    "Select final findings by index only. Do not invent files, refs, or candidate ids.",
+    "Every candidate index must be reported, merged, dropped, or covered as a merge target.",
+    "Report cap: " + caps.reportCap,
+    "",
+    "Verified candidates:",
+    JSON.stringify(nonRefuted.map((item, index) => ({
+      index: index,
+      candidateId: item.candidateId,
+      candidateDigest: item.candidateDigest,
+      lensKey: item.lensKey,
+      file: item.candidate.file,
+      line: item.candidate.line,
+      summary: item.candidate.summary,
+      failureScenario: item.candidate.failureScenario,
+      verdict: item.verifier.verdict,
+      severity: item.verifier.severity,
+      evidenceRefs: item.verifier.evidenceRefs
+    })), null, 2)
+  ].join("\\n"), {
+    label: "code-review-synthesis",
+    phase: "Synthesize",
+    schema: synthesisSchema,
+    key: "code-review/synthesis/" + sourceSnapshotHashKey + "/" + scopeDigest.slice(7, 23) + "/" + hash(nonRefuted).slice(7, 23)
+  });
+  synthesis = normalizeSynthesis(rawSynthesis, nonRefuted);
+}
+const decisionRows = finalDecisionRows(synthesis, nonRefuted);
+const findings = [];
+for (let index = 0; index < synthesis.decisions.length; index += 1) {
+  const decision = synthesis.decisions[index];
+  if (decision.action !== "report") continue;
+  const item = nonRefuted[decision.index];
+  const row = decisionRows[index];
+  findings.push({
+    candidateId: item.candidateId,
+    candidateDigest: item.candidateDigest,
+    severity: decision.severity || item.verifier.severity || "P2",
+    file: item.candidate.file,
+    line: item.candidate.line,
+    summary: item.candidate.summary,
+    failureScenario: item.candidate.failureScenario,
+    verdict: item.verifier.verdict,
+    evidence: item.verifier.evidence,
+    evidenceRefs: item.verifier.evidenceRefs,
+    lens: { key: item.lensKey, title: item.lensTitle },
+    synthesisDecision: {
+      action: decision.action,
+      reasonCategory: decision.reasonCategory,
+      reason: decision.reason,
+      mergeCandidates: row.mergeCandidates
+    }
+  });
+}
+return {
+  level: level,
+  provenance: {
+    sourceSnapshotId: sourceSnapshotId,
+    contextHash: contextHash,
+    allowedEvidenceIndexDigest: allowedEvidenceIndexDigest,
+    diffBaseRef: diffBaseRef || null,
+    truncation: { raw: truncation }
+  },
+  summary: synthesis.summary,
+  findings: findings,
+  synthesis: {
+    mode: synthesis.mode,
+    fallbackReason: synthesis.fallbackReason,
+    decisions: decisionRows
+  },
+  stats: {
+    finders: activeLenses.length + (caps.sweep ? 1 : 0),
+    candidates: verifiedCandidates.length,
+    verifierAttempts: verifiedCandidates.length,
+    verified: verifiedCandidates.length,
+    refuted: refuted,
+    invalid: 0,
+    reported: findings.length,
+    dropped: droppedStats(decisionRows)
+  }
+};`;
+}
 
 function phaseWiseBuiltinWorkflowScript(input: {
   readonly name: string;
@@ -1002,6 +1737,8 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     }
     return {
       entries: cacheEntries,
+      byCallKey: new Map(cacheEntries.map((entry) => [entry.agentCallKey, entry])),
+      usedCallKeys: new Set(),
       nextIndex: 0,
       prefixOpen: true,
     };
@@ -1625,6 +2362,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     host.pipeline = hardenCallable((items: unknown, ...stages: unknown[]): HandledWorkflowPromise<unknown[]> => {
       return this.trackWorkflowPromise(ctx, this.pipeline(ctx, items, stages));
     });
+    host.hash = hardenCallable((value: unknown): string => workflowValueHash(value));
     host.workspaceContext = hardenCallable((options?: unknown): HandledWorkflowPromise<string> => {
       return this.trackWorkflowPromise(ctx, this.workspaceContext(ctx, options));
     });
@@ -1704,6 +2442,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     }
     const schema = normalizeStructuredOutputSchema(options?.schema);
     const isolation = normalizeAgentIsolation(options?.isolation);
+    const logicalKey = normalizeAgentLogicalKey(options?.key);
     if (isolation && !workflowIsolationReviewAllowsMode(ctx.isolationReview, isolation)) {
       throw workflowInputError(`agent ${isolation} isolation was not covered by the current workflow permission review.`);
     }
@@ -1715,6 +2454,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       effort: 'xhigh',
       schema,
       isolation,
+      logicalKey,
     });
     const previousAgentCallKey = ctx.previousAgentCallKey;
     const agentCallKey = computeWorkflowAgentCallKey({
@@ -2354,18 +3094,36 @@ function normalizeAgentIsolation(value: unknown): AgentIsolation | undefined {
   throw workflowInputError('agent isolation must be "worktree" when provided.');
 }
 
+function normalizeAgentLogicalKey(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string') throw workflowInputError('agent key must be a non-empty string when provided.');
+  const key = value.trim();
+  if (!key) throw workflowInputError('agent key must be a non-empty string when provided.');
+  if (key.length > 160) throw workflowInputError('agent key must be at most 160 characters.');
+  if (!/^[A-Za-z0-9_.:/@+-]+$/.test(key)) {
+    throw workflowInputError('agent key may only contain letters, numbers, "_", "-", ".", ":", "/", "@", and "+".');
+  }
+  return key;
+}
+
 function takeResumeCacheHit(
   cache: WorkflowResumeCache | undefined,
   agentCallKey: string,
 ): WorkflowResumeAgentCacheEntry | null {
-  if (!cache || !cache.prefixOpen) return null;
-  const entry = cache.entries[cache.nextIndex];
-  if (!entry || entry.agentCallKey !== agentCallKey) {
+  if (!cache) return null;
+  if (cache.prefixOpen) {
+    const entry = cache.entries[cache.nextIndex];
+    if (entry?.agentCallKey === agentCallKey && !cache.usedCallKeys.has(agentCallKey)) {
+      cache.usedCallKeys.add(agentCallKey);
+      cache.nextIndex += 1;
+      return entry;
+    }
     cache.prefixOpen = false;
-    return null;
   }
-  cache.nextIndex += 1;
-  return entry;
+  const keyed = cache.byCallKey.get(agentCallKey);
+  if (!keyed || cache.usedCallKeys.has(agentCallKey)) return null;
+  cache.usedCallKeys.add(agentCallKey);
+  return keyed;
 }
 
 async function gitOutput(cwd: string, args: readonly string[]): Promise<string> {
@@ -2386,7 +3144,10 @@ async function gitOutput(cwd: string, args: readonly string[]): Promise<string> 
 
 async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptions): Promise<string> {
   const root = await workspaceContextRoot(cwd);
-  const gitStatus = await gitOutput(root, ['status', '--short']).catch(() => '');
+  const gitStatus = await gitOutput(root, ['status', '--short', '--untracked-files=all']).catch(() => '');
+  const reviewEvidence = options.includeDiff
+    ? await buildReviewEvidenceContext(root, gitStatus, options)
+    : undefined;
   const explicitPaths = [
     ...options.files,
     ...extractMentionedWorkspacePaths(options.query ?? ''),
@@ -2417,6 +3178,19 @@ async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptio
   return [
     '## Workspace Context',
     `Root: ${root}`,
+    ...(reviewEvidence ? [
+      `Source Snapshot: ${reviewEvidence.sourceSnapshotId}`,
+      `Context Hash: ${reviewEvidence.contextHash}`,
+      '',
+      '### Review Evidence',
+      reviewEvidence.text,
+      '',
+      '### Allowed Evidence Refs',
+      reviewEvidence.allowedEvidenceRefs.length ? reviewEvidence.allowedEvidenceRefs.join('\n') : '(none)',
+      '',
+      '### Unavailable Evidence',
+      reviewEvidence.unavailableEvidence.length ? reviewEvidence.unavailableEvidence.join('\n') : '(none)',
+    ] : []),
     '',
     '### Git Status',
     gitStatus.trim() ? gitStatus : '(clean or unavailable)',
@@ -2426,18 +3200,177 @@ async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptio
   ].join('\n');
 }
 
+interface ReviewEvidenceContext {
+  readonly sourceSnapshotId: string;
+  readonly contextHash: string;
+  readonly allowedEvidenceRefs: readonly string[];
+  readonly unavailableEvidence: readonly string[];
+  readonly text: string;
+}
+
+interface BoundedGitText {
+  readonly text: string;
+  readonly truncated: boolean;
+}
+
+async function buildReviewEvidenceContext(
+  root: string,
+  gitStatus: string,
+  options: WorkspaceContextOptions,
+): Promise<ReviewEvidenceContext> {
+  const unavailableEvidence: string[] = [];
+  const changedPaths = pathsFromGitStatus(gitStatus);
+  const head = await gitOutput(root, ['rev-parse', '--verify', 'HEAD']).catch((err) => {
+    unavailableEvidence.push(`unavailable:git-head:${workflowErrorMessage(err)}`);
+    return 'unavailable';
+  });
+  const unstaged = await boundedGitOutput(root, [
+    'diff',
+    '--no-ext-diff',
+    '--patch',
+    '--find-renames',
+    '--',
+  ], options.maxDiffBytes).catch((err) => {
+    unavailableEvidence.push(`unavailable:diff-unstaged:${workflowErrorMessage(err)}`);
+    return { text: '', truncated: false };
+  });
+  const staged = await boundedGitOutput(root, [
+    'diff',
+    '--cached',
+    '--no-ext-diff',
+    '--patch',
+    '--find-renames',
+    '--',
+  ], options.maxDiffBytes).catch((err) => {
+    unavailableEvidence.push(`unavailable:diff-staged:${workflowErrorMessage(err)}`);
+    return { text: '', truncated: false };
+  });
+  let committed: BoundedGitText = { text: '', truncated: false };
+  let acceptedDiffBaseRef = '';
+  if (options.diffBaseRef) {
+    const baseCommit = await gitOutput(root, ['rev-parse', '--verify', `${options.diffBaseRef}^{commit}`]).catch((err) => {
+      unavailableEvidence.push(`unavailable:diff-base:${options.diffBaseRef}:${workflowErrorMessage(err)}`);
+      return '';
+    });
+    if (baseCommit) {
+      acceptedDiffBaseRef = options.diffBaseRef;
+      committed = await boundedGitOutput(root, [
+        'diff',
+        '--no-ext-diff',
+        '--patch',
+        '--find-renames',
+        `${baseCommit}..HEAD`,
+        '--',
+      ], options.maxDiffBytes).catch((err) => {
+        unavailableEvidence.push(`unavailable:diff-committed:${options.diffBaseRef}:${workflowErrorMessage(err)}`);
+        return { text: '', truncated: false };
+      });
+    }
+  }
+  const diffEvidence = [
+    { kind: 'unstaged', value: unstaged },
+    { kind: 'staged', value: staged },
+    { kind: 'committed', value: committed },
+  ] as const;
+  const allowedEvidenceRefs = uniqueStrings([
+    ...changedPaths.map((path) => `file:${path}`),
+    ...diffEvidence.flatMap((entry) => diffEvidenceRefs(entry.kind, entry.value.text)),
+  ]);
+  const allowedEvidenceIndexDigest = fullHash(allowedEvidenceRefs.join('\n'));
+  const sourceSnapshotId = `git:${head}:${fullHash([
+    gitStatus,
+    unstaged.text,
+    staged.text,
+    committed.text,
+  ].join('\n\0\n'))}`;
+  const truncation = {
+    unstaged: unstaged.truncated,
+    staged: staged.truncated,
+    committed: committed.truncated,
+  };
+  const contextHash = fullHash(JSON.stringify({
+    root,
+    sourceSnapshotId,
+    gitStatus,
+    acceptedDiffBaseRef,
+    truncation,
+    allowedEvidenceRefs,
+  }));
+  const sections = [
+    `sourceSnapshotId: ${sourceSnapshotId}`,
+    `contextHash: ${contextHash}`,
+    `allowedEvidenceIndexDigest: ${allowedEvidenceIndexDigest}`,
+    `diffBaseRef: ${acceptedDiffBaseRef || '(none)'}`,
+    `truncation: ${JSON.stringify(truncation)}`,
+    '',
+    '#### Changed Files',
+    changedPaths.length ? changedPaths.join('\n') : '(none)',
+    '',
+    '#### Unstaged Diff',
+    unstaged.text || '(none)',
+    '',
+    '#### Staged Diff',
+    staged.text || '(none)',
+    '',
+    '#### Committed Diff',
+    committed.text || (options.diffBaseRef ? '(none)' : '(not requested)'),
+  ];
+  return {
+    sourceSnapshotId,
+    contextHash,
+    allowedEvidenceRefs,
+    unavailableEvidence,
+    text: sections.join('\n'),
+  };
+}
+
+async function boundedGitOutput(root: string, args: readonly string[], maxBytes: number): Promise<BoundedGitText> {
+  const text = await gitOutput(root, args);
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return { text, truncated: false };
+  return {
+    text: Buffer.from(text, 'utf8').subarray(0, maxBytes).toString('utf8'),
+    truncated: true,
+  };
+}
+
+function diffEvidenceRefs(kind: string, diff: string): readonly string[] {
+  const refs: string[] = [];
+  let currentPath = '';
+  let hunkIndex = 0;
+  for (const line of diff.split(/\r?\n/)) {
+    const header = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+    if (header) {
+      currentPath = header[2] ?? header[1] ?? '';
+      hunkIndex = 0;
+      if (currentPath && currentPath !== '/dev/null') refs.push(`diff:${kind}:${currentPath}`);
+      continue;
+    }
+    if (currentPath && line.startsWith('@@')) {
+      hunkIndex += 1;
+      refs.push(`hunk:${kind}:${currentPath}:${hunkIndex}`);
+    }
+  }
+  return refs;
+}
+
 function normalizeWorkspaceContextOptions(value: unknown): WorkspaceContextOptions {
   const options = asRecord(value) ?? {};
   const query = typeof options.query === 'string' ? options.query : undefined;
   const files = Array.isArray(options.files)
     ? options.files.filter((item): item is string => typeof item === 'string' && item.trim() !== '')
     : [];
+  const diffBaseRef = typeof options.diffBaseRef === 'string' && options.diffBaseRef.trim()
+    ? options.diffBaseRef.trim()
+    : undefined;
   return {
     ...(query ? { query } : {}),
     files,
+    includeDiff: options.includeDiff === true,
+    ...(diffBaseRef ? { diffBaseRef } : {}),
     maxFiles: boundedPositiveInteger(options.maxFiles, DEFAULT_WORKSPACE_CONTEXT_MAX_FILES, 1, 100),
     maxFileBytes: boundedPositiveInteger(options.maxFileBytes, DEFAULT_WORKSPACE_CONTEXT_MAX_FILE_BYTES, 1_000, 50_000),
     maxBytes: boundedPositiveInteger(options.maxBytes, DEFAULT_WORKSPACE_CONTEXT_MAX_BYTES, 10_000, 200_000),
+    maxDiffBytes: boundedPositiveInteger(options.maxDiffBytes, DEFAULT_WORKSPACE_CONTEXT_MAX_DIFF_BYTES, 1_000, 200_000),
   };
 }
 
@@ -2643,6 +3576,18 @@ function agentCompletionProgress(
 
 function shortHash(value: string): string {
   return createHash('sha256').update(value).digest('hex').slice(0, 12);
+}
+
+function fullHash(value: string): string {
+  return `sha256:${createHash('sha256').update(value).digest('hex')}`;
+}
+
+function workflowValueHash(value: unknown): string {
+  try {
+    return fullHash(stableJson(value));
+  } catch (err) {
+    throw workflowInputError(workflowErrorMessage(err, 'workflow hash value must be JSON-serializable.'));
+  }
 }
 
 function workflowScriptHash(script: string): string {
@@ -3682,6 +4627,7 @@ function installWorkflowVmGlobals(
     '  define(globalThis, "agent", { value: (...values) => __host.agent(...values), writable: false, configurable: false });',
     '  define(globalThis, "parallel", { value: (...values) => __host.parallel(...values), writable: false, configurable: false });',
     '  define(globalThis, "pipeline", { value: (...values) => __host.pipeline(...values), writable: false, configurable: false });',
+    '  define(globalThis, "hash", { value: (...values) => __host.hash(...values), writable: false, configurable: false });',
     '  define(globalThis, "workspaceContext", { value: (...values) => __host.workspaceContext(...values), writable: false, configurable: false });',
     '  define(globalThis, "announcePlan", { value: (...values) => __host.announcePlan(...values), writable: false, configurable: false });',
     '  define(globalThis, "announcePhasePlan", { value: (...values) => __host.announcePhasePlan(...values), writable: false, configurable: false });',
@@ -4438,12 +5384,14 @@ function workflowAgentSemanticOpts(input: {
   readonly effort: string;
   readonly schema?: Record<string, unknown>;
   readonly isolation?: AgentIsolation;
+  readonly logicalKey?: string;
 }): WorkflowAgentSemanticOpts {
   return {
     ...(input.schema ? { schema: journalJsonValueOrInputError(input.schema, 'agent schema') } : {}),
     model: input.model,
     effort: input.effort,
     ...(input.isolation ? { isolation: input.isolation } : {}),
+    ...(input.logicalKey ? { logicalKey: input.logicalKey } : {}),
   };
 }
 

@@ -103,10 +103,11 @@ test('workflow runtime rejects invalid launch inputs before side effects', async
   }
 });
 
-test('built-in code-review plans phase-wise parallel agents and injects deterministic workspace context', async () => {
+test('built-in code-review runs dynamic lens finders, candidate verifiers, sweep, and synthesis', async () => {
   const backend = new FakeSubagentBackend();
   const { runtime, root } = await createRuntime({ backend });
   try {
+    await initializeGitRepo(root);
     await mkdir(join(root, 'docs'), { recursive: true });
     await writeFile(join(root, 'docs', 'client-package-plan.md'), [
       '# Client Package Plan',
@@ -121,63 +122,123 @@ test('built-in code-review plans phase-wise parallel agents and injects determin
     });
     const events = await collectEvents(runtime, launch.taskId);
     const snapshot = runtime.get(launch.taskId);
-    assert.equal(snapshot.status, 'completed');
-    assert.equal(backend.requests.length, 8);
+    assert.equal(snapshot.status, 'completed', snapshot.error || JSON.stringify(snapshot.events));
+    assert.equal(backend.requests.length, 7);
     assert.ok(backend.maxActiveRequests >= 2);
+    assert.equal(snapshot.result.level, 'xhigh');
+    assert.equal(snapshot.result.findings.length, 1);
+    assert.equal(snapshot.result.findings[0].severity, 'P1');
+    assert.equal(snapshot.result.stats.finders, 3);
+    assert.equal(snapshot.result.stats.candidates, 2);
+    assert.equal(snapshot.result.stats.verifierAttempts, 2);
+    assert.equal(snapshot.result.stats.reported, 1);
+    assert.match(snapshot.result.provenance.sourceSnapshotId, /^git:[0-9a-f]{40}:sha256:[0-9a-f]{64}$/);
     const planEvent = events.find((event) => event.type === 'workflow.plan.ready');
     assert.equal(planEvent.mode, 'phase_parallel');
     assert.equal(planEvent.phases.length, 1);
-    assert.deepEqual(planEvent.phases.map((phase) => phase.title), ['Discovery']);
-    assert.deepEqual(planEvent.phases[0].agents.map((agent) => agent.label), [
-      'code-review-discovery-runtime',
-      'code-review-discovery-security',
-    ]);
+    assert.deepEqual(planEvent.phases.map((phase) => phase.title), ['Scope']);
+    assert.deepEqual(planEvent.phases[0].agents.map((agent) => agent.label), ['code-review-scope']);
     assert.ok(
       events.findIndex((event) => event.type === 'workflow.plan.ready')
         < events.findIndex((event) => event.type === 'workflow.phase.planned'),
     );
     assert.ok(
-      events.findIndex((event) => event.type === 'workflow.phase.planned')
-        < events.findIndex((event) => event.type === 'workflow.phase.started'),
+      events.findIndex((event) => event.type === 'workflow.phase.planned' && event.title === 'Scope')
+        < events.findIndex((event) => event.type === 'workflow.phase.started' && event.title === 'Scope'),
     );
     const labels = events
       .filter((event) => event.type === 'workflow.agent.started')
       .map((event) => event.label);
     assert.deepEqual(labels, [
-      'code-review-planner',
-      'code-review-discovery-runtime',
-      'code-review-discovery-security',
-      'code-review-phase-discovery-synthesis',
-      'code-review-validation-contracts',
-      'code-review-validation-tests',
-      'code-review-phase-validation-synthesis',
-      'code-review-final-synthesis',
+      'code-review-scope',
+      'code-review-find-runtime-contract',
+      'code-review-find-security-boundary',
+      'code-review-verify-runtime-contract-c1',
+      'code-review-verify-runtime-contract-c2',
+      'code-review-sweep-finder',
+      'code-review-synthesis',
     ]);
     const phaseTitles = events
       .filter((event) => event.type === 'workflow.phase.started')
       .map((event) => event.title);
-    assert.deepEqual(phaseTitles, ['Discovery', 'Validation']);
+    assert.deepEqual(phaseTitles, ['Evidence', 'Scope', 'Find', 'Verify', 'Sweep', 'Synthesize']);
     const phasePlans = events
       .filter((event) => event.type === 'workflow.phase.planned')
       .map((event) => event.title);
-    assert.deepEqual(phasePlans, ['Discovery', 'Validation']);
-    const discoveryPhase = events.find((event) => event.type === 'workflow.phase.started' && event.title === 'Discovery');
-    assert.equal(discoveryPhase.plannedAgentCount, 2);
-    assert.deepEqual(discoveryPhase.plannedAgents.map((agent) => agent.label), [
-      'code-review-discovery-runtime',
-      'code-review-discovery-security',
+    assert.deepEqual(phasePlans, ['Scope', 'Find', 'Verify', 'Sweep', 'Synthesize']);
+    const findPlan = events.find((event) => event.type === 'workflow.phase.planned' && event.title === 'Find');
+    assert.deepEqual(findPlan.plannedAgents.map((agent) => agent.label), [
+      'code-review-find-runtime-contract',
+      'code-review-find-security-boundary',
     ]);
-    const validationPlan = events.find((event) => event.type === 'workflow.phase.planned' && event.title === 'Validation');
-    assert.deepEqual(validationPlan.plannedAgents.map((agent) => agent.label), [
-      'code-review-validation-contracts',
-      'code-review-validation-tests',
-    ]);
-    const reviewerPrompt = backend.requests
+    assert.ok(
+      events.findIndex((event) => event.type === 'workflow.agent.started' && event.label === 'code-review-verify-runtime-contract-c1')
+        < events.findIndex((event) => event.type === 'workflow.agent.completed' && event.label === 'code-review-find-security-boundary'),
+      'expected verifier for an early finder to start before the slower finder completed',
+    );
+    const scopePrompt = backend.requests
       .map((request) => request.messages[0].content)
-      .find((content) => /Parallel phase agent: Runtime/.test(content));
-    assert.match(reviewerPrompt, /## Workspace Context/);
-    assert.match(reviewerPrompt, /--- docs\/client-package-plan\.md/);
-    assert.match(reviewerPrompt, /platform token/);
+      .find((content) => /Code-review Scope/.test(content));
+    assert.match(scopePrompt, /### Review Evidence/);
+    assert.match(scopePrompt, /file:docs\/client-package-plan\.md/);
+    assert.match(scopePrompt, /platform token/);
+    const journal = await readWorkflowJournal(workflowJournalPath(snapshot.transcriptDir));
+    const verifierKeys = journal.entries
+      .filter((entry) => entry.kind === 'workflow.agent.started' && entry.semanticOpts.logicalKey?.startsWith('code-review/verify/'))
+      .map((entry) => entry.semanticOpts.logicalKey);
+    assert.equal(verifierKeys.length, 2);
+    assert.equal(new Set(verifierKeys).size, 2);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('built-in code-review high level skips sweep', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'docs'), { recursive: true });
+    await writeFile(join(root, 'docs', 'client-package-plan.md'), 'The platform token owns authority.\n');
+
+    const launch = await runtime.launch({
+      name: 'code-review',
+      args: {
+        prompt: 'Review docs/client-package-plan.md for runtime contract risks.',
+        level: 'high',
+      },
+    });
+    const events = await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed', snapshot.error || JSON.stringify(snapshot.events));
+    assert.equal(snapshot.result.level, 'high');
+    assert.equal(snapshot.result.stats.finders, 2);
+    assert.equal(events.some((event) => event.type === 'workflow.agent.started' && event.label === 'code-review-sweep-finder'), false);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('built-in code-review fails closed on unsupported finder evidence refs', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'docs'), { recursive: true });
+    await writeFile(join(root, 'docs', 'client-package-plan.md'), 'The platform token owns authority.\n');
+
+    const launch = await runtime.launch({
+      name: 'code-review',
+      args: { prompt: 'INVALID_EVIDENCE_REF Review docs/client-package-plan.md.' },
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.match(snapshot.error, /unsupported evidence ref/);
+    assert.equal(
+      snapshot.events.some((event) => event.type === 'workflow.agent.started' && /code-review-verify-/.test(event.label)),
+      false,
+    );
   } finally {
     await runtime.close();
   }
@@ -245,6 +306,125 @@ return { discovery, results };`,
       events.findIndex((event) => event.type === 'workflow.agent.completed' && event.label === 'dynamic-scan')
         < events.findIndex((event) => event.type === 'workflow.phase.planned' && event.title === 'Verify'),
     );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow pipeline preserves item boundaries without stage barriers', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend() });
+  try {
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "pipeline-contract" };
+const events = [];
+const result = await pipeline([1, 2],
+  (item) => {
+    if (item === 1) {
+      return new Promise((resolve) => setTimeout(() => {
+        events.push("stage1:" + item);
+        resolve([item, "wrapped"]);
+      }, 50));
+    }
+    events.push("stage1:" + item);
+    return [item, "wrapped"];
+  },
+  (value) => {
+    events.push("stage2:" + value[0]);
+    return value;
+  }
+);
+return { result, events };`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    assert.deepEqual(jsonValue(snapshot.result.result), [
+      [1, 'wrapped'],
+      [2, 'wrapped'],
+    ]);
+    assert.ok(
+      snapshot.result.events.indexOf('stage2:2') < snapshot.result.events.indexOf('stage1:1'),
+      `expected item 2 to pass stage 2 before item 1 leaves stage 1: ${snapshot.result.events.join(', ')}`,
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workspaceContext includeDiff returns deterministic review evidence refs', async () => {
+  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend() });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src', 'demo.ts'), [
+      'export function value() {',
+      '  return 1;',
+      '}',
+      '',
+    ].join('\n'));
+    await gitLines(root, ['add', 'src/demo.ts']);
+    await gitLines(root, ['commit', '-m', 'add demo']);
+    await writeFile(join(root, 'src', 'demo.ts'), [
+      'export function value() {',
+      '  return 2;',
+      '}',
+      '',
+    ].join('\n'));
+
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "review-evidence-context" };
+return await workspaceContext({
+  query: "src/demo.ts",
+  files: ["src/demo.ts"],
+  includeDiff: true,
+  diffBaseRef: "HEAD~1"
+});`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    assert.match(snapshot.result, /### Review Evidence/);
+    assert.match(snapshot.result, /sourceSnapshotId: git:[0-9a-f]{40}:sha256:[0-9a-f]{64}/);
+    assert.match(snapshot.result, /contextHash: sha256:[0-9a-f]{64}/);
+    assert.match(snapshot.result, /allowedEvidenceIndexDigest: sha256:[0-9a-f]{64}/);
+    assert.match(snapshot.result, /diffBaseRef: HEAD~1/);
+    assert.match(snapshot.result, /diff:unstaged:src\/demo\.ts/);
+    assert.match(snapshot.result, /hunk:unstaged:src\/demo\.ts:1/);
+    assert.match(snapshot.result, /-  return 1;/);
+    assert.match(snapshot.result, /### Allowed Evidence Refs/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow runtime resumes logical-keyed agents after dynamic reorder', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const script = `export const meta = { name: "logical-key-resume" };
+const order = Array.isArray(args.order) ? args.order : ["a", "b"];
+return await parallel(order.map((id) => () => agent("logical:" + id, {
+  label: "logical-" + id,
+  key: "logical/" + id
+})));`;
+    const first = await runtime.launch({
+      script,
+      args: { order: ['a', 'b'] },
+    });
+    await collectEvents(runtime, first.taskId);
+    assert.deepEqual(jsonValue(runtime.get(first.taskId).result), ['RAW:logical:a', 'RAW:logical:b']);
+    assert.equal(backend.requests.length, 2);
+
+    const resumed = await runtime.launch({
+      resumeFromRunId: first.runId,
+      args: { order: ['b', 'a'] },
+    });
+    const resumedEvents = await collectEvents(runtime, resumed.taskId);
+    const completions = resumedEvents.filter((event) => event.type === 'workflow.agent.completed');
+    assert.deepEqual(jsonValue(runtime.get(resumed.taskId).result), ['RAW:logical:b', 'RAW:logical:a']);
+    assert.equal(completions.length, 2);
+    assert.equal(completions.every((event) => event.cached === true), true);
+    assert.equal(backend.requests.length, 2);
   } finally {
     await runtime.close();
   }
@@ -546,6 +726,19 @@ class FakeSubagentBackend {
           }],
         });
       }
+      if (isReviewScopeSchema(schema)) {
+        return structuredToolResult(fakeReviewScope());
+      }
+      if (isReviewFinderSchema(schema)) {
+        if (/Code-review Finder[\s\S]*Lens key: security-boundary/.test(workflowPrompt)) await sleep(80);
+        return structuredToolResult(fakeReviewFinder(workflowPrompt));
+      }
+      if (isReviewVerifierSchema(schema)) {
+        return structuredToolResult(fakeReviewVerifier(workflowPrompt));
+      }
+      if (isReviewSynthesisSchema(schema)) {
+        return structuredToolResult(fakeReviewSynthesis());
+      }
       return subagentResult({
         text: '',
         toolCalls: [{
@@ -564,6 +757,22 @@ class FakeSubagentBackend {
 
 function isPhasePlanSchema(schema) {
   return Boolean(schema?.properties?.phases);
+}
+
+function isReviewScopeSchema(schema) {
+  return Boolean(schema?.properties?.lensDecisions && schema?.properties?.lenses && schema?.properties?.files);
+}
+
+function isReviewFinderSchema(schema) {
+  return Boolean(schema?.properties?.candidates);
+}
+
+function isReviewVerifierSchema(schema) {
+  return Boolean(schema?.properties?.verdict && schema?.properties?.evidenceRefs);
+}
+
+function isReviewSynthesisSchema(schema) {
+  return Boolean(schema?.properties?.decisions && schema?.properties?.summary);
 }
 
 function fakePhasePlan(prompt) {
@@ -607,6 +816,129 @@ function fakePhasePlan(prompt) {
       },
     ],
   };
+}
+
+function fakeReviewScope() {
+  return {
+    files: ['docs/client-package-plan.md'],
+    summary: 'Review the client package plan and authority binding claims.',
+    instructions: 'Prioritize material runtime contract and boundary risks.',
+    lensDecisions: [
+      {
+        seedId: 'cross-file-contract',
+        action: 'select',
+        selectedLensId: 'runtime-contract',
+        reasonCategory: 'matched_change',
+        decisionRefs: ['file:docs/client-package-plan.md'],
+        reason: 'The plan changes runtime and package contract behavior.',
+      },
+      {
+        seedId: 'security-boundary',
+        action: 'select',
+        selectedLensId: 'security-boundary',
+        reasonCategory: 'prompt_risk',
+        decisionRefs: ['file:docs/client-package-plan.md'],
+        reason: 'Authority binding requires boundary review.',
+      },
+    ],
+    lenses: [
+      {
+        id: 'runtime-contract',
+        title: 'Runtime Contract',
+        focus: 'Check whether the client package runtime contract can fail materially.',
+        kind: 'contract',
+      },
+      {
+        id: 'security-boundary',
+        title: 'Security Boundary',
+        focus: 'Check whether platform token authority can leak or be misbound.',
+        kind: 'security',
+      },
+    ],
+  };
+}
+
+function fakeReviewFinder(prompt) {
+  if (/Code-review Sweep Finder/.test(prompt) || /Lens key: security-boundary/.test(prompt)) {
+    return { candidates: [] };
+  }
+  if (/INVALID_EVIDENCE_REF/.test(prompt)) {
+    return {
+      candidates: [{
+        file: 'docs/client-package-plan.md',
+        line: 1,
+        summary: 'This candidate intentionally references unsupported evidence.',
+        failureScenario: 'The workflow should fail before verification.',
+        evidenceRefs: ['file:outside.md'],
+        kind: 'contract',
+      }],
+    };
+  }
+  return {
+    candidates: [
+      {
+        file: 'docs/client-package-plan.md',
+        line: 3,
+        summary: 'Package plan may under-specify authority binding.',
+        failureScenario: 'A client could treat a token-like artifact as authority without verifying the platform binding.',
+        evidenceRefs: ['file:docs/client-package-plan.md'],
+        kind: 'contract',
+      },
+      {
+        file: 'docs/client-package-plan.md',
+        line: 3,
+        summary: 'The runtime contract may omit a deterministic validation gate.',
+        failureScenario: 'A release could pass docs review while missing a local schema gate.',
+        evidenceRefs: ['file:docs/client-package-plan.md'],
+        kind: 'coverage',
+      },
+    ],
+  };
+}
+
+function fakeReviewVerifier(prompt) {
+  const second = /candidate_runtime-contract_2|candidate_sweep_2/.test(prompt);
+  return {
+    verdict: 'CONFIRMED',
+    evidence: second
+      ? 'The candidate is real but lower materiality than the authority binding issue.'
+      : 'The plan text discusses platform token authority but does not show a validation gate.',
+    evidenceRefs: ['file:docs/client-package-plan.md'],
+    severity: second ? 'P2' : 'P1',
+  };
+}
+
+function fakeReviewSynthesis() {
+  return {
+    summary: 'One material runtime contract issue should be reported; the lower-risk coverage point is dropped.',
+    decisions: [
+      {
+        index: 0,
+        action: 'report',
+        severity: 'P1',
+        reasonCategory: 'material',
+        reason: 'Authority binding is a material runtime contract risk.',
+      },
+      {
+        index: 1,
+        action: 'drop',
+        severity: 'P2',
+        reasonCategory: 'not_material',
+        reason: 'The validation gate point is useful follow-up but not material enough for the final report.',
+      },
+    ],
+  };
+}
+
+function structuredToolResult(value) {
+  return subagentResult({
+    text: '',
+    toolCalls: [{
+      id: 'call_structured',
+      name: 'StructuredOutput',
+      arguments: JSON.stringify(value),
+    }],
+  });
 }
 
 function subagentResult({ text, toolCalls = [], usage }) {
@@ -705,4 +1037,8 @@ async function fileExists(path) {
   } catch {
     return false;
   }
+}
+
+function jsonValue(value) {
+  return JSON.parse(JSON.stringify(value));
 }

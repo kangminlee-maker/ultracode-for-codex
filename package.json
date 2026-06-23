@@ -1,6 +1,6 @@
 {
   "name": "ultracode-for-codex",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Run Codex-native Ultracode orchestration with an optional local CLI runtime.",
   "keywords": [
     "codex",

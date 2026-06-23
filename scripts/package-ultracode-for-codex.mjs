@@ -120,6 +120,7 @@ function validateTarballEntries(entries) {
     'package/skills/ultracode-for-codex/references/progress-visuals.md',
     'package/skills/ultracode-for-codex-cli/SKILL.md',
     'package/skills/ultracode-for-codex-cli/agents/openai.yaml',
+    'package/docs/provenance-audit.md',
     'package/docs/ultracode-p3a-journal-design.md',
     'package/docs/ultracode-p3b-resume-cache.md',
     'package/docs/ultracode-p3c-worktree-isolation.md',
@@ -179,6 +180,7 @@ async function validateExtractedPackage(packageDir) {
   if (packageJson.dependencies && Object.keys(packageJson.dependencies).length > 0) {
     throw new Error('Installable ultracode package must not declare runtime dependencies.');
   }
+  await validatePackagedProvenance(packageDir, packageJson);
   await validateSkillCommand(join(packageDir, 'skills', 'ultracode-for-codex'), {
     name: 'ultracode-for-codex',
     requiredText: [
@@ -195,6 +197,8 @@ async function validateExtractedPackage(packageDir) {
     requiredText: [
       'npm package and CLI runtime surface',
       'The default `$ultracode-for-codex` skill is Codex-native',
+      'dynamic lenses',
+      'candidate verification',
       'npm run pack:ultracode-for-codex',
     ],
   });
@@ -212,6 +216,31 @@ async function validateExtractedPackage(packageDir) {
     }
     if (packageRelativePath.startsWith('dist/')) {
       validateRuntimeFileDoesNotCallDirectProvider(content, packageRelativePath);
+    }
+  }
+}
+
+async function validatePackagedProvenance(packageDir, packageJson) {
+  const provenance = await readFile(join(packageDir, 'docs', 'provenance-audit.md'), 'utf8');
+  const version = String(packageJson.version ?? '');
+  const license = String(packageJson.license ?? '');
+  const required = [
+    `ultracode-for-codex@${version}`,
+    `audited package metadata version is \`${version}\``,
+    `${license} license`,
+  ];
+  for (const text of required) {
+    if (!provenance.includes(text)) {
+      throw new Error(`Packaged provenance audit is missing current metadata text: ${text}`);
+    }
+  }
+  const versionPattern = /(^|[^0-9A-Za-z])v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)(?=$|[^0-9A-Za-z])/g;
+  const versionMentions = [...provenance.matchAll(versionPattern)].map((match) => match[2]);
+  for (const mentionedVersion of versionMentions) {
+    if (mentionedVersion !== version) {
+      throw new Error(
+        `Packaged provenance audit contains stale package version ${mentionedVersion}; expected ${version}.`,
+      );
     }
   }
 }

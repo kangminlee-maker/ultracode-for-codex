@@ -63,6 +63,9 @@ try {
   await assertBackgroundDefault(installedCli);
   await assertCliSmoke(installedCli);
   await assertBuiltinPlanProgress(installedCli);
+  await assertBuiltinCodeReviewJsonl(installedCli);
+  await assertBuiltinCodeReviewPlain(installedCli);
+  await assertBuiltinCodeReviewInvalidEvidence(installedCli);
   await assertPlainProgress(installedCli);
   await assertPermissionAllow(installedCli);
   await assertRetry(installedCli);
@@ -169,6 +172,8 @@ async function assertSkillCommandPackageContents(installedPackageDir) {
   assert.match(cliSkill, /^name: ultracode-for-codex-cli$/m);
   assert.match(cliSkill, /npm package and CLI runtime surface/);
   assert.match(cliSkill, /The default `\$ultracode-for-codex` skill is Codex-native/);
+  assert.match(cliSkill, /dynamic lenses/);
+  assert.match(cliSkill, /candidate verification/);
   assert.match(cliAgent, /Operate the Ultracode for Codex npm CLI runtime/);
 }
 
@@ -484,6 +489,129 @@ async function assertBuiltinPlanProgress(installedCli) {
     'task-inspect-tests',
   ]);
   assertProgressEvent(progress, 'workflow.review.recommended', { status: 'review_recommended' });
+}
+
+async function assertBuiltinCodeReviewJsonl(installedCli) {
+  await writeCodeReviewFixture();
+  const result = runCliAttached(installedCli, [
+    '--name',
+    'code-review',
+    '--args',
+    '{"prompt":"Review docs/client-package-plan.md for runtime contract risks."}',
+    '--permission',
+    'allow',
+  ]);
+  assert.equal(result.status, 0);
+  const progress = progressEvents(result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.level, 'xhigh');
+  assert.equal(output.findings.length, 1);
+  assert.equal(output.findings[0].severity, 'P1');
+  assert.equal(output.stats.finders, 3);
+  assert.equal(output.stats.candidates, 2);
+  assert.equal(output.stats.verifierAttempts, 2);
+  assert.equal(output.stats.reported, 1);
+  assert.match(output.provenance.sourceSnapshotId, /^git:[0-9a-f]{40}:sha256:[0-9a-f]{64}$/);
+
+  assertProgressEvent(progress, 'workflow.plan.ready', { status: 'planned', phaseCount: 1 });
+  assertProgressEvent(progress, 'workflow.phase.started', { title: 'Evidence' });
+  assertProgressEvent(progress, 'workflow.phase.planned', { title: 'Scope', plannedAgentCount: 1 });
+  assertProgressEvent(progress, 'workflow.phase.started', { title: 'Scope', plannedAgentCount: 1 });
+  const findPlan = assertProgressEvent(progress, 'workflow.phase.planned', { title: 'Find', plannedAgentCount: 2 });
+  assert.deepEqual(findPlan.plannedAgents.map((agent) => agent.label), [
+    'code-review-find-runtime-contract',
+    'code-review-find-security-boundary',
+  ]);
+  assertProgressEvent(progress, 'workflow.phase.planned', { title: 'Verify', plannedAgentCount: 1 });
+  assertProgressEvent(progress, 'workflow.phase.started', { title: 'Verify', plannedAgentCount: 1 });
+  assertProgressEvent(progress, 'workflow.agent.started', { label: 'code-review-verify-runtime-contract-c1', phase: 'Verify' });
+  assertProgressEvent(progress, 'workflow.agent.started', { label: 'code-review-verify-runtime-contract-c2', phase: 'Verify' });
+  const firstVerifyCompletion = assertProgressEvent(progress, 'workflow.agent.completed', {
+    label: 'code-review-verify-runtime-contract-c1',
+    phase: 'Verify',
+    phaseKnownAgentCount: 2,
+  });
+  assert.match(firstVerifyCompletion.summary, /Phase Verify \(1\/2\)/);
+  assert.ok(
+    progress.findIndex((event) => event.event === 'workflow.agent.started' && event.label === 'code-review-verify-runtime-contract-c1')
+      < progress.findIndex((event) => event.event === 'workflow.agent.completed' && event.label === 'code-review-find-security-boundary'),
+    'expected verifier for an early finder to start before the delayed finder completed',
+  );
+  assertProgressEvent(progress, 'workflow.phase.planned', { title: 'Sweep', plannedAgentCount: 1 });
+  assertProgressEvent(progress, 'workflow.agent.started', { label: 'code-review-sweep-finder', phase: 'Sweep' });
+  assertProgressEvent(progress, 'workflow.phase.planned', { title: 'Synthesize', plannedAgentCount: 1 });
+  assertProgressEvent(progress, 'workflow.agent.started', { label: 'code-review-synthesis', phase: 'Synthesize' });
+  assertProgressEvent(progress, 'workflow.completed', { status: 'completed' });
+  const summary = assertProgressEvent(progress, 'workflow.summary.ready', { status: 'completed' });
+  const verifySummary = summary.phasesSummary.find((phase) => phase.title === 'Verify');
+  assert.ok(verifySummary, 'expected Verify phase in completion summary');
+  assert.deepEqual(verifySummary.agents.map((agent) => agent.label), [
+    'code-review-verify-dynamic',
+    'code-review-verify-runtime-contract-c1',
+    'code-review-verify-runtime-contract-c2',
+  ]);
+  assertProgressEvent(progress, 'workflow.review.recommended', { status: 'review_recommended' });
+}
+
+async function assertBuiltinCodeReviewPlain(installedCli) {
+  await writeCodeReviewFixture();
+  const result = runCliAttached(installedCli, [
+    '--name',
+    'code-review',
+    '--args',
+    '{"prompt":"Review docs/client-package-plan.md for runtime contract risks.","level":"high"}',
+    '--permission',
+    'allow',
+    '--progress',
+    'plain',
+  ]);
+  assert.equal(result.status, 0);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.level, 'high');
+  assert.equal(output.stats.finders, 2);
+  assert.equal(output.stats.candidates, 2);
+  assert.doesNotMatch(result.stderr, /code-review-sweep-finder/);
+  assert.match(result.stderr, /\[phase\] Evidence/);
+  assert.match(result.stderr, /\[phase-plan\] Scope \(1 agents\)/);
+  assert.match(result.stderr, /\[phase-plan\] Find \(2 agents\)/);
+  assert.match(result.stderr, /\[phase-plan\] Verify \(1 agents\)/);
+  assert.match(result.stderr, /\[agent:\d+\] started code-review-verify-runtime-contract-c1/);
+  assert.match(result.stderr, /\[agent:\d+\] completed code-review-verify-runtime-contract-c1 \| Phase Verify \(1\/2\), \d+ out of \d+ agents have completed the task, \d+s elapsed \| tokens=/);
+  assert.match(result.stderr, /\[workflow-summary\] Phase Verify: 3 agents/);
+  assert.match(result.stderr, /code-review-verify-runtime-contract-c2/);
+  assert.match(result.stderr, /\[review-recommendation\]/);
+}
+
+async function assertBuiltinCodeReviewInvalidEvidence(installedCli) {
+  await writeCodeReviewFixture();
+  const result = runCliAttached(installedCli, [
+    '--name',
+    'code-review',
+    '--args',
+    '{"prompt":"INVALID_EVIDENCE_REF Review docs/client-package-plan.md."}',
+    '--permission',
+    'allow',
+  ]);
+  assert.equal(result.status, 1);
+  const progress = progressEvents(result.stderr);
+  assertProgressEvent(progress, 'workflow.failed', { status: 'failed' });
+  assertProgressEvent(progress, 'workflow.terminal_failure', { status: 'failed' });
+  assert.ok(
+    !progress.some((event) => event.event === 'workflow.agent.started' && /code-review-verify-/.test(event.label ?? '')),
+    'invalid finder evidence should fail before verifier agents start',
+  );
+  assert.equal(result.stdout, '');
+}
+
+async function writeCodeReviewFixture() {
+  await mkdir(join(consumerDir, 'docs'), { recursive: true });
+  await writeFile(join(consumerDir, 'docs', 'client-package-plan.md'), [
+    '# Client Package Plan',
+    '',
+    'The client package must bind authority to the platform token.',
+    'Runtime validation must stay deterministic.',
+    '',
+  ].join('\n'));
 }
 
 async function assertPlainProgress(installedCli) {
@@ -828,6 +956,178 @@ function usage() {
   };
 }
 
+function isReviewScopeSchema(schema) {
+  return Boolean(schema?.properties?.lensDecisions && schema?.properties?.lenses && schema?.properties?.files);
+}
+
+function isReviewFinderSchema(schema) {
+  return Boolean(schema?.properties?.candidates);
+}
+
+function isReviewVerifierSchema(schema) {
+  return Boolean(schema?.properties?.verdict && schema?.properties?.evidenceRefs);
+}
+
+function isReviewSynthesisSchema(schema) {
+  return Boolean(schema?.properties?.decisions && schema?.properties?.summary);
+}
+
+function fakeReviewScope() {
+  return {
+    files: ['docs/client-package-plan.md'],
+    summary: 'Review the client package plan and authority binding claims.',
+    instructions: 'Prioritize material runtime contract and boundary risks.',
+    lensDecisions: [
+      {
+        seedId: 'cross-file-contract',
+        action: 'select',
+        selectedLensId: 'runtime-contract',
+        reasonCategory: 'matched_change',
+        decisionRefs: ['file:docs/client-package-plan.md'],
+        reason: 'The plan changes runtime and package contract behavior.',
+      },
+      {
+        seedId: 'security-boundary',
+        action: 'select',
+        selectedLensId: 'security-boundary',
+        reasonCategory: 'prompt_risk',
+        decisionRefs: ['file:docs/client-package-plan.md'],
+        reason: 'Authority binding requires boundary review.',
+      },
+    ],
+    lenses: [
+      {
+        id: 'runtime-contract',
+        title: 'Runtime Contract',
+        focus: 'Check whether the client package runtime contract can fail materially.',
+        kind: 'contract',
+      },
+      {
+        id: 'security-boundary',
+        title: 'Security Boundary',
+        focus: 'Check whether platform token authority can leak or be misbound.',
+        kind: 'security',
+      },
+    ],
+  };
+}
+
+function fakeReviewFinder(input) {
+  const prompt = reviewPromptText(input);
+  if (reviewUserRequest(prompt).includes('INVALID_EVIDENCE_REF')) {
+    return {
+      candidates: [{
+        file: 'docs/client-package-plan.md',
+        line: 3,
+        summary: 'This candidate intentionally references unsupported evidence.',
+        failureScenario: 'The workflow should fail before verifier agents start.',
+        evidenceRefs: ['file:outside.md'],
+        kind: 'contract',
+      }],
+    };
+  }
+  if (prompt.startsWith('Code-review Sweep Finder')) {
+    return { candidates: [] };
+  }
+  const lensKey = currentReviewLensKey(prompt);
+  if (lensKey === 'runtime-contract') {
+    return {
+      candidates: [
+        {
+          file: 'docs/client-package-plan.md',
+          line: 3,
+          summary: 'Package plan may under-specify authority binding.',
+          failureScenario: 'A client could treat a token-like artifact as authority without verifying the platform binding.',
+          evidenceRefs: ['file:docs/client-package-plan.md'],
+          kind: 'contract',
+        },
+        {
+          file: 'docs/client-package-plan.md',
+          line: 4,
+          summary: 'The runtime contract may omit a deterministic validation gate.',
+          failureScenario: 'A release could pass docs review while missing a local schema gate.',
+          evidenceRefs: ['file:docs/client-package-plan.md'],
+          kind: 'coverage',
+        },
+      ],
+    };
+  }
+  if (lensKey === 'security-boundary') {
+    return { candidates: [] };
+  }
+  return {
+    candidates: [],
+  };
+}
+
+function currentReviewLensKey(input) {
+  const prompt = reviewPromptText(input);
+  const marker = 'Lens key: ';
+  const start = prompt.indexOf(marker);
+  if (start < 0) return '';
+  const rest = prompt.slice(start + marker.length);
+  const match = /^[A-Za-z0-9_.:/@+-]+/.exec(rest);
+  return match ? match[0] : '';
+}
+
+function reviewUserRequest(input) {
+  const prompt = reviewPromptText(input);
+  const start = prompt.indexOf('User request:');
+  if (start < 0) return '';
+  const scope = prompt.indexOf('Scope:', start);
+  if (scope < 0) return prompt.slice(start);
+  return prompt.slice(start, scope);
+}
+
+function fakeReviewVerifier(input) {
+  const prompt = reviewPromptText(input);
+  const second = prompt.includes('candidate_runtime-contract_2') || prompt.includes('candidate_sweep_2');
+  return {
+    verdict: 'CONFIRMED',
+    evidence: second
+      ? 'The candidate is real but lower materiality than the authority binding issue.'
+      : 'The plan discusses platform token authority but does not show a validation gate.',
+    evidenceRefs: ['file:docs/client-package-plan.md'],
+    severity: second ? 'P2' : 'P1',
+  };
+}
+
+function reviewPromptText(input) {
+  try {
+    const parsed = JSON.parse(input);
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) {
+        if (typeof item?.text === 'string') return item.text;
+      }
+    }
+  } catch (_err) {
+    // Fall back to the original string for direct unit-style invocations.
+  }
+  return input;
+}
+
+function fakeReviewSynthesis() {
+  return {
+    summary: 'One material runtime contract issue should be reported; the lower-risk coverage point is dropped.',
+    decisions: [
+      {
+        index: 0,
+        action: 'report',
+        severity: 'P1',
+        reasonCategory: 'material',
+        reason: 'Authority binding is a material runtime contract risk.',
+      },
+      {
+        index: 1,
+        action: 'drop',
+        severity: 'P2',
+        reasonCategory: 'not_material',
+        reason: 'The validation gate point is useful follow-up but not material enough for the final report.',
+      },
+    ],
+  };
+}
+
 function emitTurn(threadId, turnId, text) {
   write({
     method: 'item/agentMessage/delta',
@@ -905,6 +1205,23 @@ rl.on('line', (line) => {
           ],
         }],
       })), 0);
+      return;
+    }
+    if (isReviewScopeSchema(outputSchema)) {
+      setTimeout(() => emitTurn(threadId, turnId, JSON.stringify(fakeReviewScope())), 0);
+      return;
+    }
+    if (isReviewFinderSchema(outputSchema)) {
+      const delay = currentReviewLensKey(input) === 'security-boundary' ? 120 : 0;
+      setTimeout(() => emitTurn(threadId, turnId, JSON.stringify(fakeReviewFinder(input))), delay);
+      return;
+    }
+    if (isReviewVerifierSchema(outputSchema)) {
+      setTimeout(() => emitTurn(threadId, turnId, JSON.stringify(fakeReviewVerifier(input))), 0);
+      return;
+    }
+    if (isReviewSynthesisSchema(outputSchema)) {
+      setTimeout(() => emitTurn(threadId, turnId, JSON.stringify(fakeReviewSynthesis())), 0);
       return;
     }
     if (input.includes('WAIT') && !hasWorkspaceContext) return;
