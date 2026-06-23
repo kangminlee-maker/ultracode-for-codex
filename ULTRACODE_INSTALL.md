@@ -22,7 +22,7 @@ Skill commands:
 
 The packaged `settings.json` defaults CLI workflow runs to OS background
 execution with result and progress files under
-`.ultracode-for-codex/background/{jobId}`.
+`${ULTRACODE_FOR_CODEX_HOME:-~/.ultracode-for-codex}/background/{jobId}`.
 
 Production surface:
 
@@ -124,7 +124,7 @@ Settings defaults:
     "retryLimit": 0,
     "timeoutMs": 0,
     "background": {
-      "runDir": ".ultracode-for-codex/background/{jobId}",
+      "runDir": "{stateRoot}/background/{jobId}",
       "resultFile": "result.json",
       "progressFile": "progress.jsonl",
       "metadataFile": "metadata.json",
@@ -166,6 +166,9 @@ Useful controls:
   acting on it.
 - Press `Ctrl-C` once to cancel the running workflow.
 - Use `--retry-limit <n>` to retry failed runs in the same process.
+- Use `--resume-from-run-id <runId>` to resume a completed local workflow from
+  preserved runtime state. Resume always uses the original persisted workflow
+  source; without `--args`, it also reuses the original args.
 - `--timeout-ms 0` waits for completion, cancellation, or app-server exit.
   Positive values opt into a workflow deadline and per-agent silence budget;
   that budget is not divided by the retry budget.
@@ -196,12 +199,18 @@ Useful controls:
 - Keep `journalPath`, `journal.jsonl`, and journal contents out of CLI output.
   Local runtime state may still contain runtime-owned
   `transcriptDir`, `scriptPath`, and result files.
-- `resumeFromRunId` remains a runtime-internal same-session capability; the
-  CLI uses retry or explicit reruns for user-facing recovery.
+- `--resume-from-run-id` reads the preserved runtime script, result record, and
+  completed journal from the workflow state directory under
+  `${ULTRACODE_FOR_CODEX_HOME:-~/.ultracode-for-codex}`; completed agent
+  results are reused only when their runtime-owned call keys still match. The
+  script path, script source identity, and inherited args must match the
+  completed journal.
 - Use `isolation: "worktree"` only in git repositories with at least one commit.
   Isolated worktrees are intentionally preserved for review, including clean
   worktrees.
-- Treat `.ultracode-for-codex` workflow state as sensitive local data.
+- Treat workflow state under `${ULTRACODE_FOR_CODEX_HOME:-~/.ultracode-for-codex}`
+  as sensitive local data. Project-local `.ultracode-for-codex/` directories are
+  legacy state and should stay ignored.
 
 ## First Checks After Install
 
@@ -224,5 +233,5 @@ workflow.
   progress and completion summary examples for native orchestration.
 - `skills/ultracode-for-codex-cli/SKILL.md`: explicit CLI runtime command.
 - `docs/ultracode-p3a-journal-design.md`: implemented journal contract.
-- `docs/ultracode-p3b-resume-cache.md`: runtime-internal resume/cache contract.
+- `docs/ultracode-p3b-resume-cache.md`: local resume/cache contract.
 - `docs/ultracode-p3c-worktree-isolation.md`: worktree isolation contract.

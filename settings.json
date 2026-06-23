@@ -6,7 +6,7 @@
     "retryLimit": 0,
     "timeoutMs": 0,
     "background": {
-      "runDir": ".ultracode-for-codex/background/{jobId}",
+      "runDir": "{stateRoot}/background/{jobId}",
       "resultFile": "result.json",
       "progressFile": "progress.jsonl",
       "metadataFile": "metadata.json",

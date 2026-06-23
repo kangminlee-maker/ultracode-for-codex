@@ -162,6 +162,16 @@ npm exec -- ultracode-for-codex run \
   --args '{"prompt":"check the release plan"}'
 ```
 
+Resume a completed local workflow from preserved runtime state:
+
+```bash
+npm exec -- ultracode-for-codex run \
+  --accept-llm-guide=v1 \
+  --execution attached \
+  --cwd /path/to/project \
+  --resume-from-run-id run_...
+```
+
 ## What Gets Installed
 
 The package includes:
@@ -174,11 +184,14 @@ The package includes:
 
 ## Local State
 
-CLI background runs write local workflow state under `.ultracode-for-codex/` in
-the target project. Treat that folder as local runtime data. It may contain
-progress, metadata, transcripts, and results for the run.
+CLI runs write workflow state under `${ULTRACODE_FOR_CODEX_HOME:-~/.ultracode-for-codex}`.
+The runtime keeps background metadata, journals, transcripts, generated scripts,
+and results outside the target project so review evidence stays focused on the
+workspace itself.
 
-Add it to `.gitignore` if your project does not already ignore it:
+Project workflow sources may still live in `.codex/workflows/`. If an older
+workspace already has `.ultracode-for-codex/`, keep it ignored and treat it as
+legacy sensitive local data:
 
 ```gitignore
 .ultracode-for-codex/

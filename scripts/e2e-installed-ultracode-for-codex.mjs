@@ -33,6 +33,7 @@ run(process.execPath, [join(repoRoot, 'scripts/package-ultracode-for-codex.mjs')
 const consumerDir = await mkdtemp(join(tmpdir(), 'ultracode-for-codex-e2e-consumer-'));
 const externalWorktreeStore = join(dirname(consumerDir), '.ultracode-for-codex-worktrees');
 const codexHome = join(consumerDir, '.codex-home');
+const ultracodeHome = `${consumerDir}-ultracode-home`;
 const fakeCodexPath = join(consumerDir, 'fake-codex.cjs');
 
 try {
@@ -63,24 +64,28 @@ try {
   await assertBackgroundDefault(installedCli);
   await assertCliSmoke(installedCli);
   await assertBuiltinPlanProgress(installedCli);
-  await assertBuiltinCodeReviewJsonl(installedCli);
+  const codeReviewRun = await assertBuiltinCodeReviewJsonl(installedCli);
+  await assertBuiltinCodeReviewResume(installedCli, codeReviewRun);
   await assertBuiltinCodeReviewPlain(installedCli);
   await assertBuiltinCodeReviewInvalidEvidence(installedCli);
+  await assertInstalledReviewEvidenceContext(installedCli);
   await assertPlainProgress(installedCli);
   await assertPermissionAllow(installedCli);
   await assertRetry(installedCli);
   await assertCancel(installedCli);
   await assertBackgroundCancel(installedCli);
 
-  const journals = await findFiles(join(consumerDir, '.ultracode-for-codex'), 'journal.jsonl');
+  const journals = await findFiles(ultracodeHome, 'journal.jsonl');
   assert.ok(journals.length >= 4);
   process.stdout.write('installed ultracode-for-codex E2E passed (boundary_stub: fake Codex app-server, CLI run)\n');
 } finally {
   if (keepTemp) {
     process.stdout.write(`kept E2E consumer temp dir: ${consumerDir}\n`);
+    process.stdout.write(`kept E2E ultracode home: ${ultracodeHome}\n`);
   } else {
     await rm(consumerDir, { recursive: true, force: true });
     await rm(externalWorktreeStore, { recursive: true, force: true });
+    await rm(ultracodeHome, { recursive: true, force: true });
   }
 }
 
@@ -174,6 +179,7 @@ async function assertSkillCommandPackageContents(installedPackageDir) {
   assert.match(cliSkill, /The default `\$ultracode-for-codex` skill is Codex-native/);
   assert.match(cliSkill, /dynamic lenses/);
   assert.match(cliSkill, /candidate verification/);
+  assert.match(cliSkill, /--resume-from-run-id/);
   assert.match(cliAgent, /Operate the Ultracode for Codex npm CLI runtime/);
 }
 
@@ -373,7 +379,7 @@ async function assertBackgroundDefault(installedCli) {
   assert.equal(archiveRecord.status.status, 'completed');
   assert.deepEqual(JSON.parse(archiveRecord.resultText), { background: true });
 
-  const exportPath = join(consumerDir, '.ultracode-for-codex', 'archive', `${launch.jobId}-export.json`);
+  const exportPath = join(ultracodeHome, 'archive', `${launch.jobId}-export.json`);
   const exportCommand = runCliCommand(installedCli, 'export', [
     launch.jobId,
     '--cwd',
@@ -551,6 +557,82 @@ async function assertBuiltinCodeReviewJsonl(installedCli) {
     'code-review-verify-runtime-contract-c2',
   ]);
   assertProgressEvent(progress, 'workflow.review.recommended', { status: 'review_recommended' });
+  const started = assertProgressEvent(progress, 'workflow.started', { workflowName: 'code-review' });
+  return { runId: started.runId, output };
+}
+
+async function assertBuiltinCodeReviewResume(installedCli, previousRun) {
+  assert.equal(typeof previousRun.runId, 'string');
+  const result = runCliAttached(installedCli, [
+    '--resume-from-run-id',
+    previousRun.runId,
+    '--permission',
+    'allow',
+  ]);
+  assert.equal(result.status, 0);
+  const output = JSON.parse(result.stdout);
+  assert.deepEqual(output.findings, previousRun.output.findings);
+  assert.deepEqual(output.stats, previousRun.output.stats);
+  const progress = progressEvents(result.stderr);
+  const completions = progress.filter((event) => event.event === 'workflow.agent.completed');
+  assert.equal(completions.length, 7);
+  assert.ok(completions.every((event) => event.cached === true), 'resumed code-review should use cached agent completions');
+  assertProgressEvent(progress, 'workflow.completed', { status: 'completed', agentCount: 7 });
+  const summary = assertProgressEvent(progress, 'workflow.summary.ready', { status: 'completed' });
+  assert.equal(summary.phasesSummary.find((phase) => phase.title === 'Verify')?.agentCount, 3);
+
+  const conflictingSource = runCliAttached(installedCli, [
+    '--resume-from-run-id',
+    previousRun.runId,
+    '--name',
+    'code-review',
+    '--permission',
+    'allow',
+  ]);
+  assert.equal(conflictingSource.status, 1);
+  assert.match(conflictingSource.stderr, /--resume-from-run-id cannot be combined/);
+
+  const conflictingBackgroundSource = runCli(installedCli, [
+    '--resume-from-run-id',
+    previousRun.runId,
+    '--name',
+    'code-review',
+    '--permission',
+    'allow',
+  ]);
+  assert.equal(conflictingBackgroundSource.status, 1);
+  assert.match(conflictingBackgroundSource.stderr, /--resume-from-run-id cannot be combined/);
+
+  const emptyResume = runCli(installedCli, [
+    '--resume-from-run-id=',
+    '--permission',
+    'allow',
+  ]);
+  assert.equal(emptyResume.status, 1);
+  assert.match(emptyResume.stderr, /resumeFromRunId must be a non-empty workflow runId string/);
+
+  const unknownBackgroundResume = runCli(installedCli, [
+    '--resume-from-run-id',
+    'run_00000000-0000-0000-0000-000000000000',
+    '--permission',
+    'allow',
+  ]);
+  assert.equal(unknownBackgroundResume.status, 1);
+  assert.match(unknownBackgroundResume.stderr, /Unknown workflow run for resume/);
+
+  const [resultPath] = await findFiles(ultracodeHome, `${previousRun.runId}.result.json`);
+  assert.ok(resultPath, `expected result record for ${previousRun.runId}`);
+  const originalResultRecord = JSON.parse(await readFile(resultPath, 'utf8'));
+  await writeFile(resultPath, `${JSON.stringify({ ...originalResultRecord, scriptHash: 'sha256:bad' }, null, 2)}\n`);
+  const corruptBackgroundResume = runCli(installedCli, [
+    '--resume-from-run-id',
+    previousRun.runId,
+    '--permission',
+    'allow',
+  ]);
+  assert.equal(corruptBackgroundResume.status, 1);
+  assert.match(corruptBackgroundResume.stderr, /Unknown workflow run for resume|Workflow run cannot be used as a resume source/);
+  await writeFile(resultPath, `${JSON.stringify(originalResultRecord, null, 2)}\n`);
 }
 
 async function assertBuiltinCodeReviewPlain(installedCli) {
@@ -603,6 +685,35 @@ async function assertBuiltinCodeReviewInvalidEvidence(installedCli) {
   assert.equal(result.stdout, '');
 }
 
+async function assertInstalledReviewEvidenceContext(installedCli) {
+  await writeReviewEvidenceFixture();
+  const result = runCliAttached(installedCli, [
+    '--script',
+    [
+      'export const meta = { name: "installed-review-evidence-context" };',
+      'return await workspaceContext({',
+      '  query: "src/evidence-large.txt src/evidence-deleted.txt",',
+      '  files: ["src/evidence-large.txt", "src/evidence-deleted.txt"],',
+      '  includeDiff: true,',
+      '  diffBaseRef: "missing-diff-base",',
+      '  maxDiffBytes: 1000',
+      '});',
+    ].join('\n'),
+    '--permission',
+    'allow',
+  ]);
+  assert.equal(result.status, 0);
+  const context = JSON.parse(result.stdout);
+  assert.match(context, /### Review Evidence/);
+  assert.match(context, /truncation: \{"unstaged":true,"staged":false,"committed":false\}/);
+  assert.match(context, /diff:unstaged:src\/evidence-large\.txt/);
+  assert.match(context, /diff:unstaged:src\/evidence-deleted\.txt/);
+  assert.match(context, /unavailable:diff-base:missing-diff-base:/);
+  assert.match(context, /### Allowed Evidence Refs/);
+  assert.match(context, /file:src\/evidence-large\.txt/);
+  assert.match(context, /file:src\/evidence-deleted\.txt/);
+}
+
 async function writeCodeReviewFixture() {
   await mkdir(join(consumerDir, 'docs'), { recursive: true });
   await writeFile(join(consumerDir, 'docs', 'client-package-plan.md'), [
@@ -612,6 +723,16 @@ async function writeCodeReviewFixture() {
     'Runtime validation must stay deterministic.',
     '',
   ].join('\n'));
+}
+
+async function writeReviewEvidenceFixture() {
+  await mkdir(join(consumerDir, 'src'), { recursive: true });
+  await writeFile(join(consumerDir, 'src', 'evidence-large.txt'), 'base\n');
+  await writeFile(join(consumerDir, 'src', 'evidence-deleted.txt'), 'delete me\n');
+  run('git', ['add', 'docs/client-package-plan.md', 'src/evidence-large.txt', 'src/evidence-deleted.txt'], { cwd: consumerDir });
+  run('git', ['commit', '-m', 'add review evidence fixture'], { cwd: consumerDir });
+  await writeFile(join(consumerDir, 'src', 'evidence-large.txt'), Array.from({ length: 180 }, (_, index) => `changed line ${index}`).join('\n') + '\n');
+  await rm(join(consumerDir, 'src', 'evidence-deleted.txt'));
 }
 
 async function assertPlainProgress(installedCli) {
@@ -791,6 +912,7 @@ function cliEnv() {
     FAKE_EXPECT_CLIENT_VERSION: pkg.version,
     OPENAI_API_KEY: 'fake-openai-key',
     OPENAI_BASE_URL: 'https://example.invalid/openai',
+    ULTRACODE_FOR_CODEX_HOME: ultracodeHome,
   };
 }
 
@@ -1113,6 +1235,7 @@ function fakeReviewSynthesis() {
       {
         index: 0,
         action: 'report',
+        merge: null,
         severity: 'P1',
         reasonCategory: 'material',
         reason: 'Authority binding is a material runtime contract risk.',
@@ -1120,6 +1243,7 @@ function fakeReviewSynthesis() {
       {
         index: 1,
         action: 'drop',
+        merge: null,
         severity: 'P2',
         reasonCategory: 'not_material',
         reason: 'The validation gate point is useful follow-up but not material enough for the final report.',

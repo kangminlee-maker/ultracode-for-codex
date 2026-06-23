@@ -10,6 +10,7 @@ import { CodexSubagentBackend } from './codex/subagent-backend.js';
 import { WorkflowTaskRegistry } from './runtime/workflow-runtime.js';
 import { UltracodeRequestError } from './runtime/types.js';
 import { ultracodePackageVersion } from './runtime/package-info.js';
+import { defaultUltracodeStateRoot, resolveUltracodeStatePath } from './runtime/state-root.js';
 import { renderUltracodeInstallGuideNotice } from './ultracode-install-guide.js';
 import {
   codexDefaultReasoningEffort,
@@ -49,6 +50,7 @@ export type {
 
 const ULTRACODE_INSTALL_GUIDE_ACCEPT_VERSION = 'v1';
 const PROGRESS_KIND = 'ultracode.workflow.progress';
+const WORKFLOW_RUN_ID_RE = /^run_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type ExecutionMode = WorkflowExecutionMode;
 type PermissionPolicy = WorkflowPermissionPolicy;
@@ -92,12 +94,17 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
 
   const cwd = options.cwd ?? process.cwd();
   const executionMode = parseExecutionMode(options.execution);
-  if (executionMode === 'background') return launchBackgroundWorkflow(args, cwd);
+  const inputPromise = workflowLaunchInputFromOptions(options);
+  if (executionMode === 'background') {
+    const input = await inputPromise;
+    if (input.resumeFromRunId) await assertBackgroundResumeSource(cwd, input.resumeFromRunId);
+    return launchBackgroundWorkflow(args, cwd);
+  }
   const timeoutMs = parseIntOption(options.timeoutMs, workflowDefaultTimeoutMs());
   const retryLimit = parseRetryLimit(options.retryLimit);
   const permissionPolicy = parsePermissionPolicy(options.permission);
   const progressMode = parseProgressMode(options.progress);
-  const input = await workflowLaunchInputFromOptions(options);
+  const input = await inputPromise;
   const backend = new CodexSubagentBackend({
     command: options.command,
     cwd,
@@ -142,6 +149,28 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
     await runtime.close();
   }
 }
+
+async function assertBackgroundResumeSource(cwd: string, runId: string): Promise<void> {
+  const runtime = new WorkflowTaskRegistry({
+    backend: RESUME_PREFLIGHT_BACKEND,
+    cwd,
+    requestTimeoutMs: 0,
+  });
+  try {
+    await runtime.validateResumeSource(runId);
+  } finally {
+    await runtime.close();
+  }
+}
+
+const RESUME_PREFLIGHT_BACKEND = {
+  name: 'resume-preflight',
+  model: 'resume-preflight',
+  async generate(): Promise<never> {
+    throw new Error('Resume preflight must not run subagents.');
+  },
+  async close(): Promise<void> {},
+};
 
 interface ParsedOptions {
   readonly _: string[];
@@ -790,10 +819,9 @@ function backgroundProcessIdentityMatches(
 
 async function backgroundArchivePath(options: ParsedOptions, jobId: string): Promise<string> {
   if (options.outputPath) return resolve(options.outputPath);
-  const cwd = options.cwd ?? process.cwd();
   const archiveDir = options.outDir
     ? resolve(options.outDir)
-    : resolve(cwd, '.ultracode-for-codex', 'archive');
+    : join(defaultUltracodeStateRoot(), 'archive');
   return join(archiveDir, `${jobId}.json`);
 }
 
@@ -992,6 +1020,9 @@ function delay(ms: number): Promise<void> {
 
 function resolveBackgroundRunDir(cwd: string, template: string, jobId: string): string {
   const expanded = template.replaceAll('{jobId}', jobId);
+  if (expanded.includes('{stateRoot}') || expanded === '~' || expanded.startsWith('~/')) {
+    return resolveUltracodeStatePath(expanded);
+  }
   return isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
 }
 
@@ -1012,9 +1043,7 @@ async function workflowLaunchInputFromOptions(options: ParsedOptions): Promise<W
   const positionalScriptFile = options._[0];
   if (options._.length > 1) throw new Error('run accepts at most one positional workflow script file.');
   const scriptFile = options.scriptFile ?? positionalScriptFile;
-  if (options.resumeFromRunId) {
-    throw new Error('CLI resume is not available yet; use --retry-limit for same-run retry or rerun the workflow command.');
-  }
+  const hasResumeFromRunId = options.resumeFromRunId !== undefined;
   const sourceSelectors = [
     options.script !== undefined ? '--script' : '',
     scriptFile ? '--script-file' : '',
@@ -1024,16 +1053,32 @@ async function workflowLaunchInputFromOptions(options: ParsedOptions): Promise<W
   if (sourceSelectors.length > 1) {
     throw new Error(`Choose only one workflow source selector: ${sourceSelectors.join(', ')}.`);
   }
-  if (sourceSelectors.length === 0) {
-    throw new Error('run requires --script, --script-file, --script-path, --name, or a positional script file.');
+  if (hasResumeFromRunId) validateCliResumeFromRunId(options.resumeFromRunId);
+  if (hasResumeFromRunId && sourceSelectors.length > 0) {
+    throw new Error('--resume-from-run-id cannot be combined with --script, --script-file, --script-path, --name, or a positional script file.');
   }
+  if (sourceSelectors.length === 0 && !hasResumeFromRunId) {
+    throw new Error('run requires --script, --script-file, --script-path, --name, --resume-from-run-id, or a positional script file.');
+  }
+  const parsedArgs = await parseArgsPayload(options);
+  const shouldIncludeArgs = options.args !== undefined || options.argsFile !== undefined || !hasResumeFromRunId;
   return {
     ...(options.script !== undefined ? { script: options.script } : {}),
     ...(scriptFile ? { script: await readFile(scriptFile, 'utf8') } : {}),
     ...(options.scriptPath ? { scriptPath: options.scriptPath } : {}),
     ...(options.name ? { name: options.name } : {}),
-    args: await parseArgsPayload(options),
+    ...(hasResumeFromRunId ? { resumeFromRunId: options.resumeFromRunId } : {}),
+    ...(shouldIncludeArgs ? { args: parsedArgs } : {}),
   };
+}
+
+function validateCliResumeFromRunId(value: unknown): void {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new Error('resumeFromRunId must be a non-empty workflow runId string.');
+  }
+  if (!WORKFLOW_RUN_ID_RE.test(value.trim())) {
+    throw new Error('resumeFromRunId must be a workflow runId in run_<uuid> format.');
+  }
 }
 
 async function parseArgsPayload(options: ParsedOptions): Promise<unknown> {
@@ -1702,7 +1747,8 @@ Options:
   --script-file <path>               Workflow script file. A positional file path is also accepted.
   --script-path <path>               Runtime-owned persisted workflow script path.
   --name <name>                      Named workflow from .codex/workflows or built-ins.
-  --args <json>                      Workflow args JSON. Default: {}.
+  --resume-from-run-id <runId>        Resume a completed local workflow run from preserved runtime state.
+  --args <json>                      Workflow args JSON. Default: {}; resume runs inherit prior args when omitted.
   --args-file <path>                 Read workflow args JSON from a file.
   --permission <ask|allow|deny>      Permission review behavior. Default: settings.json (${workflowDefaultPermissionPolicy()}).
   --retry-limit <number>             Retry failed workflows in the same process. Default: settings.json (${workflowDefaultRetryLimit()}).

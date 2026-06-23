@@ -16,6 +16,7 @@ import {
   workflowDefaultRetryLimit,
   workflowDefaultTimeoutMs,
 } from '../dist/settings.js';
+import { defaultWorkflowStateDir } from '../dist/runtime/state-root.js';
 
 test('settings.json provides Codex workflow runtime defaults', () => {
   assert.deepEqual(loadSettings(), {
@@ -26,7 +27,7 @@ test('settings.json provides Codex workflow runtime defaults', () => {
       retryLimit: 0,
       timeoutMs: 0,
       background: {
-        runDir: '.ultracode-for-codex/background/{jobId}',
+        runDir: '{stateRoot}/background/{jobId}',
         resultFile: 'result.json',
         progressFile: 'progress.jsonl',
         metadataFile: 'metadata.json',
@@ -44,7 +45,7 @@ test('settings.json provides Codex workflow runtime defaults', () => {
   assert.equal(workflowDefaultRetryLimit(), 0);
   assert.equal(workflowDefaultTimeoutMs(), 0);
   assert.deepEqual(workflowBackgroundDefaults(), {
-    runDir: '.ultracode-for-codex/background/{jobId}',
+    runDir: '{stateRoot}/background/{jobId}',
     resultFile: 'result.json',
     progressFile: 'progress.jsonl',
     metadataFile: 'metadata.json',
@@ -52,6 +53,10 @@ test('settings.json provides Codex workflow runtime defaults', () => {
   });
   assert.equal(codexDefaultReasoningEffort(), 'xhigh');
   assert.equal(codexDefaultVerbosity(), 'medium');
+  assert.match(
+    defaultWorkflowStateDir('/tmp/example-workspace'),
+    /\/\.ultracode-for-codex\/workspaces\/example-workspace-[0-9a-f]{16}$/,
+  );
 });
 
 test('settings validators accept only supported Codex model controls', () => {

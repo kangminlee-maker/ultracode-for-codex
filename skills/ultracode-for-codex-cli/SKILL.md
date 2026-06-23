@@ -56,6 +56,10 @@ CLI behavior:
   deletion with `archive` or `export`;
 - `wait --result`, `cancel --wait`, `logs --event <event>`, and `--plain`
   provide focused foreground checks;
+- `--resume-from-run-id <runId>` resumes a completed local workflow from
+  preserved runtime state, rejects additional workflow source selectors, and
+  reuses completed agent results only when the runtime-owned call keys still
+  match;
 - attached execution is available with `--execution attached` when the caller
   should stay connected until completion;
 - attached progress prints to stderr as JSONL by default;
@@ -101,9 +105,12 @@ CLI behavior:
   background execution so long runs can keep waiting while Codex does other
   work.
 - Keep `journalPath`, `journal.jsonl`, and journal contents out of CLI output.
-- Treat `.ultracode-for-codex` workflow state as sensitive local data.
-- Keep `resumeFromRunId` runtime-internal unless cross-process resume gets an
-  explicit durable design.
+- Treat workflow state under `${ULTRACODE_FOR_CODEX_HOME:-~/.ultracode-for-codex}`
+  as sensitive local data. Project-local `.ultracode-for-codex/` is legacy
+  state and should stay ignored if present.
+- `--resume-from-run-id` reads preserved script, result, and completed journal
+  state from the global workflow state root; script path, script source
+  identity, and inherited args must match the completed journal.
 - Use `isolation: "worktree"` only inside a git repo with at least one commit;
   isolated worktrees are intentionally preserved for review, including clean
   worktrees.

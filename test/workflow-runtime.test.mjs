@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { afterEach, test } from 'node:test';
 import { promisify } from 'node:util';
 import { WorkflowTaskRegistry } from '../dist/runtime/workflow-runtime.js';
@@ -86,6 +86,10 @@ test('workflow runtime rejects invalid launch inputs before side effects', async
   try {
     await assertRejectCode(
       () => runtime.launch({ resumeFromRunId: 'run_old' }),
+      'workflow_input_invalid',
+    );
+    await assertRejectCode(
+      () => runtime.launch({ resumeFromRunId: '../run_escape' }),
       'workflow_input_invalid',
     );
     assert.deepEqual(await findFiles(root, 'journal.jsonl'), []);
@@ -355,6 +359,7 @@ test('workspaceContext includeDiff returns deterministic review evidence refs', 
   const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend() });
   try {
     await initializeGitRepo(root);
+    await gitLines(root, ['config', 'core.quotePath', 'true']);
     await mkdir(join(root, 'src'), { recursive: true });
     await writeFile(join(root, 'src', 'demo.ts'), [
       'export function value() {',
@@ -362,7 +367,22 @@ test('workspaceContext includeDiff returns deterministic review evidence refs', 
       '}',
       '',
     ].join('\n'));
-    await gitLines(root, ['add', 'src/demo.ts']);
+    await writeFile(join(root, 'src', 'deleted.ts'), 'export const removed = true;\n');
+    await writeFile(join(root, 'src', 'a -> b.ts'), 'export const arrow = 1;\n');
+    await writeFile(join(root, 'src', 'é.ts'), 'export const accent = 1;\n');
+    await writeFile(join(root, 'src', 'rename-source.ts'), 'export const renameSource = true;\n');
+    await mkdir(join(root, '.ultracode-for-codex', 'workflows'), { recursive: true });
+    await writeFile(join(root, '.ultracode-for-codex', 'workflows', 'journal.jsonl'), 'runtime state before\n');
+    await writeFile(join(root, '.ultracode-for-codex', 'workflows', 'rename-source.json'), '{"secret":true}\n');
+    await writeFile(join(root, '.ultracode-for-codex', 'workflows', 'secret\nname.json'), '{"quotedSecret":true}\n');
+    await gitLines(root, ['add', 'src/demo.ts', 'src/deleted.ts', 'src/a -> b.ts', 'src/é.ts', 'src/rename-source.ts']);
+    await gitLines(root, [
+      'add',
+      '-f',
+      '.ultracode-for-codex/workflows/journal.jsonl',
+      '.ultracode-for-codex/workflows/rename-source.json',
+      '.ultracode-for-codex/workflows/secret\nname.json',
+    ]);
     await gitLines(root, ['commit', '-m', 'add demo']);
     await writeFile(join(root, 'src', 'demo.ts'), [
       'export function value() {',
@@ -370,6 +390,13 @@ test('workspaceContext includeDiff returns deterministic review evidence refs', 
       '}',
       '',
     ].join('\n'));
+    await writeFile(join(root, 'src', 'a -> b.ts'), 'export const arrow = 2;\n');
+    await writeFile(join(root, 'src', 'é.ts'), 'export const accent = 2;\n');
+    await gitLines(root, ['mv', 'src/rename-source.ts', 'src/renamed -> target.ts']);
+    await rm(join(root, 'src', 'deleted.ts'));
+    await writeFile(join(root, '.ultracode-for-codex', 'workflows', 'journal.jsonl'), 'runtime state after\n');
+    await writeFile(join(root, '.ultracode-for-codex', 'workflows', 'secret\nname.json'), '{"quotedSecret":false}\n');
+    await gitLines(root, ['mv', '.ultracode-for-codex/workflows/rename-source.json', 'src/runtime-copy.json']);
 
     const launch = await runtime.launch({
       script: `export const meta = { name: "review-evidence-context" };
@@ -389,10 +416,125 @@ return await workspaceContext({
     assert.match(snapshot.result, /allowedEvidenceIndexDigest: sha256:[0-9a-f]{64}/);
     assert.match(snapshot.result, /diffBaseRef: HEAD~1/);
     assert.match(snapshot.result, /diff:unstaged:src\/demo\.ts/);
+    assert.match(snapshot.result, /file:src\/a -> b\.ts/);
+    assert.match(snapshot.result, /file:src\/é\.ts/);
+    assert.match(snapshot.result, /file:src\/renamed -> target\.ts/);
+    assert.match(snapshot.result, /file:src\/deleted\.ts/);
+    assert.match(snapshot.result, /diff:unstaged:src\/deleted\.ts/);
     assert.match(snapshot.result, /hunk:unstaged:src\/demo\.ts:1/);
     assert.match(snapshot.result, /-  return 1;/);
     assert.match(snapshot.result, /### Allowed Evidence Refs/);
+    assert.doesNotMatch(snapshot.result, /\.ultracode-for-codex/);
+    assert.doesNotMatch(snapshot.result, /runtime-copy\.json/);
+    assert.doesNotMatch(snapshot.result, /runtime state after/);
+    assert.doesNotMatch(snapshot.result, /quotedSecret/);
   } finally {
+    await runtime.close();
+  }
+});
+
+test('workspaceContext parses raw git status copy paths without delimiter guessing', async () => {
+  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend() });
+  const oldPath = process.env.PATH;
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src', 'source.ts'), 'export const source = true;\n');
+    await writeFile(join(root, 'src', 'auth.ts'), 'export const auth = true;\n');
+    await writeFile(join(root, 'src', 'copied -> target.ts'), 'export const copied = true;\n');
+    await writeFile(join(root, 'src', 'clean-target.ts'), 'export const cleanTarget = true;\n');
+    await withFakeGit(root, `
+if (args[0] === 'status' && args.includes('-z')) {
+  process.stdout.write(Buffer.concat([
+    Buffer.from('C  src/copied -> target.ts\\0src/source.ts\\0'),
+    Buffer.from('R  src/'),
+    Buffer.from([0xc2, 0x9b]),
+    Buffer.from('spoof.ts\\0src/auth.ts\\0'),
+    Buffer.from(' M src/'),
+    Buffer.from([0xff]),
+    Buffer.from('bad.ts\\0'),
+    Buffer.from('R  src/clean-target.ts\\0src/'),
+    Buffer.from([0xc2, 0x9b]),
+    Buffer.from('source.ts\\0')
+  ]));
+  process.exit(0);
+}
+`);
+
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "review-evidence-copy-status" };
+return await workspaceContext({
+  query: "copy status",
+  includeDiff: true
+});`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    assert.match(snapshot.result, /file:src\/copied -> target\.ts/);
+    assert.match(snapshot.result, /unavailable:git-status-path:2:unsafe-target/);
+    assert.match(snapshot.result, /unavailable:git-status-path:3:unsafe-path/);
+    assert.match(snapshot.result, /unavailable:git-status-path:4:unsafe-source/);
+    assert.doesNotMatch(snapshot.result, /file:src\/clean-target\.ts/);
+    assert.doesNotMatch(snapshot.result, /file:src\/auth\.ts/);
+    assert.doesNotMatch(snapshot.result, /file:src\/source\.ts/);
+    assert.doesNotMatch(snapshot.result, /file:src\/\u009Bspoof\.ts/);
+    assert.doesNotMatch(snapshot.result, /file:src\/\uFFFDbad\.ts/);
+  } finally {
+    process.env.PATH = oldPath;
+    await runtime.close();
+  }
+});
+
+test('workspaceContext fallback git status rejects leading control-character paths', async () => {
+  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend() });
+  const oldPath = process.env.PATH;
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src', 'fallback-safe.txt'), 'safe\n');
+    await writeFile(join(root, 'src', 'target -> kept.ts'), 'quoted target\n');
+    await writeFile(join(root, ' leading-target.txt'), 'target\n');
+    await writeFile(join(root, ' leading.txt'), 'leading\n');
+    await withFakeGit(root, `
+if (args[0] === 'status' && args.includes('-z')) {
+  process.stderr.write('forced raw status failure\\n');
+  process.exit(1);
+}
+if (args[0] === 'status' && args.includes('--short')) {
+  process.stdout.write(' M src/fallback-safe.txt\\n M  leading.txt\\n M "\\\\012file:fake.ts"\\nR  "\\\\033old.ts" -> src/fallback-safe.txt\\nR  "src/source -> old.ts" ->  leading-target.txt\\nR  src/source.ts -> src/renamed -> fallback.ts\\nR  src/old.ts -> "src/target -> kept.ts"\\n');
+  process.exit(0);
+}
+`);
+
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "review-evidence-fallback-status" };
+return await workspaceContext({
+  query: "fallback status",
+  includeDiff: true
+});`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    assert.match(snapshot.result, /file:src\/fallback-safe\.txt/);
+    assert.match(snapshot.result, /file:src\/target -> kept\.ts/);
+    assert.match(snapshot.result, /^file: leading\.txt$/m);
+    assert.match(snapshot.result, /^file: leading-target\.txt$/m);
+    assert.match(snapshot.result, /unavailable:git-status-raw:failed/);
+    assert.match(snapshot.result, /unavailable:git-status-path:3:unsafe-path/);
+    assert.match(snapshot.result, /unavailable:git-status-path:4:unsafe-source/);
+    assert.match(snapshot.result, /unavailable:git-status-path:6:unsafe-path/);
+    assert.match(snapshot.result, /R  "src\/source -> old\.ts" -> " leading-target\.txt"/);
+    assert.match(snapshot.result, /R  src\/old\.ts -> "src\/target -> kept\.ts"/);
+    assert.doesNotMatch(snapshot.result, /^file:fake\.ts$/m);
+    assert.doesNotMatch(snapshot.result, /^file:fallback\.ts$/m);
+    assert.doesNotMatch(snapshot.result, /forced raw status failure/);
+    assert.doesNotMatch(snapshot.result, /\\012file:fake\.ts/);
+    assert.doesNotMatch(snapshot.result, /\\033old\.ts/);
+    assert.doesNotMatch(snapshot.result, /src\/renamed -> fallback\.ts/);
+  } finally {
+    process.env.PATH = oldPath;
     await runtime.close();
   }
 });
@@ -427,6 +569,129 @@ return await parallel(order.map((id) => () => agent("logical:" + id, {
     assert.equal(backend.requests.length, 2);
   } finally {
     await runtime.close();
+  }
+});
+
+test('workflow runtime resumes completed logical-keyed agents across registry instances', async () => {
+  const backend1 = new FakeSubagentBackend();
+  const { runtime: runtime1, root } = await createRuntime({ backend: backend1 });
+  const stateDir = join(root, '.ultracode-for-codex');
+  const script = `export const meta = { name: "durable-logical-key-resume" };
+const order = Array.isArray(args.order) ? args.order : ["a", "b"];
+return await parallel(order.map((id) => () => agent("durable:" + id, {
+  label: "durable-" + id,
+  key: "durable/" + id
+})));`;
+  let runId;
+  let sourceScriptPath;
+  let sourceScriptHash;
+  try {
+    const first = await runtime1.launch({
+      script,
+      args: { order: ['a', 'b'] },
+    });
+    await collectEvents(runtime1, first.taskId);
+    const snapshot = runtime1.get(first.taskId);
+    assert.equal(snapshot.status, 'completed');
+    runId = first.runId;
+    sourceScriptPath = snapshot.scriptPath;
+    sourceScriptHash = snapshot.scriptHash;
+    assert.equal(backend1.requests.length, 2);
+    const resultRecord = JSON.parse(await readFile(join(stateDir, 'workflows', `${runId}.result.json`), 'utf8'));
+    assert.equal(resultRecord.retryInput.scriptPath, snapshot.scriptPath);
+    assert.deepEqual(resultRecord.retryInput.args, { order: ['a', 'b'] });
+  } finally {
+    await runtime1.close();
+  }
+
+  const backend2 = new FakeSubagentBackend();
+  const runtime2 = new WorkflowTaskRegistry({
+    backend: backend2,
+    cwd: root,
+    stateDir,
+    requestTimeoutMs: 30_000,
+  });
+  try {
+    await assertRejectCode(
+      () => runtime2.launch({ resumeFromRunId: runId, name: 'task' }),
+      'workflow_input_invalid',
+    );
+    const resumed = await runtime2.launch({
+      resumeFromRunId: runId,
+      args: { order: ['b', 'a'] },
+    });
+    const resumedEvents = await collectEvents(runtime2, resumed.taskId);
+    const completions = resumedEvents.filter((event) => event.type === 'workflow.agent.completed');
+    assert.deepEqual(jsonValue(runtime2.get(resumed.taskId).result), ['RAW:durable:b', 'RAW:durable:a']);
+    assert.equal(completions.length, 2);
+    assert.equal(completions.every((event) => event.cached === true), true);
+    assert.equal(backend2.requests.length, 0);
+
+    const resultPath = join(stateDir, 'workflows', `${runId}.result.json`);
+    const journalPath = workflowJournalPath(join(stateDir, 'subagents', 'workflows', runId));
+    const resultRecord = JSON.parse(await readFile(resultPath, 'utf8'));
+    const journalText = await readFile(journalPath, 'utf8');
+    const alternateScriptPath = join(stateDir, 'workflows', 'scripts', 'alternate-durable-logical-key-resume.js');
+    await writeFile(alternateScriptPath, await readFile(sourceScriptPath, 'utf8'));
+    await writeFile(`${alternateScriptPath}.meta.json`, `${JSON.stringify({
+      version: 1,
+      workflowName: 'durable-logical-key-resume',
+      workflowSource: 'project',
+      scriptHash: sourceScriptHash,
+    }, null, 2)}\n`);
+    await writeFile(resultPath, `${JSON.stringify({
+      ...resultRecord,
+      retryInput: {
+        ...resultRecord.retryInput,
+        scriptPath: alternateScriptPath,
+      },
+    }, null, 2)}\n`);
+    await assertRejectCode(
+      () => runtime2.launch({ resumeFromRunId: runId }),
+      'workflow_input_invalid',
+    );
+    await writeFile(resultPath, `${JSON.stringify(resultRecord, null, 2)}\n`);
+
+    await writeFile(resultPath, `${JSON.stringify({
+      ...resultRecord,
+      retryInput: {
+        scriptPath: resultRecord.retryInput.scriptPath,
+      },
+    }, null, 2)}\n`);
+    const resumedWithJournalArgs = await runtime2.launch({ resumeFromRunId: runId });
+    await collectEvents(runtime2, resumedWithJournalArgs.taskId);
+    assert.deepEqual(jsonValue(runtime2.get(resumedWithJournalArgs.taskId).result), ['RAW:durable:a', 'RAW:durable:b']);
+    assert.equal(backend2.requests.length, 0);
+    await writeFile(resultPath, `${JSON.stringify(resultRecord, null, 2)}\n`);
+
+    await writeFile(resultPath, `${JSON.stringify({
+      ...resultRecord,
+      retryInput: {
+        ...resultRecord.retryInput,
+        args: { order: ['tampered'] },
+      },
+    }, null, 2)}\n`);
+    await assertRejectCode(
+      () => runtime2.launch({ resumeFromRunId: runId }),
+      'workflow_input_invalid',
+    );
+    await writeFile(resultPath, `${JSON.stringify(resultRecord, null, 2)}\n`);
+
+    await writeFile(resultPath, `${JSON.stringify({ ...resultRecord, scriptHash: 'sha256:bad' }, null, 2)}\n`);
+    await assertRejectCode(
+      () => runtime2.launch({ resumeFromRunId: runId }),
+      'workflow_input_invalid',
+    );
+    await writeFile(resultPath, `${JSON.stringify(resultRecord, null, 2)}\n`);
+
+    const journalWithoutTerminal = `${journalText.trimEnd().split('\n').slice(0, -1).join('\n')}\n`;
+    await writeFile(journalPath, journalWithoutTerminal);
+    await assertRejectCode(
+      () => runtime2.launch({ resumeFromRunId: runId }),
+      'workflow_input_invalid',
+    );
+  } finally {
+    await runtime2.close();
   }
 });
 
@@ -915,6 +1180,7 @@ function fakeReviewSynthesis() {
       {
         index: 0,
         action: 'report',
+        merge: null,
         severity: 'P1',
         reasonCategory: 'material',
         reason: 'Authority binding is a material runtime contract risk.',
@@ -922,6 +1188,7 @@ function fakeReviewSynthesis() {
       {
         index: 1,
         action: 'drop',
+        merge: null,
         severity: 'P2',
         reasonCategory: 'not_material',
         reason: 'The validation gate point is useful follow-up but not material enough for the final report.',
@@ -1023,6 +1290,27 @@ async function initializeGitRepo(root) {
   await writeFile(join(root, 'README.md'), '# worktree fixture\n');
   await gitLines(root, ['add', 'README.md']);
   await gitLines(root, ['commit', '-m', 'init']);
+}
+
+async function withFakeGit(root, customSource) {
+  const { stdout } = await execFileAsync('sh', ['-c', 'command -v git'], { encoding: 'utf8' });
+  const realGit = stdout.trim();
+  const binDir = join(root, 'fake-bin');
+  await mkdir(binDir, { recursive: true });
+  const fakeGitPath = join(binDir, 'git');
+  await writeFile(fakeGitPath, `#!/usr/bin/env node
+import { spawnSync } from 'node:child_process';
+const args = process.argv.slice(2);
+${customSource}
+const result = spawnSync(${JSON.stringify(realGit)}, args, { stdio: 'inherit' });
+if (result.error) {
+  console.error(result.error.message);
+  process.exit(1);
+}
+process.exit(result.status ?? 0);
+`);
+  await chmod(fakeGitPath, 0o755);
+  process.env.PATH = `${binDir}${delimiter}${process.env.PATH ?? ''}`;
 }
 
 async function gitLines(cwd, args) {

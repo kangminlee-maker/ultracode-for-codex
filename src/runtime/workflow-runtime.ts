@@ -26,6 +26,7 @@ import type {
   WorkflowJournalDurability,
   WorkflowJournalUsage,
 } from './workflow-journal.js';
+import { defaultUltracodeStateRoot, defaultWorkflowStateDir } from './state-root.js';
 
 export type WorkflowTaskStatus = 'running' | 'completed' | 'failed';
 export type WorkflowTaskType = 'local_workflow';
@@ -427,7 +428,28 @@ interface WorkflowPermissionStore {
 
 interface WorkflowResumePlan {
   readonly launchInput: WorkflowLaunchInput;
-  readonly sourceTask?: WorkflowTaskMutable;
+  readonly sourceTask?: WorkflowResumeSource;
+}
+
+interface WorkflowResumeSource {
+  readonly runId: string;
+  readonly status: WorkflowTaskStatus;
+  readonly transcriptDir: string;
+  readonly retryInput: WorkflowLaunchInput;
+  readonly workflowName?: string;
+  readonly scriptHash?: string;
+}
+
+interface WorkflowCompletedResumeJournal {
+  readonly entries: readonly WorkflowJournalEntry[];
+  readonly started: Extract<WorkflowJournalEntry, { readonly kind: 'workflow.run.started' }>;
+}
+
+interface DurableWorkflowResultRecord {
+  readonly runId: string;
+  readonly workflowName: string;
+  readonly scriptHash: string;
+  readonly retryInput?: WorkflowLaunchInput;
 }
 
 interface WorkflowResumeCache {
@@ -536,6 +558,7 @@ const WORKSPACE_CONTEXT_EXCLUDED_DIRS = new Set([
   'node_modules',
   'out',
 ]);
+const EMPTY_WORKSPACE_PATH_EXCLUSIONS: ReadonlySet<string> = new Set();
 const WORKSPACE_CONTEXT_ALLOWED_EXTENSIONS = new Set([
   '.cjs',
   '.css',
@@ -646,21 +669,21 @@ const seedLenses = [
 const scopeSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["files", "summary", "lensDecisions", "lenses"],
+  required: ["files", "summary", "instructions", "lensDecisions", "lenses"],
   properties: {
     files: { type: "array", items: { type: "string", minLength: 1, maxLength: 240 } },
     summary: { type: "string", minLength: 1 },
-    instructions: { type: "string" },
+    instructions: { type: ["string", "null"] },
     lensDecisions: {
       type: "array",
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["seedId", "action", "reasonCategory", "decisionRefs", "reason"],
+        required: ["seedId", "action", "selectedLensId", "reasonCategory", "decisionRefs", "reason"],
         properties: {
           seedId: { type: "string", minLength: 1 },
           action: { type: "string", enum: ["select", "skip"] },
-          selectedLensId: { type: "string" },
+          selectedLensId: { type: ["string", "null"] },
           reasonCategory: { type: "string", enum: ["matched_change", "prompt_risk", "no_evidence", "cap_limit", "redundant", "out_of_scope", "tiny_change"] },
           decisionRefs: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
           reason: { type: "string", minLength: 1 }
@@ -693,14 +716,14 @@ const finderSchema = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["file", "summary", "failureScenario", "evidenceRefs"],
+        required: ["file", "line", "summary", "failureScenario", "evidenceRefs", "kind"],
         properties: {
           file: { type: "string", minLength: 1, maxLength: 240 },
-          line: { type: "integer", minimum: 1 },
+          line: { type: ["integer", "null"], minimum: 1 },
           summary: { type: "string", minLength: 1 },
           failureScenario: { type: "string", minLength: 1 },
           evidenceRefs: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
-          kind: { type: "string" }
+          kind: { type: ["string", "null"] }
         }
       }
     }
@@ -709,12 +732,12 @@ const finderSchema = {
 const verifierSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["verdict", "evidence", "evidenceRefs"],
+  required: ["verdict", "evidence", "evidenceRefs", "severity"],
   properties: {
     verdict: { type: "string", enum: ["CONFIRMED", "PLAUSIBLE", "REFUTED"] },
     evidence: { type: "string", minLength: 1 },
     evidenceRefs: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
-    severity: { type: "string", enum: ["P0", "P1", "P2", "P3"] }
+    severity: { type: ["string", "null"], enum: ["P0", "P1", "P2", "P3", null] }
   }
 };
 const synthesisSchema = {
@@ -728,12 +751,12 @@ const synthesisSchema = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["index", "action", "reasonCategory", "reason"],
+        required: ["index", "action", "merge", "severity", "reasonCategory", "reason"],
         properties: {
           index: { type: "integer", minimum: 0 },
           action: { type: "string", enum: ["report", "merge", "drop"] },
-          merge: { type: "array", minItems: 1, items: { type: "integer", minimum: 0 } },
-          severity: { type: "string", enum: ["P0", "P1", "P2", "P3"] },
+          merge: { type: ["array", "null"], minItems: 1, items: { type: "integer", minimum: 0 } },
+          severity: { type: ["string", "null"], enum: ["P0", "P1", "P2", "P3", null] },
           reasonCategory: { type: "string", enum: ["material", "duplicate", "not_material", "report_cap", "unsupported_evidence", "superseded"] },
           reason: { type: "string", minLength: 1 }
         }
@@ -1562,7 +1585,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   private readonly agentStallRetryLimit: number;
 
   constructor(private readonly options: WorkflowTaskRegistryOptions) {
-    this.stateDir = options.stateDir ?? join(options.cwd ?? process.cwd(), '.ultracode-for-codex');
+    this.stateDir = options.stateDir ?? defaultWorkflowStateDir(options.cwd ?? process.cwd());
     this.agentStallRetryLimit = normalizeAgentStallRetryLimit(options.agentStallRetryLimit);
     this.agentStallTimeoutMs = normalizeAgentStallTimeoutMs(
       options.agentStallTimeoutMs,
@@ -1572,7 +1595,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
 
   async launch(input: WorkflowLaunchInput): Promise<WorkflowLaunchResult> {
     if (this.closed) throw workflowInputError('Workflow runtime is closed.');
-    const resumePlan = this.prepareResumePlan(input);
+    const resumePlan = await this.prepareResumePlan(input);
     let resolved = await this.resolveLaunchInput(resumePlan.launchInput);
     const parsed = parseInlineWorkflowScript(resolved.script);
     const scriptHash = workflowScriptHash(resolved.script);
@@ -1674,27 +1697,28 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     };
   }
 
-  private prepareResumePlan(input: WorkflowLaunchInput): WorkflowResumePlan {
+  async validateResumeSource(resumeFromRunId: string): Promise<void> {
+    const runId = normalizeResumeFromRunId(resumeFromRunId);
+    const sourceTask = await this.workflowTaskByRunId(runId);
+    if (!sourceTask) throw workflowInputError(`Unknown workflow run for resume: ${runId}`);
+    if (sourceTask.status === 'running') throw workflowResumeRunningError(runId);
+    await this.createResumeCache(sourceTask);
+  }
+
+  private async prepareResumePlan(input: WorkflowLaunchInput): Promise<WorkflowResumePlan> {
     if (!Object.prototype.hasOwnProperty.call(input, 'resumeFromRunId')) {
       return { launchInput: input };
     }
     const resumeFromRunId = normalizeResumeFromRunId(input.resumeFromRunId);
-    const sourceTask = this.workflowTaskByRunId(resumeFromRunId);
+    const sourceTask = await this.workflowTaskByRunId(resumeFromRunId);
     if (!sourceTask) throw workflowInputError(`Unknown workflow run for resume: ${resumeFromRunId}`);
     if (sourceTask.status === 'running') throw workflowResumeRunningError(resumeFromRunId);
+    if (workflowLaunchHasSourceSelector(input)) {
+      throw workflowInputError('resumeFromRunId cannot be combined with script, scriptPath, or name. Resume uses the original persisted workflow source.');
+    }
     const inheritedArgs = !Object.prototype.hasOwnProperty.call(input, 'args') && sourceTask.retryInput.args !== undefined
       ? { args: sourceTask.retryInput.args }
       : {};
-    if (workflowLaunchHasSourceSelector(input)) {
-      return {
-        sourceTask,
-        launchInput: {
-          ...inheritedArgs,
-          ...input,
-          resumeFromRunId,
-        },
-      };
-    }
     return {
       sourceTask,
       launchInput: {
@@ -1707,20 +1731,58 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     };
   }
 
-  private workflowTaskByRunId(runId: string): WorkflowTaskMutable | undefined {
+  private async workflowTaskByRunId(runId: string): Promise<WorkflowResumeSource | undefined> {
     for (const task of this.tasks.values()) {
       if (task.runId === runId) return task;
     }
-    return undefined;
+    return await this.durableWorkflowResumeSource(runId);
   }
 
-  private async createResumeCache(sourceTask: WorkflowTaskMutable): Promise<WorkflowResumeCache> {
-    let entries: readonly WorkflowJournalEntry[];
+  private async durableWorkflowResumeSource(runId: string): Promise<WorkflowResumeSource | undefined> {
+    const resultPath = join(this.stateDir, 'workflows', `${runId}.result.json`);
+    let record: DurableWorkflowResultRecord | null;
     try {
-      entries = (await readWorkflowJournal(workflowJournalPath(sourceTask.transcriptDir))).entries;
+      record = durableWorkflowResultRecordFromUnknown(JSON.parse(await readFile(resultPath, 'utf8')));
     } catch {
-      throw workflowInputError(`Workflow run cannot be used as a resume source: ${sourceTask.runId}`);
+      return undefined;
     }
+    if (!record || record.runId !== runId || !record.retryInput) return undefined;
+    let scriptRecord: { readonly script: string; readonly scriptPath: string; readonly metadata?: WorkflowScriptMetadata };
+    try {
+      scriptRecord = await this.readRuntimeWorkflowScript(record.retryInput.scriptPath ?? '');
+    } catch {
+      return undefined;
+    }
+    const actualScriptHash = workflowScriptHash(scriptRecord.script);
+    if (actualScriptHash !== record.scriptHash) return undefined;
+    if (scriptRecord.metadata?.scriptHash !== record.scriptHash) return undefined;
+    if (scriptRecord.metadata?.workflowName !== record.workflowName) return undefined;
+    const transcriptDir = join(this.stateDir, 'subagents', 'workflows', runId);
+    let completedJournal: WorkflowCompletedResumeJournal;
+    try {
+      completedJournal = await this.readCompletedResumeJournal({
+        runId,
+        transcriptDir,
+        workflowName: record.workflowName,
+        scriptHash: record.scriptHash,
+      });
+    } catch {
+      return undefined;
+    }
+    if (!durableScriptRecordMatchesJournal(scriptRecord, completedJournal.started)) return undefined;
+    if (!durableRetryInputArgsMatchJournal(record.retryInput, completedJournal.started.args)) return undefined;
+    return {
+      runId,
+      status: 'completed',
+      transcriptDir,
+      retryInput: durableRetryInputWithJournalArgs(record.retryInput, completedJournal.started.args),
+      workflowName: record.workflowName,
+      scriptHash: record.scriptHash,
+    };
+  }
+
+  private async createResumeCache(sourceTask: WorkflowResumeSource): Promise<WorkflowResumeCache> {
+    const { entries } = await this.readCompletedResumeJournal(sourceTask);
     const completedByCallKey = new Map<string, Extract<WorkflowJournalEntry, { kind: 'workflow.agent.completed' }>>();
     for (const entry of entries) {
       if (entry.kind === 'workflow.agent.completed') completedByCallKey.set(entry.agentCallKey, entry);
@@ -1742,6 +1804,37 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       nextIndex: 0,
       prefixOpen: true,
     };
+  }
+
+  private async readCompletedResumeJournal(sourceTask: {
+    readonly runId: string;
+    readonly transcriptDir: string;
+    readonly workflowName?: string;
+    readonly scriptHash?: string;
+  }): Promise<WorkflowCompletedResumeJournal> {
+    let journal: Awaited<ReturnType<typeof readWorkflowJournal>>;
+    try {
+      journal = await readWorkflowJournal(workflowJournalPath(sourceTask.transcriptDir));
+    } catch {
+      throw workflowInputError(`Workflow run cannot be used as a resume source: ${sourceTask.runId}`);
+    }
+    const entries = journal.entries;
+    const started = entries[0];
+    const terminal = entries.at(-1);
+    if (
+      journal.truncatedTail
+      || !started
+      || started.kind !== 'workflow.run.started'
+      || started.runId !== sourceTask.runId
+      || (sourceTask.scriptHash && started.scriptHash !== sourceTask.scriptHash)
+      || (sourceTask.workflowName && started.workflowName !== sourceTask.workflowName)
+      || !terminal
+      || terminal.kind !== 'workflow.run.completed'
+      || terminal.runId !== sourceTask.runId
+    ) {
+      throw workflowInputError(`Workflow run cannot be used as a resume source: ${sourceTask.runId}`);
+    }
+    return { entries, started };
   }
 
   private async resolveLaunchInput(input: WorkflowLaunchInput): Promise<ResolvedWorkflowLaunchInput> {
@@ -2284,6 +2377,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         workflowSource: task.workflowSource,
         ...(task.workflowSourcePath ? { workflowSourcePath: task.workflowSourcePath } : {}),
         scriptHash: task.scriptHash,
+        retryInput: durableWorkflowRetryInput(task.retryInput),
         result: journalResult,
       }, null, 2)}\n`);
       const completedSnapshot = await this.completeTask(ctx, journalResult, {
@@ -3085,6 +3179,9 @@ function normalizeResumeFromRunId(value: unknown): string {
   }
   const runId = value.trim();
   if (!runId) throw workflowInputError('resumeFromRunId must be a non-empty workflow runId string.');
+  if (!/^run_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runId)) {
+    throw workflowInputError('resumeFromRunId must be a workflow runId in run_<uuid> format.');
+  }
   return runId;
 }
 
@@ -3127,13 +3224,17 @@ function takeResumeCacheHit(
 }
 
 async function gitOutput(cwd: string, args: readonly string[]): Promise<string> {
+  return (await gitOutputRaw(cwd, args)).trim();
+}
+
+async function gitOutputRaw(cwd: string, args: readonly string[]): Promise<string> {
   try {
     const result = await execFileAsync('git', args, {
       cwd,
       encoding: 'utf8',
       maxBuffer: 1024 * 1024,
     });
-    return result.stdout.trim();
+    return result.stdout;
   } catch (err) {
     const record = err as { readonly stderr?: unknown; readonly message?: unknown };
     const stderr = typeof record.stderr === 'string' ? record.stderr.trim() : '';
@@ -3144,22 +3245,38 @@ async function gitOutput(cwd: string, args: readonly string[]): Promise<string> 
 
 async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptions): Promise<string> {
   const root = await workspaceContextRoot(cwd);
-  const gitStatus = await gitOutput(root, ['status', '--short', '--untracked-files=all']).catch(() => '');
+  const runtimeStateExcludedPaths = workspaceRuntimeStateExcludedPaths(root);
+  const statusUnavailableEvidence: string[] = [];
+  let gitStatusRaw = '';
+  try {
+    gitStatusRaw = await gitOutputRaw(root, ['status', '--short', '--untracked-files=all', '--', '.']);
+  } catch (err) {
+    statusUnavailableEvidence.push(`unavailable:git-status:${gitFailureToken(err)}`);
+  }
+  const gitStatus = statusUnavailableEvidence.length
+    ? `(unavailable: ${statusUnavailableEvidence[0]})`
+    : formatGitStatusDisplay(gitStatusRaw, runtimeStateExcludedPaths);
+  const gitStatusPaths = await gitOutputRaw(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.']).catch((err) => {
+    statusUnavailableEvidence.push(`unavailable:git-status-raw:${gitFailureToken(err)}`);
+    return gitStatusRaw;
+  });
+  const gitStatusPathParse = parseGitStatusPaths(gitStatusPaths, runtimeStateExcludedPaths);
+  const excludedWorkspacePaths = new Set(gitStatusPathParse.excludedPaths.map(workspacePathKey));
   const reviewEvidence = options.includeDiff
-    ? await buildReviewEvidenceContext(root, gitStatus, options)
+    ? await buildReviewEvidenceContext(root, gitStatusPaths, options, statusUnavailableEvidence, runtimeStateExcludedPaths)
     : undefined;
   const explicitPaths = [
     ...options.files,
     ...extractMentionedWorkspacePaths(options.query ?? ''),
   ];
-  const changedPaths = pathsFromGitStatus(gitStatus);
+  const changedPaths = gitStatusPathParse.paths.filter((path) => shouldIncludeWorkspaceContextPath(path, runtimeStateExcludedPaths));
   const listedPaths = await listWorkspaceContextCandidates(root);
   const candidates = uniqueStrings([
     ...explicitPaths,
     ...changedPaths,
     ...WORKSPACE_CONTEXT_PRIORITY_FILES,
     ...listedPaths,
-  ]).filter(shouldIncludeWorkspaceContextPath);
+  ]).filter((path) => shouldIncludeWorkspaceContextPath(path, runtimeStateExcludedPaths) && !excludedWorkspacePaths.has(workspacePathKey(path)));
   const fileBlocks: string[] = [];
   let usedBytes = 0;
   for (const candidate of candidates) {
@@ -3193,7 +3310,7 @@ async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptio
     ] : []),
     '',
     '### Git Status',
-    gitStatus.trim() ? gitStatus : '(clean or unavailable)',
+    gitStatus,
     '',
     '### Included Files',
     fileBlocks.length ? fileBlocks.join('\n\n') : '(no readable text files selected)',
@@ -3208,6 +3325,12 @@ interface ReviewEvidenceContext {
   readonly text: string;
 }
 
+interface GitStatusPathParse {
+  readonly paths: readonly string[];
+  readonly excludedPaths: readonly string[];
+  readonly unavailableEvidence: readonly string[];
+}
+
 interface BoundedGitText {
   readonly text: string;
   readonly truncated: boolean;
@@ -3217,24 +3340,32 @@ async function buildReviewEvidenceContext(
   root: string,
   gitStatus: string,
   options: WorkspaceContextOptions,
+  initialUnavailableEvidence: readonly string[] = [],
+  runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
 ): Promise<ReviewEvidenceContext> {
-  const unavailableEvidence: string[] = [];
-  const changedPaths = pathsFromGitStatus(gitStatus);
+  const unavailableEvidence: string[] = [...initialUnavailableEvidence];
+  const gitStatusPaths = parseGitStatusPaths(gitStatus, runtimeStateExcludedPaths);
+  const changedPaths = gitStatusPaths.paths.filter((path) => shouldIncludeWorkspaceContextPath(path, runtimeStateExcludedPaths));
+  const excludedDiffPaths = new Set([
+    ...gitStatusPaths.excludedPaths.map(workspacePathKey),
+    ...runtimeStateExcludedPaths,
+  ]);
+  unavailableEvidence.push(...gitStatusPaths.unavailableEvidence);
   const head = await gitOutput(root, ['rev-parse', '--verify', 'HEAD']).catch((err) => {
-    unavailableEvidence.push(`unavailable:git-head:${workflowErrorMessage(err)}`);
+    unavailableEvidence.push(unavailableGitEvidence('git-head', err));
     return 'unavailable';
   });
-  const unstaged = await boundedGitOutput(root, [
+  const unstaged = filterWorkspaceContextDiff(await boundedGitOutput(root, [
     'diff',
     '--no-ext-diff',
     '--patch',
     '--find-renames',
     '--',
   ], options.maxDiffBytes).catch((err) => {
-    unavailableEvidence.push(`unavailable:diff-unstaged:${workflowErrorMessage(err)}`);
+    unavailableEvidence.push(unavailableGitEvidence('diff-unstaged', err));
     return { text: '', truncated: false };
-  });
-  const staged = await boundedGitOutput(root, [
+  }), excludedDiffPaths, runtimeStateExcludedPaths);
+  const staged = filterWorkspaceContextDiff(await boundedGitOutput(root, [
     'diff',
     '--cached',
     '--no-ext-diff',
@@ -3242,19 +3373,19 @@ async function buildReviewEvidenceContext(
     '--find-renames',
     '--',
   ], options.maxDiffBytes).catch((err) => {
-    unavailableEvidence.push(`unavailable:diff-staged:${workflowErrorMessage(err)}`);
+    unavailableEvidence.push(unavailableGitEvidence('diff-staged', err));
     return { text: '', truncated: false };
-  });
+  }), excludedDiffPaths, runtimeStateExcludedPaths);
   let committed: BoundedGitText = { text: '', truncated: false };
   let acceptedDiffBaseRef = '';
   if (options.diffBaseRef) {
     const baseCommit = await gitOutput(root, ['rev-parse', '--verify', `${options.diffBaseRef}^{commit}`]).catch((err) => {
-      unavailableEvidence.push(`unavailable:diff-base:${options.diffBaseRef}:${workflowErrorMessage(err)}`);
+      unavailableEvidence.push(unavailableGitEvidence('diff-base', err, options.diffBaseRef));
       return '';
     });
     if (baseCommit) {
       acceptedDiffBaseRef = options.diffBaseRef;
-      committed = await boundedGitOutput(root, [
+      committed = filterWorkspaceContextDiff(await boundedGitOutput(root, [
         'diff',
         '--no-ext-diff',
         '--patch',
@@ -3262,9 +3393,9 @@ async function buildReviewEvidenceContext(
         `${baseCommit}..HEAD`,
         '--',
       ], options.maxDiffBytes).catch((err) => {
-        unavailableEvidence.push(`unavailable:diff-committed:${options.diffBaseRef}:${workflowErrorMessage(err)}`);
+        unavailableEvidence.push(unavailableGitEvidence('diff-committed', err, options.diffBaseRef));
         return { text: '', truncated: false };
-      });
+      }), excludedDiffPaths, runtimeStateExcludedPaths);
     }
   }
   const diffEvidence = [
@@ -3274,7 +3405,7 @@ async function buildReviewEvidenceContext(
   ] as const;
   const allowedEvidenceRefs = uniqueStrings([
     ...changedPaths.map((path) => `file:${path}`),
-    ...diffEvidence.flatMap((entry) => diffEvidenceRefs(entry.kind, entry.value.text)),
+    ...diffEvidence.flatMap((entry) => diffEvidenceRefs(entry.kind, entry.value.text, runtimeStateExcludedPaths)),
   ]);
   const allowedEvidenceIndexDigest = fullHash(allowedEvidenceRefs.join('\n'));
   const sourceSnapshotId = `git:${head}:${fullHash([
@@ -3295,6 +3426,7 @@ async function buildReviewEvidenceContext(
     acceptedDiffBaseRef,
     truncation,
     allowedEvidenceRefs,
+    unavailableEvidence,
   }));
   const sections = [
     `sourceSnapshotId: ${sourceSnapshotId}`,
@@ -3333,24 +3465,112 @@ async function boundedGitOutput(root: string, args: readonly string[], maxBytes:
   };
 }
 
-function diffEvidenceRefs(kind: string, diff: string): readonly string[] {
+function filterWorkspaceContextDiff(
+  value: BoundedGitText,
+  excludedPaths: ReadonlySet<string>,
+  runtimeStateExcludedPaths: ReadonlySet<string>,
+): BoundedGitText {
+  if (!value.text) return value;
+  return {
+    ...value,
+    text: filterWorkspaceContextDiffText(value.text, excludedPaths, runtimeStateExcludedPaths),
+  };
+}
+
+function filterWorkspaceContextDiffText(
+  text: string,
+  excludedPaths: ReadonlySet<string>,
+  runtimeStateExcludedPaths: ReadonlySet<string>,
+): string {
+  const kept: string[] = [];
+  let block: string[] = [];
+  let includeBlock = true;
+  const flush = (): void => {
+    if (includeBlock && block.length > 0) kept.push(block.join('\n'));
+    block = [];
+  };
+  for (const line of text.split(/\r?\n/)) {
+    if (line.startsWith('diff --git ')) {
+      flush();
+      const header = parseGitDiffHeader(line);
+      includeBlock = header
+        ? workspaceContextDiffPathAllowed(header.oldPath, excludedPaths, runtimeStateExcludedPaths)
+          && workspaceContextDiffPathAllowed(header.newPath, excludedPaths, runtimeStateExcludedPaths)
+        : false;
+    }
+    block.push(line);
+  }
+  flush();
+  return kept.join('\n');
+}
+
+function workspaceContextDiffPathAllowed(
+  path: string,
+  excludedPaths: ReadonlySet<string>,
+  runtimeStateExcludedPaths: ReadonlySet<string>,
+): boolean {
+  if (!path || path === '/dev/null') return true;
+  const key = workspacePathKey(path);
+  return shouldIncludeWorkspaceContextPath(key, runtimeStateExcludedPaths) && !workspacePathExcludedBySet(key, excludedPaths);
+}
+
+function diffEvidenceRefs(
+  kind: string,
+  diff: string,
+  runtimeStateExcludedPaths: ReadonlySet<string>,
+): readonly string[] {
   const refs: string[] = [];
   let currentPath = '';
   let hunkIndex = 0;
   for (const line of diff.split(/\r?\n/)) {
-    const header = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+    const header = parseGitDiffHeader(line);
     if (header) {
-      currentPath = header[2] ?? header[1] ?? '';
+      currentPath = header.newPath || header.oldPath;
       hunkIndex = 0;
-      if (currentPath && currentPath !== '/dev/null') refs.push(`diff:${kind}:${currentPath}`);
+      if (currentPath && currentPath !== '/dev/null' && shouldIncludeWorkspaceContextPath(currentPath, runtimeStateExcludedPaths)) refs.push(`diff:${kind}:${currentPath}`);
       continue;
     }
-    if (currentPath && line.startsWith('@@')) {
+    if (currentPath && shouldIncludeWorkspaceContextPath(currentPath, runtimeStateExcludedPaths) && line.startsWith('@@')) {
       hunkIndex += 1;
       refs.push(`hunk:${kind}:${currentPath}:${hunkIndex}`);
     }
   }
   return refs;
+}
+
+interface GitDiffHeader {
+  readonly oldPath: string;
+  readonly newPath: string;
+}
+
+function parseGitDiffHeader(line: string): GitDiffHeader | undefined {
+  if (!line.startsWith('diff --git ')) return undefined;
+  const first = readGitDiffHeaderToken(line.slice('diff --git '.length));
+  if (!first) return undefined;
+  const second = readGitDiffHeaderToken(first.rest.trimStart());
+  if (!second || second.rest.trim()) return undefined;
+  const oldPath = gitDiffHeaderTokenPath(first.token, 'a/');
+  const newPath = gitDiffHeaderTokenPath(second.token, 'b/');
+  if (oldPath === undefined || newPath === undefined) return undefined;
+  return { oldPath, newPath };
+}
+
+function readGitDiffHeaderToken(value: string): { readonly token: string; readonly rest: string } | undefined {
+  if (!value) return undefined;
+  if (value.startsWith('"')) {
+    const end = gitQuotedPathEnd(value);
+    if (end === -1) return undefined;
+    return { token: value.slice(0, end), rest: value.slice(end) };
+  }
+  const separator = value.indexOf(' ');
+  if (separator === -1) return { token: value, rest: '' };
+  return { token: value.slice(0, separator), rest: value.slice(separator + 1) };
+}
+
+function gitDiffHeaderTokenPath(token: string, prefix: 'a/' | 'b/'): string | undefined {
+  const path = normalizeGitStatusPath(token);
+  if (!path.startsWith(prefix)) return undefined;
+  return path.slice(prefix.length);
 }
 
 function normalizeWorkspaceContextOptions(value: unknown): WorkspaceContextOptions {
@@ -3385,6 +3605,14 @@ async function workspaceContextRoot(cwd: string): Promise<string> {
   } catch {
     return await realpath(cwd).catch(() => resolve(cwd));
   }
+}
+
+function workspaceRuntimeStateExcludedPaths(root: string): ReadonlySet<string> {
+  const stateRoot = resolve(defaultUltracodeStateRoot());
+  const workspaceRoot = resolve(root);
+  if (!pathInsideOrEqual(workspaceRoot, stateRoot)) return EMPTY_WORKSPACE_PATH_EXCLUSIONS;
+  const relativeStateRoot = workspacePathKey(relative(workspaceRoot, stateRoot));
+  return new Set([relativeStateRoot || '.']);
 }
 
 async function listWorkspaceContextCandidates(root: string): Promise<readonly string[]> {
@@ -3429,14 +3657,314 @@ function extractMentionedWorkspacePaths(query: string): readonly string[] {
 }
 
 function pathsFromGitStatus(status: string): readonly string[] {
+  return parseGitStatusPaths(status).paths;
+}
+
+function parseGitStatusPaths(
+  status: string,
+  runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
+): GitStatusPathParse {
+  if (status.includes('\0')) return parseGitStatusPathsZ(status, runtimeStateExcludedPaths);
   const paths: string[] = [];
+  const excludedPaths: string[] = [];
+  const unavailableEvidence: string[] = [];
+  let entryIndex = 0;
   for (const line of status.split(/\r?\n/).filter(Boolean)) {
-    const rawPath = line.length > 3 ? line.slice(3).trim() : line.trim();
+    entryIndex += 1;
+    const match = /^([ MADRCUT?!]{2}) ([\s\S]+)$/.exec(line);
+    if (!match) {
+      unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:unparseable`);
+      continue;
+    }
+    const statusCode = match[1];
+    const rawPath = match[2];
     if (!rawPath) continue;
-    const path = rawPath.includes(' -> ') ? rawPath.split(' -> ').at(-1) ?? rawPath : rawPath;
-    paths.push(path.replace(/^"|"$/g, ''));
+    const renameOrCopy = /[RC]/.test(statusCode);
+    const renameParts = renameOrCopy ? splitGitStatusRename(rawPath) : undefined;
+    if (renameOrCopy && !renameParts) {
+      unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:unsafe-path`);
+      continue;
+    }
+    if (renameParts) {
+      const sourcePath = normalizeGitStatusPath(renameParts.source);
+      if (!isWorkspaceEvidencePathSafe(sourcePath)) {
+        const targetPath = normalizeGitStatusPath(renameParts.target);
+        if (targetPath) excludedPaths.push(targetPath);
+        unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:unsafe-source`);
+        continue;
+      } else if (!shouldExposeWorkspaceStatusPath(sourcePath, runtimeStateExcludedPaths)) {
+        const targetPath = normalizeGitStatusPath(renameParts.target);
+        if (targetPath) excludedPaths.push(targetPath);
+        unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:excluded-source`);
+        continue;
+      }
+    }
+    const selectedPath = renameParts ? renameParts.target : rawPath;
+    const path = normalizeGitStatusPath(selectedPath);
+    if (isWorkspaceEvidencePathSafe(path) && shouldExposeWorkspaceStatusPath(path, runtimeStateExcludedPaths)) paths.push(path);
+    else if (isWorkspaceEvidencePathSafe(path)) excludedPaths.push(path);
+    else unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:${renameParts ? 'unsafe-target' : 'unsafe-path'}`);
   }
-  return paths;
+  return { paths, excludedPaths, unavailableEvidence };
+}
+
+function parseGitStatusPathsZ(
+  status: string,
+  runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
+): GitStatusPathParse {
+  const paths: string[] = [];
+  const excludedPaths: string[] = [];
+  const unavailableEvidence: string[] = [];
+  const entries = status.split('\0').filter((entry) => entry !== '');
+  let entryIndex = 0;
+  for (let index = 0; index < entries.length; index += 1) {
+    entryIndex += 1;
+    const entry = entries[index] ?? '';
+    const match = /^([ MADRCUT?!]{2}) ([\s\S]+)$/.exec(entry);
+    const statusCode = match?.[1] ?? '';
+    const path = match?.[2] ?? '';
+    const renameOrCopy = /[RC]/.test(statusCode);
+    let excludedBySource = false;
+    if (renameOrCopy) {
+      const sourcePath = entries[index + 1];
+      if (sourcePath === undefined) unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:missing-source`);
+      else if (!isWorkspaceEvidencePathSafe(sourcePath)) {
+        unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:unsafe-source`);
+        excludedBySource = true;
+      }
+      else if (!shouldExposeWorkspaceStatusPath(sourcePath, runtimeStateExcludedPaths)) {
+        unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:excluded-source`);
+        excludedBySource = true;
+      }
+    }
+    if (isWorkspaceEvidencePathSafe(path) && shouldExposeWorkspaceStatusPath(path, runtimeStateExcludedPaths) && !excludedBySource) paths.push(path);
+    else if (isWorkspaceEvidencePathSafe(path)) excludedPaths.push(path);
+    else unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:${renameOrCopy ? 'unsafe-target' : 'unsafe-path'}`);
+    if (renameOrCopy) {
+      index += 1;
+    }
+  }
+  return { paths, excludedPaths, unavailableEvidence };
+}
+
+function formatGitStatusDisplay(
+  status: string,
+  runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
+): string {
+  if (!status.trim()) return '(clean or unavailable)';
+  if (status.includes('\0')) return formatGitStatusZDisplay(status, runtimeStateExcludedPaths);
+  const lines: string[] = [];
+  let entryIndex = 0;
+  for (const line of status.split(/\r?\n/).filter(Boolean)) {
+    entryIndex += 1;
+    const match = /^([ MADRCUT?!]{2}) ([\s\S]+)$/.exec(line);
+    if (!match) {
+      lines.push(`${entryIndex}: <unparseable status omitted>`);
+      continue;
+    }
+    const statusCode = match[1];
+    const rawPath = match[2];
+    const renameOrCopy = /[RC]/.test(statusCode);
+    if (renameOrCopy) {
+      const renameParts = splitGitStatusRename(rawPath);
+      if (!renameParts) {
+        lines.push(`${statusCode} <unsafe rename omitted>`);
+        continue;
+      }
+      const sourcePath = normalizeGitStatusPath(renameParts.source);
+      const targetPath = normalizeGitStatusPath(renameParts.target);
+      if (
+        (isWorkspaceEvidencePathSafe(sourcePath) && !shouldExposeWorkspaceStatusPath(sourcePath, runtimeStateExcludedPaths))
+        || (isWorkspaceEvidencePathSafe(targetPath) && !shouldExposeWorkspaceStatusPath(targetPath, runtimeStateExcludedPaths))
+      ) {
+        lines.push(`${statusCode} <excluded rename omitted>`);
+        continue;
+      }
+      lines.push(`${statusCode} ${formatGitStatusPathForDisplay(sourcePath, 'source', runtimeStateExcludedPaths)} -> ${formatGitStatusPathForDisplay(targetPath, 'target', runtimeStateExcludedPaths)}`);
+      continue;
+    }
+    const path = normalizeGitStatusPath(rawPath);
+    lines.push(`${statusCode} ${formatGitStatusPathForDisplay(path, 'path', runtimeStateExcludedPaths)}`);
+  }
+  return lines.length ? lines.join('\n') : '(clean or unavailable)';
+}
+
+function formatGitStatusZDisplay(
+  status: string,
+  runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
+): string {
+  const lines: string[] = [];
+  const entries = status.split('\0').filter((entry) => entry !== '');
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index] ?? '';
+    const match = /^([ MADRCUT?!]{2}) ([\s\S]+)$/.exec(entry);
+    if (!match) {
+      lines.push(`${index + 1}: <unparseable status omitted>`);
+      continue;
+    }
+    const statusCode = match[1];
+    const path = match[2];
+    const renameOrCopy = /[RC]/.test(statusCode);
+    if (renameOrCopy) {
+      const sourcePath = entries[index + 1] ?? '';
+      if (
+        (isWorkspaceEvidencePathSafe(sourcePath) && !shouldExposeWorkspaceStatusPath(sourcePath, runtimeStateExcludedPaths))
+        || (isWorkspaceEvidencePathSafe(path) && !shouldExposeWorkspaceStatusPath(path, runtimeStateExcludedPaths))
+      ) {
+        lines.push(`${statusCode} <excluded rename omitted>`);
+        index += 1;
+        continue;
+      }
+      lines.push(`${statusCode} ${formatGitStatusPathForDisplay(sourcePath, 'source', runtimeStateExcludedPaths)} -> ${formatGitStatusPathForDisplay(path, 'target', runtimeStateExcludedPaths)}`);
+      index += 1;
+      continue;
+    }
+    lines.push(`${statusCode} ${formatGitStatusPathForDisplay(path, 'path', runtimeStateExcludedPaths)}`);
+  }
+  return lines.length ? lines.join('\n') : '(clean or unavailable)';
+}
+
+function formatGitStatusPathForDisplay(
+  path: string,
+  label: 'path' | 'source' | 'target',
+  runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
+): string {
+  if (!isWorkspaceEvidencePathSafe(path)) return `<unsafe ${label} omitted>`;
+  if (!shouldExposeWorkspaceStatusPath(path, runtimeStateExcludedPaths)) return `<excluded ${label} omitted>`;
+  if (/^\s|\s$| -> /.test(path)) return JSON.stringify(path);
+  return path;
+}
+
+function isWorkspaceEvidencePathSafe(path: string): boolean {
+  return path !== '' && !/[\uFFFD\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(path);
+}
+
+interface GitStatusRenameParts {
+  readonly source: string;
+  readonly target: string;
+}
+
+function splitGitStatusRename(rawPath: string): GitStatusRenameParts | undefined {
+  const separator = gitStatusRenameSeparator(rawPath);
+  if (separator === -1) return undefined;
+  return {
+    source: rawPath.slice(0, separator),
+    target: rawPath.slice(separator + 4),
+  };
+}
+
+function gitStatusRenameSeparator(value: string): number {
+  let separator = -1;
+  let inQuote = false;
+  let escaped = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (inQuote) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (char === '"') inQuote = false;
+      continue;
+    }
+    if (char === '"') {
+      inQuote = true;
+      continue;
+    }
+    if (value.startsWith(' -> ', index)) {
+      if (separator !== -1) return -1;
+      separator = index;
+      index += 3;
+    }
+  }
+  return inQuote ? -1 : separator;
+}
+
+function gitFailureToken(err: unknown): string {
+  const record = err as { readonly code?: unknown; readonly signal?: unknown };
+  if (typeof record.signal === 'string' && record.signal) return 'signal';
+  if (typeof record.code === 'number') return `exit-${record.code}`;
+  return 'failed';
+}
+
+function unavailableGitEvidence(kind: string, err: unknown, detail?: string): string {
+  const safeDetail = detail && /^[A-Za-z0-9._/@+-]{1,160}$/.test(detail) ? `:${detail}` : '';
+  return `unavailable:${kind}${safeDetail}:${gitFailureToken(err)}`;
+}
+
+function gitQuotedPathEnd(value: string): number {
+  let escaped = false;
+  for (let index = 1; index < value.length; index += 1) {
+    const char = value[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') return index + 1;
+  }
+  return -1;
+}
+
+function normalizeGitStatusPath(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('"') || !trimmed.endsWith('"')) return value;
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (typeof parsed === 'string') return parsed;
+  } catch {
+    return decodeGitQuotedPath(trimmed);
+  }
+  return decodeGitQuotedPath(trimmed);
+}
+
+function decodeGitQuotedPath(value: string): string {
+  const body = value.slice(1, -1);
+  let out = '';
+  let bytes: number[] = [];
+  const flushBytes = (): void => {
+    if (bytes.length === 0) return;
+    out += Buffer.from(bytes).toString('utf8');
+    bytes = [];
+  };
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index] ?? '';
+    if (char !== '\\') {
+      flushBytes();
+      out += char;
+      continue;
+    }
+    const next = body[index + 1] ?? '';
+    if (/[0-7]/.test(next)) {
+      let octal = next;
+      index += 1;
+      for (let count = 0; count < 2 && /[0-7]/.test(body[index + 1] ?? ''); count += 1) {
+        index += 1;
+        octal += body[index] ?? '';
+      }
+      bytes.push(Number.parseInt(octal, 8));
+      continue;
+    }
+    flushBytes();
+    index += 1;
+    if (next === 'n') out += '\n';
+    else if (next === 't') out += '\t';
+    else if (next === 'r') out += '\r';
+    else if (next === 'b') out += '\b';
+    else if (next === 'f') out += '\f';
+    else if (next === 'v') out += '\v';
+    else if (next === 'a') out += '\x07';
+    else out += next;
+  }
+  flushBytes();
+  return out;
 }
 
 async function workspaceContextFileBlock(root: string, requestedPath: string, maxFileBytes: number): Promise<string | null> {
@@ -3468,9 +3996,13 @@ async function resolveWorkspaceContextPath(
   };
 }
 
-function shouldIncludeWorkspaceContextPath(path: string): boolean {
+function shouldIncludeWorkspaceContextPath(
+  path: string,
+  runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
+): boolean {
   const normalized = path.replaceAll('\\', '/').replace(/^\.\/+/, '');
   if (!normalized || normalized.startsWith('../') || normalized.includes('/../')) return false;
+  if (workspacePathExcludedBySet(normalized, runtimeStateExcludedPaths)) return false;
   const parts = normalized.split('/');
   if (parts.some((part) => WORKSPACE_CONTEXT_EXCLUDED_DIRS.has(part))) return false;
   const name = parts.at(-1) ?? '';
@@ -3478,6 +4010,30 @@ function shouldIncludeWorkspaceContextPath(path: string): boolean {
   const dot = name.lastIndexOf('.');
   if (dot < 0) return false;
   return WORKSPACE_CONTEXT_ALLOWED_EXTENSIONS.has(name.slice(dot).toLowerCase());
+}
+
+function shouldExposeWorkspaceStatusPath(
+  path: string,
+  runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
+): boolean {
+  const normalized = workspacePathKey(path);
+  if (!normalized || normalized.startsWith('../') || normalized.includes('/../')) return false;
+  if (workspacePathExcludedBySet(normalized, runtimeStateExcludedPaths)) return false;
+  return !normalized.split('/').some((part) => WORKSPACE_CONTEXT_EXCLUDED_DIRS.has(part));
+}
+
+function workspacePathKey(path: string): string {
+  return path.replaceAll('\\', '/').replace(/^\.\/+/, '');
+}
+
+function workspacePathExcludedBySet(path: string, excludedPaths: ReadonlySet<string>): boolean {
+  const key = workspacePathKey(path);
+  if (excludedPaths.has('.')) return true;
+  for (const excludedPath of excludedPaths) {
+    if (!excludedPath || excludedPath === '.') continue;
+    if (key === excludedPath || key.startsWith(`${excludedPath}/`)) return true;
+  }
+  return false;
 }
 
 function numberWorkspaceContextLines(text: string): string {
@@ -4171,6 +4727,63 @@ function workflowScriptMetadataFromUnknown(value: unknown): WorkflowScriptMetada
     ...(typeof record.workflowSourcePath === 'string' ? { workflowSourcePath: record.workflowSourcePath } : {}),
     scriptHash: record.scriptHash,
     ...(typeof record.permissionKey === 'string' ? { permissionKey: record.permissionKey } : {}),
+  };
+}
+
+function durableWorkflowRetryInput(input: WorkflowLaunchInput): WorkflowLaunchInput {
+  const scriptPath = typeof input.scriptPath === 'string' ? input.scriptPath : '';
+  if (!scriptPath) throw workflowInputError('Workflow result resume input requires a persisted scriptPath.');
+  return {
+    scriptPath,
+    ...(input.args !== undefined ? { args: journalJsonValueOrInputError(input.args, 'workflow args') } : {}),
+    ...(typeof input.toolName === 'string' && input.toolName ? { toolName: input.toolName } : {}),
+  };
+}
+
+function durableWorkflowResultRecordFromUnknown(value: unknown): DurableWorkflowResultRecord | null {
+  const record = asRecord(value);
+  if (!record || typeof record.runId !== 'string' || !record.runId.trim()) return null;
+  if (typeof record.workflowName !== 'string' || !record.workflowName.trim()) return null;
+  if (typeof record.scriptHash !== 'string' || !record.scriptHash.startsWith('sha256:')) return null;
+  const retryInput = durableWorkflowRetryInputFromUnknown(record.retryInput);
+  return {
+    runId: record.runId,
+    workflowName: record.workflowName,
+    scriptHash: record.scriptHash,
+    ...(retryInput ? { retryInput } : {}),
+  };
+}
+
+function durableWorkflowRetryInputFromUnknown(value: unknown): WorkflowLaunchInput | null {
+  const record = asRecord(value);
+  if (!record || typeof record.scriptPath !== 'string' || !record.scriptPath.trim()) return null;
+  return {
+    scriptPath: record.scriptPath.trim(),
+    ...(record.args !== undefined ? { args: normalizeJournalJsonValue(record.args, 'workflow args') } : {}),
+    ...(typeof record.toolName === 'string' && record.toolName.trim() ? { toolName: record.toolName.trim() } : {}),
+  };
+}
+
+function durableScriptRecordMatchesJournal(
+  scriptRecord: { readonly scriptPath: string; readonly metadata?: WorkflowScriptMetadata },
+  started: Extract<WorkflowJournalEntry, { readonly kind: 'workflow.run.started' }>,
+): boolean {
+  const metadata = scriptRecord.metadata;
+  return scriptRecord.scriptPath === started.scriptPath
+    && metadata !== undefined
+    && metadata.workflowSource === started.workflowSource
+    && metadata.workflowSourcePath === started.workflowSourcePath;
+}
+
+function durableRetryInputArgsMatchJournal(input: WorkflowLaunchInput, journalArgs: JsonValue): boolean {
+  if (!Object.prototype.hasOwnProperty.call(input, 'args')) return true;
+  return stableJson(input.args) === stableJson(journalArgs);
+}
+
+function durableRetryInputWithJournalArgs(input: WorkflowLaunchInput, journalArgs: JsonValue): WorkflowLaunchInput {
+  return {
+    ...input,
+    args: journalArgs,
   };
 }
 

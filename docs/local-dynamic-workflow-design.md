@@ -38,7 +38,8 @@ Status as of 2026-06-23:
 - `workspaceContext({ includeDiff: true })` now emits bounded review evidence,
   source snapshot metadata, context hashes, and allowed evidence refs.
 - Dynamic verifier agents use explicit logical keys via `agent(..., { key })`,
-  and same-session resume can reuse logical-keyed results after dynamic reorder.
+  and completed runs can reuse logical-keyed results across CLI process
+  boundaries when preserved runtime call keys still match.
 - Built-in `task` remains the generic phase planner.
 - Built-in `code-review` now uses the specialized Evidence -> Scope -> Find ->
   Verify -> optional Sweep -> Synthesize harness.
@@ -55,11 +56,11 @@ Status as of 2026-06-23:
 | Workflow launch | `src/runtime/workflow-runtime.ts` accepts inline scripts, named workflows, runtime `scriptPath`, and `args`. No launch document is required. | Preserve prompt-first launch as an explicit invariant and avoid requiring design documents or review reports in built-ins. |
 | Workflow VM | Scripts use pure-literal `meta`, run in a hardened VM, disable host globals, reject nondeterministic APIs, persist scripts, and expose `agent`, `parallel`, `pipeline`, `hash`, `workspaceContext`, `announcePlan`, `announcePhasePlan`, `phase`, and `log`. | Keep documentation and tests aligned around item-preserving pipeline semantics, phase grouping, runtime-owned hashes, and dynamic phase plans. |
 | Structured output | `agent(..., { schema })` requires a `StructuredOutput` tool call and runtime-validates JSON Schema with unknown-field rejection when `additionalProperties: false` is present. Built-in `code-review` uses schemas for scope, finder candidates, verifier verdicts, and synthesis decisions. Installed E2E covers these schemas through the shipped package path. | Optional backlog only: add wider package fixtures if future schema variants are introduced. |
-| Review evidence | `workspaceContext({ includeDiff: true })` returns git status, selected current files, bounded staged/unstaged/committed diffs, source snapshot id, context hash, allowed evidence refs, and unavailable evidence notes. Codex subagents can read files and list directories, but shell/git tools are disabled. | Optional backlog: add installed E2E around truncation and deleted files beyond the current source-level runtime tests. |
+| Review evidence | `workspaceContext({ includeDiff: true })` returns git status, selected current files, bounded staged/unstaged/committed diffs, source snapshot id, context hash, allowed evidence refs, unavailable evidence notes, and truncation metadata. Codex subagents can read files and list directories, but shell/git tools are disabled. Installed E2E covers truncation, deleted files, unavailable diff base refs, and invalid candidate evidence. | Optional backlog: add broader removed-hunk fixtures if future review evidence shapes expand. |
 | Parallel execution | `parallel()` and `pipeline()` both use `MAX_PARALLELISM = 16`. `pipeline()` processes each original item through all stages and does not flatten arrays returned by a stage. | Keep this item-preserving contract explicit. Built-in review must not assume `pipeline()` is `flatMap`; it must create candidate envelopes before candidate verification. |
 | Built-in workflows | `task` remains the generic phase planner. `code-review` uses a specialized Evidence -> Scope -> Find -> Verify -> optional Sweep -> Synthesize harness with dynamic lenses and candidate-scoped verifiers. | Optional backlog: dogfood the review workflow against a larger real repository after publish. |
 | Progress | Runtime emits plan, phase plan, phase start, agent start/completion/failure, completion, and failure events. Agent completion includes elapsed and known-count fields. CLI projects those events to JSONL or plain progress. Built-in `code-review` assigns explicit phases to dynamic finder, verifier, sweep, and synthesis agents, and the final summary expands dynamic verifier labels. | Optional backlog: tune additional visual profiles after more real runs. |
-| Persistence | Journal, result files, resume/cache, permission records, background files, and preserved worktrees are runtime-owned. Agent cache keys support prefix-ordered hits and logical-keyed hits for dynamic verifier reuse after reorder. | Optional backlog: add package-level cross-process resume/cache E2E after a durable public resume contract is designed. |
+| Persistence | Journal, result files, resume/cache, permission records, background files, and preserved worktrees are runtime-owned. Agent cache keys support prefix-ordered hits and logical-keyed hits for dynamic verifier reuse after reorder. Completed result records preserve the runtime-owned retry input needed for `--resume-from-run-id`, and installed E2E covers cross-process `code-review` resume/cache. | Optional backlog: harden resume UX after more real background runs. |
 | Native skill | `skills/ultracode-for-codex/SKILL.md` keeps the main Codex context as orchestrator and defaults to phase-wise parallel work. The CLI skill documents the explicit local runtime path. | Keep future docs behavior-first and avoid exposing internal CLI vocabulary as the default native command contract. |
 
 ## Optional Backlog
@@ -67,19 +68,14 @@ Status as of 2026-06-23:
 These items are useful quality extensions, but they are not required for the
 current local dynamic workflow release:
 
-- Cross-process `code-review` resume/cache E2E. Current tests cover logical
-  keys and same-session dynamic reorder reuse. A durable cross-process contract
-  should be designed before exposing or testing resume as a package-level
-  public behavior.
-- Broader installed review-evidence fixtures. Source-level tests cover
-  deterministic review evidence and invalid refs. Package-level fixtures can be
-  expanded later for large truncation cases, deleted files, and removed hunks.
 - Real Codex app-server dogfood run. This is valuable as a manual quality
   signal, but it depends on the live Codex environment and should not replace
   deterministic fake app-server E2E gates.
 - Multi-perspective semantic review. Parallel LLM review can improve judgment
   quality before publish, while deterministic schema, evidence, package, and
   runtime-boundary tests remain the release gate.
+- Resume UX and evidence-shape hardening. Future real runs may justify clearer
+  background resume affordances or broader removed-hunk package fixtures.
 
 ## Design Principles
 
@@ -164,7 +160,7 @@ Existing support to preserve:
   TypeScript syntax rejection;
 - JSON-serializable `args` and `budget`;
 - agent cap, parallelism cap, and stall retry policy;
-- hash-chained journal and same-session resume/cache.
+- hash-chained journal and local completed-run resume/cache.
 
 Required refinements:
 
@@ -330,21 +326,21 @@ Scope schema:
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["files", "summary", "lensDecisions", "lenses"],
+  "required": ["files", "summary", "instructions", "lensDecisions", "lenses"],
   "properties": {
     "files": { "type": "array", "items": { "type": "string" } },
     "summary": { "type": "string" },
-    "instructions": { "type": "string" },
+    "instructions": { "type": ["string", "null"] },
     "lensDecisions": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["seedId", "action", "reasonCategory", "decisionRefs", "reason"],
+        "required": ["seedId", "action", "selectedLensId", "reasonCategory", "decisionRefs", "reason"],
         "properties": {
           "seedId": { "type": "string" },
           "action": { "type": "string", "enum": ["select", "skip"] },
-          "selectedLensId": { "type": "string" },
+          "selectedLensId": { "type": ["string", "null"] },
           "reasonCategory": { "type": "string", "enum": ["matched_change", "prompt_risk", "no_evidence", "cap_limit", "redundant", "out_of_scope", "tiny_change"] },
           "decisionRefs": { "type": "array", "minItems": 1, "items": { "type": "string" } },
           "reason": { "type": "string" }
@@ -432,14 +428,14 @@ Finder schema:
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["file", "summary", "failureScenario", "evidenceRefs"],
+        "required": ["file", "line", "summary", "failureScenario", "evidenceRefs", "kind"],
         "properties": {
           "file": { "type": "string" },
-          "line": { "type": "integer" },
+          "line": { "type": ["integer", "null"] },
           "summary": { "type": "string" },
           "failureScenario": { "type": "string" },
           "evidenceRefs": { "type": "array", "minItems": 1, "items": { "type": "string" } },
-          "kind": { "type": "string" }
+          "kind": { "type": ["string", "null"] }
         }
       }
     }
@@ -453,12 +449,12 @@ Verifier schema:
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "evidence", "evidenceRefs"],
+  "required": ["verdict", "evidence", "evidenceRefs", "severity"],
   "properties": {
     "verdict": { "type": "string", "enum": ["CONFIRMED", "PLAUSIBLE", "REFUTED"] },
     "evidence": { "type": "string" },
     "evidenceRefs": { "type": "array", "minItems": 1, "items": { "type": "string" } },
-    "severity": { "type": "string", "enum": ["P0", "P1", "P2", "P3"] }
+    "severity": { "type": ["string", "null"], "enum": ["P0", "P1", "P2", "P3", null] }
   }
 }
 ```
@@ -532,12 +528,12 @@ Use a synthesis agent with a bounded decision schema:
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["index", "action", "reasonCategory", "reason"],
+        "required": ["index", "action", "merge", "severity", "reasonCategory", "reason"],
         "properties": {
           "index": { "type": "integer" },
           "action": { "type": "string", "enum": ["report", "merge", "drop"] },
-          "merge": { "type": "array", "minItems": 1, "items": { "type": "integer" } },
-          "severity": { "type": "string", "enum": ["P0", "P1", "P2", "P3"] },
+          "merge": { "type": ["array", "null"], "minItems": 1, "items": { "type": "integer" } },
+          "severity": { "type": ["string", "null"], "enum": ["P0", "P1", "P2", "P3", null] },
           "reasonCategory": { "type": "string", "enum": ["material", "duplicate", "not_material", "report_cap", "unsupported_evidence", "superseded"] },
           "reason": { "type": "string" }
         }

@@ -27,6 +27,8 @@ test('CLI parser supports run options', () => {
     'jsonl',
     '--execution',
     'attached',
+    '--resume-from-run-id',
+    'run_12345678-1234-4234-9234-123456789abc',
   ]);
 
   assert.equal(options.acceptLlmGuide, 'v1');
@@ -42,5 +44,6 @@ test('CLI parser supports run options', () => {
   assert.equal(options.verbosity, 'high');
   assert.equal(options.progress, 'jsonl');
   assert.equal(options.execution, 'attached');
+  assert.equal(options.resumeFromRunId, 'run_12345678-1234-4234-9234-123456789abc');
   assert.deepEqual(options._, []);
 });

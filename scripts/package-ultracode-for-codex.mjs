@@ -199,6 +199,7 @@ async function validateExtractedPackage(packageDir) {
       'The default `$ultracode-for-codex` skill is Codex-native',
       'dynamic lenses',
       'candidate verification',
+      '--resume-from-run-id',
       'npm run pack:ultracode-for-codex',
     ],
   });
