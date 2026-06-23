@@ -1,13 +1,13 @@
 # Provenance Audit
 
-Date: 2026-06-22
+Date: 2026-06-23
 
 ## Scope
 
 This audit checked:
 
 - tracked repository files;
-- generated npm package contents for `ultracode-for-codex@0.3.3`;
+- generated npm package contents for `ultracode-for-codex@0.3.4`;
 - the locally installed companion Codex skill.
 
 Generated build output and package tarballs were checked as projections of the
@@ -23,7 +23,7 @@ License transition completed:
 
 - Apache-2.0 `LICENSE` file is present;
 - `package.json` and `package-lock.json` declare `Apache-2.0`;
-- audited package metadata version is `0.3.3`;
+- audited package metadata version is `0.3.4`;
 - npm publish state is verified separately during release preparation.
 
 ## Evidence
