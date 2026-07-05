@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { CodexSubagentBackend } from './codex/subagent-backend.js';
 import { WorkflowTaskRegistry } from './runtime/workflow-runtime.js';
-import { UltracodeRequestError } from './runtime/types.js';
+import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError } from './runtime/types.js';
 import { ultracodePackageVersion } from './runtime/package-info.js';
 import { defaultUltracodeStateRoot, resolveUltracodeStatePath } from './runtime/state-root.js';
 import { renderUltracodeInstallGuideNotice } from './ultracode-install-guide.js';
@@ -95,6 +95,9 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   const cwd = options.cwd ?? process.cwd();
   const executionMode = parseExecutionMode(options.execution);
   const inputPromise = workflowLaunchInputFromOptions(options);
+  if (options.validate !== undefined) {
+    return await validateWorkflowCommand(await inputPromise, cwd, options);
+  }
   if (executionMode === 'background') {
     const input = await inputPromise;
     if (input.resumeFromRunId) await assertBackgroundResumeSource(cwd, input.resumeFromRunId);
@@ -105,10 +108,13 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   const permissionPolicy = parsePermissionPolicy(options.permission);
   const progressMode = parseProgressMode(options.progress);
   const input = await inputPromise;
+  const resumeModel = input.resumeFromRunId && !options.model
+    ? await resolveResumeBackendModel(cwd, input.resumeFromRunId)
+    : undefined;
   const backend = new CodexSubagentBackend({
     command: options.command,
     cwd,
-    model: options.model,
+    model: options.model ?? resumeModel,
     timeoutMs,
     reasoningEffort: parseReasoningEffort(options.reasoningEffort),
     verbosity: parseVerbosity(options.verbosity),
@@ -150,24 +156,60 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   }
 }
 
-async function assertBackgroundResumeSource(cwd: string, runId: string): Promise<void> {
+async function withPreflightRegistry<T>(
+  cwd: string,
+  fn: (runtime: WorkflowTaskRegistry) => Promise<T>,
+): Promise<T> {
   const runtime = new WorkflowTaskRegistry({
-    backend: RESUME_PREFLIGHT_BACKEND,
+    backend: PREFLIGHT_BACKEND,
     cwd,
     requestTimeoutMs: 0,
   });
   try {
-    await runtime.validateResumeSource(runId);
+    return await fn(runtime);
   } finally {
     await runtime.close();
   }
 }
 
-const RESUME_PREFLIGHT_BACKEND = {
-  name: 'resume-preflight',
-  model: 'resume-preflight',
+async function validateWorkflowCommand(
+  input: Awaited<ReturnType<typeof workflowLaunchInputFromOptions>>,
+  cwd: string,
+  options: ParsedOptions,
+): Promise<number> {
+  const report = await withPreflightRegistry(cwd, (runtime) => runtime.validateWorkflowInput(input));
+  if (wantsPlain(options)) {
+    process.stdout.write(`[validate] ${report.workflowName} (${report.workflowSource}) agents=${report.agentCallSites} schema=${report.schemaCallSites} keyed=${report.keyedCallSites}\n`);
+    for (const warning of report.warnings) {
+      process.stdout.write(`[validate] warning: ${warning}\n`);
+    }
+  } else {
+    process.stdout.write(`${JSON.stringify({
+      kind: 'ultracode.workflow.validate',
+      version: 1,
+      status: 'valid',
+      ...report,
+    }, null, 2)}\n`);
+  }
+  return 0;
+}
+
+async function assertBackgroundResumeSource(cwd: string, runId: string): Promise<void> {
+  await withPreflightRegistry(cwd, (runtime) => runtime.validateResumeSource(runId));
+}
+
+async function resolveResumeBackendModel(cwd: string, runId: string): Promise<string | undefined> {
+  const info = await withPreflightRegistry(cwd, (runtime) => runtime.resumeSourceInfo(runId));
+  // An absent model means the source run had no run-level model configured,
+  // so there is nothing to adopt.
+  return info.model && info.model !== SUBAGENT_MODEL_PLACEHOLDER ? info.model : undefined;
+}
+
+const PREFLIGHT_BACKEND = {
+  name: 'preflight',
+  model: 'preflight',
   async generate(): Promise<never> {
-    throw new Error('Resume preflight must not run subagents.');
+    throw new Error('Preflight must not run subagents.');
   },
   async close(): Promise<void> {},
 };
@@ -190,6 +232,7 @@ interface ParsedOptions {
   readonly scriptPath?: string;
   readonly name?: string;
   readonly resumeFromRunId?: string;
+  readonly validate?: string;
   readonly permission?: string;
   readonly retryLimit?: string;
   readonly jobId?: string;
@@ -209,6 +252,8 @@ interface ParsedOptions {
   readonly outputPath?: string;
 }
 
+const VALUELESS_FLAGS = new Set(['plain', 'result', 'wait', 'validate']);
+
 export function parseOptions(args: readonly string[]): ParsedOptions {
   const out: Record<string, string | string[]> = { _: [] };
   for (let i = 0; i < args.length; i += 1) {
@@ -221,12 +266,18 @@ export function parseOptions(args: readonly string[]): ParsedOptions {
     const rawKey = arg.slice(2, eq === -1 ? undefined : eq);
     const key = rawKey.replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
     const value = eq === -1 ? args[i + 1] : arg.slice(eq + 1);
-    if (eq === -1 && (value === undefined || value.startsWith('--'))) {
+    if (eq === -1 && (VALUELESS_FLAGS.has(key) || value === undefined || value.startsWith('--'))) {
       out[key] = 'true';
       continue;
     }
     if (eq === -1) i += 1;
     out[key] = value ?? '';
+  }
+  if (typeof out.cwd === 'string' && out.cwd) {
+    // Workflow state is partitioned by the exact working directory, and
+    // background metadata replays this value as the recovery anchor, so a
+    // relative --cwd must be pinned to an absolute path immediately.
+    out.cwd = resolve(out.cwd);
   }
   return out as unknown as ParsedOptions;
 }
@@ -240,10 +291,10 @@ async function launchBackgroundWorkflow(args: readonly string[], cwd: string): P
   const metadataPath = join(runDir, settings.metadataFile);
   const pidPath = join(runDir, settings.pidFile);
   assertDistinctBackgroundPaths([resultPath, progressPath, metadataPath, pidPath]);
-  await mkdir(runDir, { recursive: true });
+  await mkdir(runDir, { recursive: true, mode: 0o700 });
 
-  const stdout = await open(resultPath, 'w');
-  const stderr = await open(progressPath, 'w');
+  const stdout = await open(resultPath, 'w', 0o600);
+  const stderr = await open(progressPath, 'w', 0o600);
   const entryPath = cliEntryPath();
   let childPid = 0;
   try {
@@ -253,6 +304,11 @@ async function launchBackgroundWorkflow(args: readonly string[], cwd: string): P
       ...args,
       '--execution',
       'attached',
+      // The background progress file is machine state for status/jobs/resume
+      // anchors; force JSONL regardless of the caller's display preference
+      // (logs --plain still renders human-readable lines from it).
+      '--progress',
+      'jsonl',
     ], {
       cwd: process.cwd(),
       detached: true,
@@ -266,7 +322,7 @@ async function launchBackgroundWorkflow(args: readonly string[], cwd: string): P
   }
 
   const launchedAt = new Date().toISOString();
-  await writeFile(pidPath, `${childPid}\n`);
+  await writeFile(pidPath, `${childPid}\n`, { mode: 0o600 });
   await writeFile(metadataPath, `${JSON.stringify({
     kind: 'ultracode.workflow.background',
     version: 1,
@@ -282,7 +338,7 @@ async function launchBackgroundWorkflow(args: readonly string[], cwd: string): P
     nodePath: process.execPath,
     cliEntryPath: entryPath,
     commandLineHint: `${process.execPath} ${entryPath} run`,
-  }, null, 2)}\n`);
+  }, null, 2)}\n`, { mode: 0o600 });
   process.stdout.write(`${JSON.stringify({
     kind: 'ultracode.workflow.background',
     version: 1,
@@ -334,6 +390,7 @@ interface BackgroundJobStatus {
   readonly version: 1;
   readonly status: 'running' | 'completed' | 'failed' | 'exited_unknown';
   readonly jobId?: string;
+  readonly runId?: string;
   readonly pid?: number;
   readonly alive: boolean;
   readonly launchedAt?: string;
@@ -591,17 +648,21 @@ async function inspectBackgroundJob(options: ParsedOptions): Promise<BackgroundJ
   const resultReady = Boolean(resultText?.trim());
   const statusEvents = progress.events.filter((event) => !isPostCompletionGuidanceEvent(event));
   const lastEvent = statusEvents.at(-1);
-  const terminalEvent = [...statusEvents].reverse().find((event) => (
-    event.event === 'workflow.completed'
-    || event.event === 'workflow.failed'
-    || event.event === 'workflow.terminal_failure'
-  ));
+  // A terminal event counts only while it is the newest status event: an
+  // in-process retry appends new events after a failed attempt's terminal
+  // record, and that job is running again, not terminally failed.
+  const terminalEvent = lastEvent && (
+    lastEvent.event === 'workflow.completed'
+    || lastEvent.event === 'workflow.failed'
+    || lastEvent.event === 'workflow.terminal_failure'
+  ) ? lastEvent : undefined;
   const status = backgroundStatusFrom({ terminalEvent, resultReady, alive });
   return {
     kind: 'ultracode.workflow.background.status',
     version: 1,
     status,
     jobId: metadata.jobId ?? ref.jobId,
+    runId: lastStringField(progress.events, 'runId'),
     pid,
     alive,
     launchedAt: metadata.launchedAt,
@@ -908,8 +969,10 @@ function renderBackgroundStatusPlain(status: BackgroundJobStatus & {
 }): string {
   const parts = [
     `[job] ${status.jobId ?? 'unknown'} ${status.status}`,
+    status.runId ? `run=${status.runId}` : '',
     status.pid !== undefined ? `pid=${status.pid}` : '',
     `alive=${status.alive}`,
+    `cwd=${status.cwd}`,
     status.resultReady ? 'result=ready' : 'result=pending',
     status.waitTimedOut ? `wait=timeout(${status.waitTimeoutMs}ms)` : '',
   ].filter(Boolean);
@@ -1747,7 +1810,8 @@ Options:
   --script-file <path>               Workflow script file. A positional file path is also accepted.
   --script-path <path>               Runtime-owned persisted workflow script path.
   --name <name>                      Named workflow from .codex/workflows or built-ins.
-  --resume-from-run-id <runId>        Resume a completed local workflow run from preserved runtime state.
+  --resume-from-run-id <runId>        Resume a completed, failed, cancelled, or interrupted local workflow run from preserved runtime state; run it from the source run's working directory.
+  --validate                         Validate the workflow source without running agents: hard-fails structural problems, prints static schema/key warnings.
   --args <json>                      Workflow args JSON. Default: {}; resume runs inherit prior args when omitted.
   --args-file <path>                 Read workflow args JSON from a file.
   --permission <ask|allow|deny>      Permission review behavior. Default: settings.json (${workflowDefaultPermissionPolicy()}).

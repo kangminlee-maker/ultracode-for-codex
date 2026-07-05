@@ -17,7 +17,7 @@ import type {
   SubagentUsage,
   Verbosity,
 } from '../runtime/types.js';
-import { estimateTokens } from '../runtime/types.js';
+import { SUBAGENT_MODEL_PLACEHOLDER, estimateTokens } from '../runtime/types.js';
 import { ultracodePackageVersion } from '../runtime/package-info.js';
 import { codexChildProcessEnv } from './env.js';
 
@@ -166,7 +166,7 @@ export class CodexSubagentBackend implements SubagentBackend {
   constructor(options: CodexSubagentBackendOptions) {
     this.command = options.command ?? 'codex';
     this.cwd = options.cwd;
-    this.model = options.model ?? 'codex-subagent';
+    this.model = options.model ?? SUBAGENT_MODEL_PLACEHOLDER;
     this.configuredModel = options.model;
     this.timeoutMs = normalizeOptionalTimeoutMs(options.timeoutMs);
     this.rpcTimeoutMs = this.timeoutMs > 0 ? this.timeoutMs : DEFAULT_CODEX_RPC_TIMEOUT_MS;
@@ -678,9 +678,10 @@ export class CodexSubagentBackend implements SubagentBackend {
   }
 
   private modelOverrideFor(requestModel: string): string | undefined {
-    if (this.configuredModel) return this.configuredModel;
-    if (!requestModel || requestModel === this.model || requestModel === 'codex-subagent') return undefined;
-    return requestModel;
+    if (requestModel && requestModel !== this.model && requestModel !== SUBAGENT_MODEL_PLACEHOLDER) {
+      return requestModel;
+    }
+    return this.configuredModel;
   }
 
   private bufferTurnState(key: string, apply: (state: BufferedTurnState) => void): void {

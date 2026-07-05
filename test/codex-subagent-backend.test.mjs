@@ -105,6 +105,45 @@ test('CodexSubagentBackend maps structured output schema to StructuredOutput cal
   }
 });
 
+test('CodexSubagentBackend prefers an explicit per-request model over the configured model', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  const backend = new CodexSubagentBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+    model: 'configured-model',
+  });
+
+  try {
+    const overridden = await backend.generate(textRequest({ prompt: 'DEBUG_PAYLOAD', model: 'per-agent-model' }));
+    assert.equal(JSON.parse(overridden.text).turnStart.model, 'per-agent-model');
+
+    const defaulted = await backend.generate(textRequest({ prompt: 'DEBUG_PAYLOAD', model: 'configured-model' }));
+    assert.equal(JSON.parse(defaulted.text).turnStart.model, 'configured-model');
+  } finally {
+    await backend.close();
+  }
+});
+
+test('CodexSubagentBackend uses the per-request model when no run-level model is configured', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  const backend = new CodexSubagentBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+  });
+
+  try {
+    const overridden = await backend.generate(textRequest({ prompt: 'DEBUG_PAYLOAD', model: 'per-agent-model' }));
+    assert.equal(JSON.parse(overridden.text).turnStart.model, 'per-agent-model');
+
+    const defaulted = await backend.generate(textRequest({ prompt: 'DEBUG_PAYLOAD' }));
+    assert.equal(JSON.parse(defaulted.text).turnStart.model, undefined);
+  } finally {
+    await backend.close();
+  }
+});
+
 test('CodexSubagentBackend uses an Ultracode-only app-server surface', async () => {
   process.env.CODEX_HOME = await createCodexHome();
   const backend = new CodexSubagentBackend({
@@ -238,7 +277,7 @@ test('usageFromCodexTokenUsage returns provider token details', () => {
 
 function textRequest(overrides = {}) {
   return {
-    model: 'codex-subagent',
+    model: overrides.model ?? 'codex-subagent',
     messages: [{ role: 'user', content: overrides.prompt ?? 'Return OK.' }],
     reasoningEffort: overrides.reasoningEffort,
     tools: [],

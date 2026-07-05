@@ -1,16 +1,17 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, mkdir, readdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { createContext, runInContext } from 'node:vm';
-import type { SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage } from './types.js';
-import { UltracodeRequestError, estimateTokens } from './types.js';
+import type { ReasoningEffort, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage } from './types.js';
+import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort } from './types.js';
 import {
   WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
   WORKFLOW_JOURNAL_WRITE_FAILED_REASON,
   WorkflowJournalError,
+  WorkflowJournalValidationError,
   WorkflowJournalWriter,
   computeWorkflowAgentCallKey,
   isWorkflowJournalError,
@@ -324,6 +325,7 @@ interface WorkflowRunContext {
   readonly asyncFinalizers: Set<Promise<void>>;
   nextTimerId: number;
   previousAgentCallKey: string;
+  readonly usedLogicalKeys: Set<string>;
   currentPhase?: string;
   announcedPlan?: WorkflowExecutionPlan;
   pendingPhasePlan?: WorkflowPlanPhase;
@@ -440,9 +442,22 @@ interface WorkflowResumeSource {
   readonly scriptHash?: string;
 }
 
-interface WorkflowCompletedResumeJournal {
+interface WorkflowResumeSourceJournal {
   readonly entries: readonly WorkflowJournalEntry[];
   readonly started: Extract<WorkflowJournalEntry, { readonly kind: 'workflow.run.started' }>;
+  readonly terminal?: Extract<WorkflowJournalEntry, { readonly kind: 'workflow.run.completed' | 'workflow.run.failed' }>;
+  readonly truncatedTail: boolean;
+}
+
+type WorkflowResumeSourceTerminal = 'completed' | 'failed' | 'interrupted';
+
+interface WorkflowResumeSourceInfo {
+  readonly runId: string;
+  readonly terminal: WorkflowResumeSourceTerminal;
+  readonly terminalReason?: string;
+  readonly model?: string;
+  readonly workspaceFingerprint?: string;
+  readonly completedAgentCount: number;
 }
 
 interface DurableWorkflowResultRecord {
@@ -458,6 +473,7 @@ interface WorkflowResumeCache {
   readonly usedCallKeys: Set<string>;
   nextIndex: number;
   prefixOpen: boolean;
+  readonly source: WorkflowResumeSourceInfo;
 }
 
 interface WorkflowResumeAgentCacheEntry {
@@ -491,6 +507,7 @@ interface AgentOptions {
   readonly label?: string;
   readonly key?: string;
   readonly model?: string;
+  readonly effort?: string;
   readonly phase?: string;
   readonly schema?: unknown;
   readonly isolation?: unknown;
@@ -929,6 +946,7 @@ function reviewLensStage(lens) {
     label: finderLabel(lens),
     phase: "Find",
     schema: finderSchema,
+    effort: "high",
     key: "code-review/find/" + lens.lensKey + "/" + sourceSnapshotHashKey
   }).then((finderOutput) => {
     const rawCandidates = Array.isArray(finderOutput.candidates) ? finderOutput.candidates : [];
@@ -1005,6 +1023,7 @@ function runSweep(kept, refutedCount) {
     label: "code-review-sweep-finder",
     phase: "Sweep",
     schema: finderSchema,
+    effort: "high",
     key: "code-review/sweep/" + sourceSnapshotHashKey + "/" + scopeDigest.slice(7, 23)
   }).then((sweepOutput) => {
     const sweepLens = { id: "sweep", lensKey: "sweep", title: "Sweep", focus: "Final gap search", kind: "correctness", position: activeLenses.length };
@@ -1623,6 +1642,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     const retryInput = { ...resolved, scriptPath };
     const startedAt = Date.now();
     const journalArgs = journalJsonValueOrInputError(resumePlan.launchInput.args ?? null, 'workflow args');
+    const workspaceFingerprint = await this.workspaceFingerprint();
     let journal: WorkflowJournalWriter;
     try {
       journal = await WorkflowJournalWriter.create({
@@ -1642,8 +1662,13 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         runtime: {
           schemaVersion: 1,
           cwd: this.options.cwd ?? process.cwd(),
+          ...(this.options.backend.model !== SUBAGENT_MODEL_PLACEHOLDER
+            ? { model: this.options.backend.model }
+            : {}),
+          ...(workspaceFingerprint ? { workspaceFingerprint } : {}),
         },
       });
+      await writeWorkflowStateFile(workflowRunPidPath(transcriptDir), `${process.pid}\n`);
       if (!resolved.scriptPath) {
         await this.recordWorkflowSourceAllow(resolved, parsed, scriptHash, isolationReview);
       }
@@ -1680,6 +1705,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       ...(task.workflowSourcePath ? { workflowSourcePath: task.workflowSourcePath } : {}),
       scriptHash,
     });
+    if (resumeCache) this.emitResumeDisclosure(task, resumeCache.source, workspaceFingerprint);
     task.runPromise = this.runTask(task, parsed, retryInput, resumeCache);
     task.runPromise.catch(() => undefined);
     return {
@@ -1697,12 +1723,92 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     };
   }
 
+  private emitResumeDisclosure(
+    task: WorkflowTaskMutable,
+    source: WorkflowResumeSourceInfo,
+    currentWorkspaceFingerprint: string | undefined,
+  ): void {
+    const log = (message: string): void => {
+      this.emit(task, {
+        type: 'workflow.log',
+        taskId: task.taskId,
+        runId: task.runId,
+        message,
+      });
+    };
+    const terminalDetail = source.terminalReason ? `: ${source.terminalReason}` : '';
+    log(`Resuming from ${source.runId} (${source.terminal}${terminalDetail}); up to ${source.completedAgentCount} completed agent result(s) are reusable.`);
+    if ((source.model ?? SUBAGENT_MODEL_PLACEHOLDER) !== this.options.backend.model) {
+      log(`Resume model mismatch: source run used ${source.model ?? 'the default model'}, this run uses ${this.options.backend.model}. Agent results whose call keys embed a different model re-run; per-agent model overrides keep their cached results.`);
+    }
+    if (
+      source.workspaceFingerprint
+      && currentWorkspaceFingerprint
+      && source.workspaceFingerprint !== currentWorkspaceFingerprint
+    ) {
+      log('Workspace changed since the source run; cached agent results may reference stale file state.');
+    }
+  }
+
+  private async workspaceFingerprint(): Promise<string | undefined> {
+    const cwd = this.options.cwd ?? process.cwd();
+    try {
+      const gitRoot = await gitOutput(cwd, ['rev-parse', '--show-toplevel']);
+      const excludes = await this.gitRuntimeStateExcludePathspecs(gitRoot);
+      const head = await gitOutput(gitRoot, ['rev-parse', 'HEAD']).catch(() => 'no-head');
+      const status = await gitOutput(gitRoot, ['status', '--porcelain=v1', '--untracked-files=all', '--', '.', ...excludes]);
+      // `git diff HEAD` sees content edits to tracked files that the status
+      // listing alone cannot (a file that was already dirty in both runs).
+      // Untracked-file content changes remain invisible beyond presence.
+      const diff = head === 'no-head'
+        ? ''
+        : await gitOutput(gitRoot, ['diff', 'HEAD', '--', '.', ...excludes]).catch(() => '');
+      return `git:${createHash('sha256').update(`${head}\0${status}\0${diff}`).digest('hex')}`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async validateWorkflowInput(input: WorkflowLaunchInput): Promise<{
+    readonly workflowName: string;
+    readonly description?: string;
+    readonly workflowSource: WorkflowSource;
+    readonly scriptHash: string;
+    readonly agentCallSites: number;
+    readonly schemaCallSites: number;
+    readonly keyedCallSites: number;
+    readonly warnings: readonly string[];
+  }> {
+    if (this.closed) throw workflowInputError('Workflow runtime is closed.');
+    if (Object.prototype.hasOwnProperty.call(input, 'resumeFromRunId')) {
+      throw workflowInputError('Workflow validation does not accept resumeFromRunId.');
+    }
+    const resolved = await this.resolveLaunchInput(input);
+    const parsed = parseInlineWorkflowScript(resolved.script);
+    return {
+      workflowName: parsed.meta.name,
+      ...(parsed.meta.description ? { description: parsed.meta.description } : {}),
+      workflowSource: resolved.workflowSource,
+      scriptHash: workflowScriptHash(resolved.script),
+      ...workflowAuthoringScan(resolved.script),
+    };
+  }
+
   async validateResumeSource(resumeFromRunId: string): Promise<void> {
+    await this.resumeSourceInfo(resumeFromRunId);
+  }
+
+  async resumeSourceInfo(resumeFromRunId: string): Promise<Omit<WorkflowResumeSourceInfo, 'workspaceFingerprint'>> {
     const runId = normalizeResumeFromRunId(resumeFromRunId);
     const sourceTask = await this.workflowTaskByRunId(runId);
-    if (!sourceTask) throw workflowInputError(`Unknown workflow run for resume: ${runId}`);
+    if (!sourceTask) throw workflowResumeUnknownError(runId);
     if (sourceTask.status === 'running') throw workflowResumeRunningError(runId);
-    await this.createResumeCache(sourceTask);
+    const sourceJournal = await this.readResumeSourceJournal(sourceTask);
+    const completedAgentCount = sourceJournal.entries
+      .filter((entry) => entry.kind === 'workflow.agent.completed')
+      .length;
+    const { workspaceFingerprint: _internal, ...info } = workflowResumeSourceInfoFromJournal(runId, sourceJournal, completedAgentCount);
+    return info;
   }
 
   private async prepareResumePlan(input: WorkflowLaunchInput): Promise<WorkflowResumePlan> {
@@ -1711,7 +1817,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     }
     const resumeFromRunId = normalizeResumeFromRunId(input.resumeFromRunId);
     const sourceTask = await this.workflowTaskByRunId(resumeFromRunId);
-    if (!sourceTask) throw workflowInputError(`Unknown workflow run for resume: ${resumeFromRunId}`);
+    if (!sourceTask) throw workflowResumeUnknownError(resumeFromRunId);
     if (sourceTask.status === 'running') throw workflowResumeRunningError(resumeFromRunId);
     if (workflowLaunchHasSourceSelector(input)) {
       throw workflowInputError('resumeFromRunId cannot be combined with script, scriptPath, or name. Resume uses the original persisted workflow source.');
@@ -1740,101 +1846,203 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
 
   private async durableWorkflowResumeSource(runId: string): Promise<WorkflowResumeSource | undefined> {
     const resultPath = join(this.stateDir, 'workflows', `${runId}.result.json`);
-    let record: DurableWorkflowResultRecord | null;
+    const transcriptDir = join(this.stateDir, 'subagents', 'workflows', runId);
+    let recordText: string | null = null;
     try {
-      record = durableWorkflowResultRecordFromUnknown(JSON.parse(await readFile(resultPath, 'utf8')));
-    } catch {
-      return undefined;
+      recordText = await readFile(resultPath, 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw workflowResumeSourceInvalidError(runId);
+      recordText = null;
     }
-    if (!record || record.runId !== runId || !record.retryInput) return undefined;
+    if (recordText !== null) {
+      // A result record that exists but cannot be parsed or bound stays
+      // fail-loud; only a valid record beside a non-completed journal (the
+      // terminal append was interrupted) falls through to journal-first
+      // discovery.
+      let record: DurableWorkflowResultRecord | null = null;
+      try {
+        record = durableWorkflowResultRecordFromUnknown(JSON.parse(recordText));
+      } catch {
+        record = null;
+      }
+      if (!record || record.runId !== runId || !record.retryInput) {
+        throw workflowResumeSourceInvalidError(runId);
+      }
+      const outcome = await this.durableCompletedResumeSource(runId, transcriptDir, {
+        ...record,
+        retryInput: record.retryInput,
+      });
+      if (outcome.kind === 'source') return outcome.source;
+      if (outcome.kind === 'invalid') throw workflowResumeSourceInvalidError(runId);
+    }
+    return await this.durableJournalResumeSource(runId, transcriptDir);
+  }
+
+  private async durableCompletedResumeSource(
+    runId: string,
+    transcriptDir: string,
+    record: DurableWorkflowResultRecord & { readonly retryInput: WorkflowLaunchInput },
+  ): Promise<
+    | { readonly kind: 'source'; readonly source: WorkflowResumeSource }
+    | { readonly kind: 'invalid' }
+    | { readonly kind: 'journal_not_completed' }
+  > {
     let scriptRecord: { readonly script: string; readonly scriptPath: string; readonly metadata?: WorkflowScriptMetadata };
     try {
       scriptRecord = await this.readRuntimeWorkflowScript(record.retryInput.scriptPath ?? '');
     } catch {
-      return undefined;
+      return { kind: 'invalid' };
     }
     const actualScriptHash = workflowScriptHash(scriptRecord.script);
-    if (actualScriptHash !== record.scriptHash) return undefined;
-    if (scriptRecord.metadata?.scriptHash !== record.scriptHash) return undefined;
-    if (scriptRecord.metadata?.workflowName !== record.workflowName) return undefined;
-    const transcriptDir = join(this.stateDir, 'subagents', 'workflows', runId);
-    let completedJournal: WorkflowCompletedResumeJournal;
+    if (actualScriptHash !== record.scriptHash) return { kind: 'invalid' };
+    if (scriptRecord.metadata?.scriptHash !== record.scriptHash) return { kind: 'invalid' };
+    if (scriptRecord.metadata?.workflowName !== record.workflowName) return { kind: 'invalid' };
+    let sourceJournal: WorkflowResumeSourceJournal;
     try {
-      completedJournal = await this.readCompletedResumeJournal({
+      sourceJournal = await this.readResumeSourceJournal({
         runId,
         transcriptDir,
         workflowName: record.workflowName,
         scriptHash: record.scriptHash,
       });
     } catch {
+      return { kind: 'invalid' };
+    }
+    if (sourceJournal.truncatedTail || sourceJournal.terminal?.kind !== 'workflow.run.completed') {
+      return { kind: 'journal_not_completed' };
+    }
+    if (!durableScriptRecordMatchesJournal(scriptRecord, sourceJournal.started)) return { kind: 'invalid' };
+    if (!durableRetryInputArgsMatchJournal(record.retryInput, sourceJournal.started.args)) return { kind: 'invalid' };
+    return {
+      kind: 'source',
+      source: {
+        runId,
+        status: 'completed',
+        transcriptDir,
+        retryInput: durableRetryInputWithJournalArgs(record.retryInput, sourceJournal.started.args),
+        workflowName: record.workflowName,
+        scriptHash: record.scriptHash,
+      },
+    };
+  }
+
+  private async durableJournalResumeSource(
+    runId: string,
+    transcriptDir: string,
+  ): Promise<WorkflowResumeSource | undefined> {
+    try {
+      await stat(workflowJournalPath(transcriptDir));
+    } catch {
       return undefined;
     }
-    if (!durableScriptRecordMatchesJournal(scriptRecord, completedJournal.started)) return undefined;
-    if (!durableRetryInputArgsMatchJournal(record.retryInput, completedJournal.started.args)) return undefined;
+    const sourceJournal = await this.readResumeSourceJournal({ runId, transcriptDir });
+    if (sourceJournal.terminal?.kind === 'workflow.run.completed') {
+      // Completed sources must bind through their result record. A completed
+      // journal reaches journal-first discovery only when the record is
+      // missing or the journal carries bytes after the terminal entry — both
+      // are external interference, not recoverable states.
+      throw workflowResumeSourceInvalidError(runId);
+    }
+    if (!sourceJournal.terminal) {
+      await this.assertResumeSourceNotLive(runId, transcriptDir);
+    }
+    const started = sourceJournal.started;
+    let scriptRecord: { readonly script: string; readonly scriptPath: string; readonly metadata?: WorkflowScriptMetadata };
+    try {
+      scriptRecord = await this.readRuntimeWorkflowScript(started.scriptPath);
+    } catch {
+      throw workflowResumeSourceInvalidError(runId);
+    }
+    if (workflowScriptHash(scriptRecord.script) !== started.scriptHash) throw workflowResumeSourceInvalidError(runId);
+    if (scriptRecord.metadata?.workflowName !== started.workflowName) throw workflowResumeSourceInvalidError(runId);
+    if (!durableScriptRecordMatchesJournal(scriptRecord, started)) throw workflowResumeSourceInvalidError(runId);
     return {
       runId,
-      status: 'completed',
+      status: 'failed',
       transcriptDir,
-      retryInput: durableRetryInputWithJournalArgs(record.retryInput, completedJournal.started.args),
-      workflowName: record.workflowName,
-      scriptHash: record.scriptHash,
+      retryInput: {
+        scriptPath: scriptRecord.scriptPath,
+        // The launch path journals absent args as null; normalize back so a
+        // resumed script sees the same `args` value the original run saw.
+        ...(started.args === null ? {} : { args: started.args }),
+      },
+      workflowName: started.workflowName,
+      scriptHash: started.scriptHash,
     };
+  }
+
+  private async assertResumeSourceNotLive(runId: string, transcriptDir: string): Promise<void> {
+    let pidText: string;
+    try {
+      pidText = await readFile(workflowRunPidPath(transcriptDir), 'utf8');
+    } catch {
+      return;
+    }
+    const pid = Number.parseInt(pidText.trim(), 10);
+    if (Number.isInteger(pid) && pid > 0 && isWorkflowProcessAlive(pid)) {
+      throw workflowResumeRunningError(runId);
+    }
   }
 
   private async createResumeCache(sourceTask: WorkflowResumeSource): Promise<WorkflowResumeCache> {
-    const { entries } = await this.readCompletedResumeJournal(sourceTask);
-    const completedByCallKey = new Map<string, Extract<WorkflowJournalEntry, { kind: 'workflow.agent.completed' }>>();
-    for (const entry of entries) {
-      if (entry.kind === 'workflow.agent.completed') completedByCallKey.set(entry.agentCallKey, entry);
+    const sourceJournal = await this.readResumeSourceJournal(sourceTask);
+    // Exact-key hits may reuse any durably completed agent result, not only
+    // the contiguous prefix, so one early stall cannot discard the results of
+    // agents that completed after it.
+    const byCallKey = new Map<string, WorkflowResumeAgentCacheEntry>();
+    for (const entry of sourceJournal.entries) {
+      if (entry.kind === 'workflow.agent.completed') {
+        byCallKey.set(entry.agentCallKey, { agentCallKey: entry.agentCallKey, result: entry.result });
+      }
     }
     const cacheEntries: WorkflowResumeAgentCacheEntry[] = [];
-    for (const entry of entries) {
+    for (const entry of sourceJournal.entries) {
       if (entry.kind !== 'workflow.agent.started') continue;
-      const completed = completedByCallKey.get(entry.agentCallKey);
+      const completed = byCallKey.get(entry.agentCallKey);
       if (!completed) break;
-      cacheEntries.push({
-        agentCallKey: entry.agentCallKey,
-        result: completed.result,
-      });
+      cacheEntries.push(completed);
     }
     return {
       entries: cacheEntries,
-      byCallKey: new Map(cacheEntries.map((entry) => [entry.agentCallKey, entry])),
+      byCallKey,
       usedCallKeys: new Set(),
       nextIndex: 0,
       prefixOpen: true,
+      source: workflowResumeSourceInfoFromJournal(sourceTask.runId, sourceJournal, byCallKey.size),
     };
   }
 
-  private async readCompletedResumeJournal(sourceTask: {
+  private async readResumeSourceJournal(sourceTask: {
     readonly runId: string;
     readonly transcriptDir: string;
     readonly workflowName?: string;
     readonly scriptHash?: string;
-  }): Promise<WorkflowCompletedResumeJournal> {
+  }): Promise<WorkflowResumeSourceJournal> {
     let journal: Awaited<ReturnType<typeof readWorkflowJournal>>;
     try {
-      journal = await readWorkflowJournal(workflowJournalPath(sourceTask.transcriptDir));
-    } catch {
-      throw workflowInputError(`Workflow run cannot be used as a resume source: ${sourceTask.runId}`);
+      // An unterminated final line was never durably committed, so it is
+      // dropped rather than rejecting the whole journal; completed-source
+      // acceptance separately requires a clean, terminal-completed journal.
+      journal = await readWorkflowJournal(workflowJournalPath(sourceTask.transcriptDir), { dropUnterminatedTail: true });
+    } catch (err) {
+      throw workflowResumeSourceInvalidError(sourceTask.runId, err);
     }
     const entries = journal.entries;
     const started = entries[0];
-    const terminal = entries.at(-1);
     if (
-      journal.truncatedTail
-      || !started
+      !started
       || started.kind !== 'workflow.run.started'
       || started.runId !== sourceTask.runId
       || (sourceTask.scriptHash && started.scriptHash !== sourceTask.scriptHash)
       || (sourceTask.workflowName && started.workflowName !== sourceTask.workflowName)
-      || !terminal
-      || terminal.kind !== 'workflow.run.completed'
-      || terminal.runId !== sourceTask.runId
     ) {
-      throw workflowInputError(`Workflow run cannot be used as a resume source: ${sourceTask.runId}`);
+      throw workflowResumeSourceInvalidError(sourceTask.runId);
     }
-    return { entries, started };
+    const last = entries.at(-1);
+    const terminal = last && (last.kind === 'workflow.run.completed' || last.kind === 'workflow.run.failed')
+      ? last
+      : undefined;
+    return { entries, started, terminal, truncatedTail: journal.truncatedTail };
   }
 
   private async resolveLaunchInput(input: WorkflowLaunchInput): Promise<ResolvedWorkflowLaunchInput> {
@@ -2290,7 +2498,22 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         'workflow_input_invalid',
       );
     }
-    return this.launch(task.retryInput);
+    // Retry resumes the failed run so durably completed agent results are
+    // reused; a source whose journal cannot serve as a resume source (for
+    // example after a journal write failure) falls back to a fresh re-run.
+    try {
+      return await this.launch({
+        resumeFromRunId: task.runId,
+        ...(typeof task.retryInput.toolName === 'string' && task.retryInput.toolName
+          ? { toolName: task.retryInput.toolName }
+          : {}),
+      });
+    } catch (err) {
+      if (err instanceof UltracodeRequestError && err.code === 'workflow_input_invalid') {
+        return await this.launch(task.retryInput);
+      }
+      throw err;
+    }
   }
 
   async *streamEvents(taskId: string, signal?: AbortSignal): AsyncIterable<WorkflowEvent> {
@@ -2350,6 +2573,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       asyncFinalizers: new Set(),
       nextTimerId: 1,
       previousAgentCallKey: WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+      usedLogicalKeys: new Set(),
     };
     task.controller = controller;
     if (task.abortRequested) controller.abort();
@@ -2528,15 +2752,22 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
       throw workflowInputError('Workflow is aborted.');
     }
-    if (options?.model !== undefined) {
-      throw workflowInputError('agent model override is not supported by this runtime yet.');
-    }
     if (ctx.agentCount >= MAX_AGENT_CALLS) {
       throw workflowInputError(`Workflow agent call cap exceeded (${MAX_AGENT_CALLS}).`);
     }
     const schema = normalizeStructuredOutputSchema(options?.schema);
     const isolation = normalizeAgentIsolation(options?.isolation);
     const logicalKey = normalizeAgentLogicalKey(options?.key);
+    const effort = normalizeAgentEffort(options?.effort) ?? 'xhigh';
+    const model = normalizeAgentModel(options?.model) ?? ctx.model;
+    if (logicalKey) {
+      // A repeated logical key would produce duplicate agent call keys, which
+      // poisons the whole journal as a resume source; fail before any spend.
+      if (ctx.usedLogicalKeys.has(logicalKey)) {
+        throw workflowInputError(`agent key "${logicalKey}" was already used in this workflow run; use a distinct key per attempt when re-calling an agent.`);
+      }
+      ctx.usedLogicalKeys.add(logicalKey);
+    }
     if (isolation && !workflowIsolationReviewAllowsMode(ctx.isolationReview, isolation)) {
       throw workflowInputError(`agent ${isolation} isolation was not covered by the current workflow permission review.`);
     }
@@ -2544,8 +2775,8 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     ctx.agentCount += 1;
     const agentId = `agent_${agentIndex + 1}`;
     const semanticOpts = workflowAgentSemanticOpts({
-      model: ctx.model,
-      effort: 'xhigh',
+      model,
+      effort,
       schema,
       isolation,
       logicalKey,
@@ -2629,7 +2860,8 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         prompt,
         schema,
         isolation,
-        model: ctx.model,
+        model,
+        effort,
         onWorktreeFinalized: recordWorktreeFinalization,
       });
       const result = attempt.result;
@@ -2776,6 +3008,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       readonly schema?: Record<string, unknown>;
       readonly isolation?: 'worktree';
       readonly model: string;
+      readonly effort: ReasoningEffort;
       readonly onWorktreeFinalized: (finalization: WorkflowAgentWorktreeFinalization) => void;
     },
   ): Promise<WorkflowAgentAttemptOutcome> {
@@ -2789,6 +3022,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       try {
         const result = await this.runAgentAttempt(ctx, agentRequest({
           model: input.model,
+          effort: input.effort,
           prompt: input.prompt,
           schema: input.schema,
           worktreePath: worktree?.path,
@@ -2835,15 +3069,24 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   }
 
   private async gitStatusArgsExcludingRuntimeState(gitRoot: string): Promise<readonly string[]> {
-    const args = ['status', '--porcelain=v1', '--untracked-files=all', '--', '.'];
+    return [
+      'status',
+      '--porcelain=v1',
+      '--untracked-files=all',
+      '--',
+      '.',
+      ...await this.gitRuntimeStateExcludePathspecs(gitRoot),
+    ];
+  }
+
+  private async gitRuntimeStateExcludePathspecs(gitRoot: string): Promise<readonly string[]> {
     const canonicalGitRoot = await realpath(gitRoot).catch(() => resolve(gitRoot));
     const canonicalStateDir = await realpath(this.stateDir).catch(() => resolve(this.stateDir));
     const relativeStateDir = relative(canonicalGitRoot, canonicalStateDir);
     if (relativeStateDir && !relativeStateDir.startsWith('..') && !isAbsolute(relativeStateDir)) {
-      args.push(`:(exclude)${relativeStateDir}`);
-      args.push(`:(exclude)${relativeStateDir}/**`);
+      return [`:(exclude)${relativeStateDir}`, `:(exclude)${relativeStateDir}/**`];
     }
-    return args;
+    return [];
   }
 
   private async runAgentAttempt(ctx: WorkflowRunContext, request: SubagentRequest): Promise<SubagentResult> {
@@ -3062,6 +3305,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         task.terminalEmitted = true;
         this.notifyTaskWaiters(task);
       }
+      await rm(workflowRunPidPath(task.transcriptDir), { force: true }).catch(() => undefined);
       return workflowTaskSnapshot(task);
     })();
     return await task.terminalFinalization;
@@ -3201,6 +3445,25 @@ function normalizeAgentLogicalKey(value: unknown): string | undefined {
     throw workflowInputError('agent key may only contain letters, numbers, "_", "-", ".", ":", "/", "@", and "+".');
   }
   return key;
+}
+
+function normalizeAgentEffort(value: unknown): ReasoningEffort | undefined {
+  if (value === undefined) return undefined;
+  if (!isReasoningEffort(value)) {
+    throw workflowInputError('agent effort must be one of none, minimal, low, medium, high, xhigh.');
+  }
+  return value;
+}
+
+function normalizeAgentModel(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw workflowInputError('agent model must be a non-empty string.');
+  }
+  if (value === SUBAGENT_MODEL_PLACEHOLDER) {
+    throw workflowInputError(`agent model must not be the reserved backend placeholder "${SUBAGENT_MODEL_PLACEHOLDER}".`);
+  }
+  return value;
 }
 
 function takeResumeCacheHit(
@@ -5508,6 +5771,7 @@ function isTerminalWorkflowEvent(event: WorkflowEvent): boolean {
 
 function agentRequest(input: {
   readonly model: string;
+  readonly effort: ReasoningEffort;
   readonly prompt: string;
   readonly schema?: Record<string, unknown>;
   readonly worktreePath?: string;
@@ -5531,7 +5795,7 @@ function agentRequest(input: {
       role: 'user',
       content: prompt,
     }],
-    reasoningEffort: 'xhigh',
+    reasoningEffort: input.effort,
     tools,
     toolChoice: input.schema ? { type: 'required' } : { type: 'auto' },
     ...(input.worktreePath ? { worktreePath: input.worktreePath } : {}),
@@ -5724,6 +5988,12 @@ function jsonDeepEqual(left: unknown, right: unknown): boolean {
 }
 
 function findMatchingBrace(text: string, start: number): number {
+  const index = findMatchingDelimiter(text, start, '{', '}');
+  if (index === -1) throw workflowMetaError('Workflow meta object is not closed.');
+  return index;
+}
+
+function findMatchingDelimiter(text: string, start: number, open: string, close: string): number {
   let depth = 0;
   let quote: '"' | "'" | '`' | null = null;
   let escaped = false;
@@ -5767,13 +6037,13 @@ function findMatchingBrace(text: string, start: number): number {
       quote = char;
       continue;
     }
-    if (char === '{') depth += 1;
-    if (char === '}') {
+    if (char === open) depth += 1;
+    if (char === close) {
       depth -= 1;
       if (depth === 0) return index;
     }
   }
-  throw workflowMetaError('Workflow meta object is not closed.');
+  return -1;
 }
 
 function firstNonWhitespace(text: string, start: number): number {
@@ -6037,6 +6307,78 @@ function workflowJournalRuntimeError(err: unknown): WorkflowJournalError {
 
 function workflowJournalRequestError(_err: unknown): UltracodeRequestError {
   return new UltracodeRequestError(WORKFLOW_JOURNAL_PUBLIC_FAILURE_MESSAGE, 500, 'server_error', WORKFLOW_INPUT_PARAM, WORKFLOW_JOURNAL_WRITE_FAILED_REASON);
+}
+
+// Deterministic static scan over the script text. It cannot judge whether a
+// result is machine-consumed; it only counts call sites so validation can
+// disclose likely contract gaps without blocking on them.
+function workflowAuthoringScan(script: string): {
+  readonly agentCallSites: number;
+  readonly schemaCallSites: number;
+  readonly keyedCallSites: number;
+  readonly warnings: readonly string[];
+} {
+  let agentCallSites = 0;
+  let schemaCallSites = 0;
+  let keyedCallSites = 0;
+  const agentCallRe = /\bagent\s*\(/g;
+  for (let match = agentCallRe.exec(script); match; match = agentCallRe.exec(script)) {
+    const openParen = script.indexOf('(', match.index);
+    const closeParen = findMatchingDelimiter(script, openParen, '(', ')');
+    const argsText = closeParen === -1 ? script.slice(openParen + 1) : script.slice(openParen + 1, closeParen);
+    agentCallSites += 1;
+    if (/\bschema\s*:/.test(argsText)) schemaCallSites += 1;
+    if (/\bkey\s*:/.test(argsText)) keyedCallSites += 1;
+  }
+  const warnings: string[] = [];
+  if (agentCallSites > schemaCallSites) {
+    warnings.push(`${agentCallSites - schemaCallSites} of ${agentCallSites} agent() call site(s) do not declare a structured output schema; machine-consumed results should pass { schema }.`);
+  }
+  if (agentCallSites > 0 && keyedCallSites === 0 && /\b(parallel|pipeline)\s*\(/.test(script)) {
+    warnings.push('No agent() call site passes a logical { key }; dynamic parallel agents without keys lose resume cache hits after reorder.');
+  }
+  return { agentCallSites, schemaCallSites, keyedCallSites, warnings };
+}
+
+function workflowResumeSourceInfoFromJournal(
+  runId: string,
+  sourceJournal: WorkflowResumeSourceJournal,
+  completedAgentCount: number,
+): WorkflowResumeSourceInfo {
+  const terminal = sourceJournal.terminal;
+  const runtime = sourceJournal.started.runtime;
+  return {
+    runId,
+    terminal: terminal ? (terminal.kind === 'workflow.run.completed' ? 'completed' : 'failed') : 'interrupted',
+    ...(terminal?.kind === 'workflow.run.failed' ? { terminalReason: terminal.reason } : {}),
+    ...(runtime.model ? { model: runtime.model } : {}),
+    ...(runtime.workspaceFingerprint ? { workspaceFingerprint: runtime.workspaceFingerprint } : {}),
+    completedAgentCount,
+  };
+}
+
+function workflowRunPidPath(transcriptDir: string): string {
+  return join(transcriptDir, 'run.pid');
+}
+
+function isWorkflowProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function workflowResumeUnknownError(runId: string): UltracodeRequestError {
+  // Workflow state is partitioned by the exact working directory, so the most
+  // common cause of an unknown run id is resuming from a different cwd.
+  return workflowInputError(`Unknown workflow run for resume: ${runId}. Run resume from the source run's working directory (--cwd).`);
+}
+
+function workflowResumeSourceInvalidError(runId: string, cause?: unknown): UltracodeRequestError {
+  const detail = cause instanceof WorkflowJournalValidationError ? ` (${cause.message})` : '';
+  return workflowInputError(`Workflow run cannot be used as a resume source: ${runId}${detail}`);
 }
 
 function workflowResumeRunningError(runId: string): UltracodeRequestError {

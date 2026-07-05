@@ -155,17 +155,17 @@
 <body>
   <main>
     <h1>Ultracode for Codex Implementation Map</h1>
-    <p>Current state of the Codex-native skill command, explicit CLI runtime, and npm package release path.</p>
+    <p>Current state of the hybrid skill command, CLI workflow runtime, and npm package release path.</p>
 
     <section class="grid" aria-label="Current status">
-      <div class="tile"><strong>Current goal</strong><span>Expose native Codex orchestration as the default skill command</span></div>
-      <div class="tile"><strong>Runtime health</strong><span>Latest npm release installed and test suite green</span></div>
-      <div class="tile"><strong>Main risk</strong><span>Skill routing must keep native and CLI authority distinct</span></div>
-      <div class="tile"><strong>Next decision</strong><span>Keep CLI runtime as explicit validation and backup execution path</span></div>
+      <div class="tile"><strong>Current goal</strong><span>Hybrid orchestration: main-context planning over CLI-executed, journaled, resumable fan-out phases (P4)</span></div>
+      <div class="tile"><strong>Runtime health</strong><span>P4 implemented; unit, installed E2E, and live Codex verification green (override enforcement, kill-resume, tier contrast)</span></div>
+      <div class="tile"><strong>Main risk</strong><span>Authored phase scripts must not silently weaken the schema/journal contract; validate mode and the llm-guide carry that discipline</span></div>
+      <div class="tile"><strong>Next decision</strong><span>Commit and publish the 0.4.0 (P4) release</span></div>
     </section>
 
     <h2>Service Blueprint</h2>
-    <p>Judgment question: which surface owns orchestration for the requested workflow?</p>
+    <p>Judgment question: which surface owns planning and which owns execution for the requested workflow?</p>
     <div class="svg-wrap">
       <svg role="img" aria-labelledby="bp-title bp-desc" width="940" height="620" viewBox="0 0 940 620">
         <title id="bp-title">Ultracode skill and CLI blueprint</title>
@@ -198,9 +198,9 @@
 
         <rect x="260" y="64" width="210" height="116" rx="8" fill="var(--gate)" stroke="var(--gate-stroke)"></rect>
         <text class="node-title" x="278" y="92">Route selection</text>
-        <text class="node-line" x="278" y="116">native by default</text>
-        <text class="node-line" x="278" y="136">CLI when explicit</text>
-        <text class="node-line" x="278" y="156">package gates</text>
+        <text class="node-line" x="278" y="116">hybrid by default</text>
+        <text class="node-line" x="278" y="136">CLI runs fan-out phases</text>
+        <text class="node-line" x="278" y="156">native fallback</text>
 
         <rect x="260" y="230" width="210" height="136" rx="8" fill="var(--runtime)" stroke="var(--runtime-stroke)"></rect>
         <text class="node-title" x="278" y="258">CLI runtime</text>
@@ -212,7 +212,7 @@
         <rect x="520" y="230" width="190" height="116" rx="8" fill="#fef3c7" stroke="#d97706"></rect>
         <text class="node-title" x="538" y="258">Main orchestrator</text>
         <text class="node-line" x="538" y="282">phase planning</text>
-        <text class="node-line" x="538" y="302">parallel subagents</text>
+        <text class="node-line" x="538" y="302">delegates fan-out to CLI</text>
         <text class="node-line" x="538" y="322">phase synthesis</text>
         <text class="node-line" x="538" y="342">chat progress</text>
 
@@ -248,11 +248,11 @@
     <h2>Current Architecture</h2>
     <table>
       <tr><th>Area</th><th>Current contract</th></tr>
-      <tr><td>Native skill</td><td><code>skills/ultracode-for-codex/SKILL.md</code> is the default user-facing command. The Codex main context owns adaptive phase planning, direct subagent spawning, visual progress snapshots from <code>references/progress-visuals.md</code>, phase synthesis, final synthesis, phase/agent summary, and final critical re-check recommendation.</td></tr>
+      <tr><td>Hybrid skill</td><td><code>skills/ultracode-for-codex/SKILL.md</code> is the default user-facing command. The Codex main context owns adaptive phase planning, phase synthesis, visual progress snapshots from <code>references/progress-visuals.md</code>, and the final critical re-check recommendation; fan-out phases execute through the CLI runtime (validate-then-launch background runs, schema-enforced outputs, journaled results, resume anchors of <code>jobId</code>/<code>runId</code>/<code>cwd</code>). Codex-native subagents remain the fallback when the CLI is unavailable.</td></tr>
       <tr><td>CLI skill</td><td><code>skills/ultracode-for-codex-cli/SKILL.md</code> owns explicit CLI runtime operations: background jobs, attached runs, packaging, release checks, runtime-boundary validation, installed E2E, and local runtime artifacts.</td></tr>
-      <tr><td>CLI</td><td><code>src/cli.ts</code> exposes <code>run</code>, background <code>status</code>/<code>wait</code>/<code>logs</code>/<code>result</code>/<code>cancel</code>/<code>jobs</code>/<code>archive</code>, help, install guide, and package-version reporting. <code>settings.json</code> defaults to OS background execution so long Codex-launched runs can continue while Codex performs other work; <code>--execution attached</code> keeps progress on stderr JSONL and result on stdout JSON when blocking is desired. Completed runs add a phase/agent angle summary and a critical re-check recommendation for the current session LLM.</td></tr>
+      <tr><td>CLI</td><td><code>src/cli.ts</code> exposes <code>run</code> (including <code>--validate</code> for no-token authoring checks and <code>--resume-from-run-id</code> for all terminal source classes), background <code>status</code>/<code>wait</code>/<code>logs</code>/<code>result</code>/<code>cancel</code>/<code>jobs</code>/<code>archive</code> (status/jobs project <code>runId</code> and <code>cwd</code>), help, install guide, and package-version reporting. <code>settings.json</code> defaults to OS background execution so long Codex-launched runs can continue while Codex performs other work; <code>--execution attached</code> keeps progress on stderr JSONL and result on stdout JSON when blocking is desired. Completed runs add a phase/agent angle summary and a critical re-check recommendation for the current session LLM.</td></tr>
       <tr><td>Settings</td><td><code>settings.json</code> owns workflow execution mode, progress mode, permission default, retry limit, opt-in timeout, background file names, and Codex model controls. The packaged timeout default is <code>0</code>, so workflows wait for completion, cancellation, or app-server exit.</td></tr>
-      <tr><td>Runtime</td><td><code>src/runtime/workflow-runtime.ts</code> owns parsing, validation, phase-wise parallel scheduling, permission, retry, cancel, and progress events. Built-in <code>task</code> and <code>code-review</code> use planner-selected dynamic workflow patterns, run parallel focused subagents by default, emit planning snapshots, emit phase-level plans immediately before each phase, repeat current agent roles on each phase-start event, and include completion counts plus elapsed time on agent completion. Runtime-owned workflow state and isolated worktrees are preserved for review.</td></tr>
+      <tr><td>Runtime</td><td><code>src/runtime/workflow-runtime.ts</code> owns parsing, validation, phase-wise parallel scheduling, permission, retry, cancel, resume, and progress events. Script <code>agent()</code> calls accept per-agent <code>effort</code>/<code>model</code> options with byte-compatible default cache identity; duplicate logical keys fail at reservation. Resume accepts completed, failed, cancelled, and interrupted sources (journal-first discovery, widened exact-key reuse, model adoption, workspace-drift disclosure). Built-in <code>code-review</code> runs finder-class agents at <code>high</code> and verdict-class agents at <code>xhigh</code>. Runtime-owned workflow state and isolated worktrees are preserved for review.</td></tr>
       <tr><td>Journal</td><td><code>src/runtime/workflow-journal.ts</code> owns durable hash-chained workflow truth.</td></tr>
       <tr><td>Subagent backend</td><td><code>src/codex/subagent-backend.ts</code> talks to Codex app-server over stdio, strips direct provider credentials, runs turns in the requested workflow cwd, and serves bounded read-only workspace tools.</td></tr>
       <tr><td>Package</td><td>Package contents are the CLI runtime, install guide, both Codex skill command folders, docs, and public type exports. CLI <code>--version</code> and Codex <code>clientInfo.version</code> read package metadata, so packaging and npm version bumps update runtime surfaces together.</td></tr>

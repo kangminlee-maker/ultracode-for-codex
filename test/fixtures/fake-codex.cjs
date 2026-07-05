@@ -231,6 +231,7 @@ function debugPayload() {
     turnStart: pick(lastTurnStartParams, [
       'cwd',
       'runtimeWorkspaceRoots',
+      'model',
       'effort',
       'summary',
       'personality',

@@ -2,6 +2,20 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { parseOptions } from '../dist/cli.js';
 
+test('CLI parser keeps value-less flags from swallowing following tokens', () => {
+  const options = parseOptions(['--validate', './phase-review.js', '--plain', 'positional-2']);
+  assert.equal(options.validate, 'true');
+  assert.equal(options.plain, 'true');
+  assert.deepEqual(options._, ['./phase-review.js', 'positional-2']);
+});
+
+test('CLI parser pins a relative --cwd to an absolute recovery anchor', () => {
+  const options = parseOptions(['--cwd', 'relative/dir']);
+  assert.notEqual(options.cwd, 'relative/dir');
+  assert.ok(options.cwd.startsWith('/'), options.cwd);
+  assert.ok(options.cwd.endsWith('/relative/dir'), options.cwd);
+});
+
 test('CLI parser supports run options', () => {
   const options = parseOptions([
     '--accept-llm-guide=v1',

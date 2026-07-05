@@ -6,7 +6,12 @@ import { delimiter, dirname, join } from 'node:path';
 import { afterEach, test } from 'node:test';
 import { promisify } from 'node:util';
 import { WorkflowTaskRegistry } from '../dist/runtime/workflow-runtime.js';
-import { readWorkflowJournal, workflowJournalPath } from '../dist/runtime/workflow-journal.js';
+import {
+  WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+  computeWorkflowAgentCallKey,
+  readWorkflowJournal,
+  workflowJournalPath,
+} from '../dist/runtime/workflow-journal.js';
 
 const tempDirs = [];
 const execFileAsync = promisify(execFile);
@@ -81,6 +86,128 @@ return { raw, structured };`,
   }
 });
 
+test('workflow agents pass per-agent effort and model overrides to the backend and journal', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const launch = await runtime.launch({
+      script: `export const meta = {
+  name: "agent-overrides",
+  description: "Run default and tiered agent options",
+  phases: [{ title: "Run", detail: "Call subagents" }]
+};
+phase("Run");
+const first = await agent("default options agent", { label: "default-agent" });
+const second = await agent("tiered agent", { label: "tiered-agent", effort: "high", model: "fake-model-mini" });
+return { first, second };`,
+    });
+
+    const events = await collectEvents(runtime, launch.taskId);
+    assert.equal(events.at(-1).type, 'workflow.completed');
+    assert.equal(backend.requests.length, 2);
+    assert.equal(backend.requests[0].reasoningEffort, 'xhigh');
+    assert.equal(backend.requests[0].model, 'fake-model');
+    assert.equal(backend.requests[1].reasoningEffort, 'high');
+    assert.equal(backend.requests[1].model, 'fake-model-mini');
+
+    const snapshot = runtime.get(launch.taskId);
+    const journal = await readWorkflowJournal(workflowJournalPath(snapshot.transcriptDir));
+    const started = journal.entries.filter((entry) => entry.kind === 'workflow.agent.started');
+    assert.deepEqual(started[0].semanticOpts, { model: 'fake-model', effort: 'xhigh' });
+    assert.deepEqual(started[1].semanticOpts, { model: 'fake-model-mini', effort: 'high' });
+    // Pin the pre-P4 call-key byte contract: a default-options agent must keep
+    // producing the exact key an older runtime journaled for the same call.
+    assert.equal(started[0].agentCallKey, computeWorkflowAgentCallKey({
+      previousAgentCallKey: WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+      prompt: 'default options agent',
+      semanticOpts: { model: 'fake-model', effort: 'xhigh' },
+    }));
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow agents reject invalid effort and model values before spending tokens', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const invalidEffort = await runtime.launch({
+      script: 'export const meta = { name: "bad-effort", description: "Reject bad effort" };\nreturn await agent("never runs", { effort: "tiny" });',
+    });
+    let events = await collectEvents(runtime, invalidEffort.taskId);
+    assert.equal(events.at(-1).type, 'workflow.failed');
+    assert.equal(events.at(-1).recovery.reason, 'workflow_input_invalid');
+
+    const invalidModel = await runtime.launch({
+      script: 'export const meta = { name: "bad-model", description: "Reject blank model" };\nreturn await agent("never runs", { model: "  " });',
+    });
+    events = await collectEvents(runtime, invalidModel.taskId);
+    assert.equal(events.at(-1).type, 'workflow.failed');
+    assert.equal(events.at(-1).recovery.reason, 'workflow_input_invalid');
+
+    const placeholderModel = await runtime.launch({
+      script: 'export const meta = { name: "placeholder-model", description: "Reject reserved placeholder" };\nreturn await agent("never runs", { model: "codex-subagent" });',
+    });
+    events = await collectEvents(runtime, placeholderModel.taskId);
+    assert.equal(events.at(-1).type, 'workflow.failed');
+    assert.equal(events.at(-1).recovery.reason, 'workflow_input_invalid');
+    assert.match(runtime.get(placeholderModel.taskId).error, /reserved backend placeholder/);
+    assert.equal(backend.requests.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow runtime validates workflow sources without running agents', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const report = await runtime.validateWorkflowInput({
+      script: `export const meta = { name: "validate-demo", description: "Static authoring scan" };
+const found = await parallel([
+  () => agent("scan one", { schema: { type: "object", additionalProperties: false, properties: { detail: { type: "string" } }, required: ["detail"] } }),
+  () => agent("scan two")
+]);
+return found;`,
+    });
+    assert.equal(report.workflowName, 'validate-demo');
+    assert.equal(report.workflowSource, 'inline');
+    assert.equal(report.agentCallSites, 2);
+    assert.equal(report.schemaCallSites, 1);
+    assert.equal(report.keyedCallSites, 0);
+    assert.equal(report.warnings.length, 2);
+    assert.match(report.warnings[0], /1 of 2 agent\(\) call site\(s\) do not declare a structured output schema/);
+    assert.match(report.warnings[1], /No agent\(\) call site passes a logical \{ key \}/);
+    assert.equal(backend.requests.length, 0);
+
+    const keyed = await runtime.validateWorkflowInput({
+      script: 'export const meta = { name: "validate-keyed" };\nreturn await agent("solo", { key: "solo", schema: { type: "object", additionalProperties: false, properties: { detail: { type: "string" } }, required: ["detail"] } });',
+    });
+    assert.deepEqual(keyed.warnings, []);
+
+    // Parentheses inside prompt strings must not truncate the scanned
+    // argument span and produce false schema/key warnings.
+    const parenPrompt = await runtime.validateWorkflowInput({
+      script: 'export const meta = { name: "validate-paren" };\nreturn await agent("fix the dangling ) in parser.ts (see init()", { key: "parse-fix", schema: { type: "object", additionalProperties: false, properties: { detail: { type: "string" } }, required: ["detail"] } });',
+    });
+    assert.equal(parenPrompt.agentCallSites, 1);
+    assert.equal(parenPrompt.schemaCallSites, 1);
+    assert.equal(parenPrompt.keyedCallSites, 1);
+    assert.deepEqual(parenPrompt.warnings, []);
+
+    await assertRejectCode(
+      () => runtime.validateWorkflowInput({ script: 'export const meta = { name: "bad-date" };\nreturn Date.now();' }),
+      'workflow_script_nondeterministic',
+    );
+    await assertRejectCode(
+      () => runtime.validateWorkflowInput({ resumeFromRunId: 'run_a' }),
+      'workflow_input_invalid',
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
 test('workflow runtime rejects invalid launch inputs before side effects', async () => {
   const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend() });
   try {
@@ -129,6 +256,14 @@ test('built-in code-review runs dynamic lens finders, candidate verifiers, sweep
     assert.equal(snapshot.status, 'completed', snapshot.error || JSON.stringify(snapshot.events));
     assert.equal(backend.requests.length, 7);
     assert.ok(backend.maxActiveRequests >= 2);
+    // Funnel tiering: wide finder sweeps run at high; scope, verifiers, and
+    // synthesis keep the xhigh verdict tier.
+    const requestEfforts = backend.requests.map((request) => ({
+      finder: /^Code-review (Sweep )?Finder/.test(request.messages[0].content),
+      effort: request.reasoningEffort,
+    }));
+    assert.equal(requestEfforts.filter((entry) => entry.finder).length, 3);
+    assert.ok(requestEfforts.every((entry) => entry.effort === (entry.finder ? 'high' : 'xhigh')));
     assert.equal(snapshot.result.level, 'xhigh');
     assert.equal(snapshot.result.findings.length, 1);
     assert.equal(snapshot.result.findings[0].severity, 'P1');
@@ -684,14 +819,341 @@ return await parallel(order.map((id) => () => agent("durable:" + id, {
     );
     await writeFile(resultPath, `${JSON.stringify(resultRecord, null, 2)}\n`);
 
+    // A result record beside a journal whose terminal append was interrupted
+    // (kill window) falls through to journal-first discovery and resumes.
     const journalWithoutTerminal = `${journalText.trimEnd().split('\n').slice(0, -1).join('\n')}\n`;
     await writeFile(journalPath, journalWithoutTerminal);
+    const resumedInterrupted = await runtime2.launch({ resumeFromRunId: runId });
+    const interruptedEvents = await collectEvents(runtime2, resumedInterrupted.taskId);
+    assert.deepEqual(jsonValue(runtime2.get(resumedInterrupted.taskId).result), ['RAW:durable:a', 'RAW:durable:b']);
+    assert.equal(
+      interruptedEvents.filter((event) => event.type === 'workflow.agent.completed' && event.cached === true).length,
+      2,
+    );
+    assert.ok(interruptedEvents.some((event) => event.type === 'workflow.log' && event.message.includes('interrupted')));
+    assert.equal(backend2.requests.length, 0);
+  } finally {
+    await runtime2.close();
+  }
+});
+
+test('workflow runtime resumes failed runs and reuses completed agent results beyond the stalled prefix', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const script = `export const meta = { name: "stall-recovery" };
+const results = await parallel([
+  () => agent("recover:FAIL_ONCE first"),
+  () => agent("recover:second"),
+  () => agent("recover:third")
+]);
+if (results[0] === null) throw new Error("first agent failed after siblings completed");
+return results;`;
+    const first = await runtime.launch({ script });
+    await collectEvents(runtime, first.taskId);
+    assert.equal(runtime.get(first.taskId).status, 'failed');
+    assert.equal(backend.requests.length, 3);
+
+    const resumed = await runtime.launch({ resumeFromRunId: first.runId });
+    const events = await collectEvents(runtime, resumed.taskId);
+    assert.equal(runtime.get(resumed.taskId).status, 'completed');
+    assert.deepEqual(jsonValue(runtime.get(resumed.taskId).result), [
+      'RAW:recover:FAIL_ONCE first',
+      'RAW:recover:second',
+      'RAW:recover:third',
+    ]);
+    const cached = events.filter((event) => event.type === 'workflow.agent.completed' && event.cached === true);
+    assert.equal(cached.length, 2);
+    assert.equal(backend.requests.length, 4);
+    assert.ok(events.some((event) => (
+      event.type === 'workflow.log'
+      && event.message.includes('Resuming from')
+      && event.message.includes('failed')
+      && event.message.includes('2 completed agent result(s)')
+    )));
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow runtime resumes failed and interrupted runs across registry instances from journal state', async () => {
+  const backend1 = new FakeSubagentBackend();
+  const { runtime: runtime1, root } = await createRuntime({ backend: backend1 });
+  const stateDir = join(root, '.ultracode-for-codex');
+  const script = `export const meta = { name: "durable-failure-resume" };
+const results = await parallel([
+  () => agent("durable-fail:FAIL_ONCE first"),
+  () => agent("durable-fail:second"),
+  () => agent("durable-fail:third")
+]);
+if (results[0] === null) throw new Error("first agent failed after siblings completed");
+return results;`;
+  let runId;
+  try {
+    const first = await runtime1.launch({ script });
+    await collectEvents(runtime1, first.taskId);
+    assert.equal(runtime1.get(first.taskId).status, 'failed');
+    runId = first.runId;
+  } finally {
+    await runtime1.close();
+  }
+
+  const backend2 = new FakeSubagentBackend();
+  const runtime2 = new WorkflowTaskRegistry({
+    backend: backend2,
+    cwd: root,
+    stateDir,
+    requestTimeoutMs: 30_000,
+  });
+  try {
+    // Journal-first durable discovery: a failed run has no result record.
+    const resumedOnce = await runtime2.launch({ resumeFromRunId: runId });
+    const onceEvents = await collectEvents(runtime2, resumedOnce.taskId);
+    assert.equal(runtime2.get(resumedOnce.taskId).status, 'failed');
+    assert.equal(onceEvents.filter((event) => event.type === 'workflow.agent.completed' && event.cached === true).length, 2);
+    assert.equal(backend2.requests.length, 1);
+
+    // Resuming the failed resume completes once the flaky agent recovers.
+    const resumedTwice = await runtime2.launch({ resumeFromRunId: resumedOnce.runId });
+    await collectEvents(runtime2, resumedTwice.taskId);
+    assert.equal(runtime2.get(resumedTwice.taskId).status, 'completed');
+    assert.deepEqual(jsonValue(runtime2.get(resumedTwice.taskId).result), [
+      'RAW:durable-fail:FAIL_ONCE first',
+      'RAW:durable-fail:second',
+      'RAW:durable-fail:third',
+    ]);
+
+    const journalPath = workflowJournalPath(join(stateDir, 'subagents', 'workflows', runId));
+    const journalText = await readFile(journalPath, 'utf8');
+    const journalLines = journalText.trimEnd().split('\n');
+
+    // A torn final line (partial JSON, no newline) is dropped as truncated.
+    const tornTail = journalLines.at(-1).slice(0, Math.floor(journalLines.at(-1).length / 2));
+    await writeFile(journalPath, `${journalLines.slice(0, -1).join('\n')}\n${tornTail}`);
+    const resumedTorn = await runtime2.launch({ resumeFromRunId: runId });
+    await collectEvents(runtime2, resumedTorn.taskId);
+    assert.equal(runtime2.get(resumedTorn.taskId).status, 'completed');
+
+    // A complete-JSON final line missing only its newline was never durably
+    // committed and is dropped the same way.
+    await writeFile(journalPath, journalText.trimEnd());
+    const resumedUnterminated = await runtime2.launch({ resumeFromRunId: runId });
+    const unterminatedEvents = await collectEvents(runtime2, resumedUnterminated.taskId);
+    assert.equal(runtime2.get(resumedUnterminated.taskId).status, 'completed');
+    assert.ok(unterminatedEvents.some((event) => event.type === 'workflow.log' && event.message.includes('interrupted')));
+
+    // A broken hash chain rejects the source fail-loud.
+    const tamperedLines = journalLines.map((line) => (
+      line.includes('"RAW:durable-fail:second"') ? line.replace('RAW:durable-fail:second', 'RAW:durable-fail:tampered') : line
+    ));
+    assert.notDeepEqual(tamperedLines, journalLines);
+    await writeFile(journalPath, `${tamperedLines.join('\n')}\n`);
     await assertRejectCode(
       () => runtime2.launch({ resumeFromRunId: runId }),
       'workflow_input_invalid',
     );
   } finally {
     await runtime2.close();
+  }
+});
+
+test('workflow runtime refuses to resume a run whose process is still alive', async () => {
+  const backend1 = new FakeSubagentBackend();
+  const { runtime: runtime1, root } = await createRuntime({ backend: backend1 });
+  const stateDir = join(root, '.ultracode-for-codex');
+  const runtime2 = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(),
+    cwd: root,
+    stateDir,
+    requestTimeoutMs: 30_000,
+  });
+  try {
+    const launch = await runtime1.launch({
+      script: 'export const meta = { name: "live-run" };\nreturn await agent("WAIT");',
+    });
+    await waitForEvent(runtime1, launch.taskId, 'workflow.agent.started');
+    // runtime2 is a separate registry over the same durable state, standing in
+    // for a fresh CLI process; the source run's process (this one) is alive.
+    await assertRejectCode(
+      () => runtime2.launch({ resumeFromRunId: launch.runId }),
+      'workflow_resume_running',
+    );
+    await runtime1.cancel(launch.taskId);
+    await collectEvents(runtime1, launch.taskId);
+  } finally {
+    await runtime2.close();
+    await runtime1.close();
+  }
+});
+
+test('workflow runtime fails loud on corrupt result records and post-terminal journal bytes', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  const stateDir = join(root, '.ultracode-for-codex');
+  const runtime2 = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(),
+    cwd: root,
+    stateDir,
+    requestTimeoutMs: 30_000,
+  });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "fail-loud-demo" };\nreturn await agent("solo agent");',
+    });
+    await collectEvents(runtime, launch.taskId);
+    assert.equal(runtime.get(launch.taskId).status, 'completed');
+    const resultPath = join(stateDir, 'workflows', `${launch.runId}.result.json`);
+    const journalPath = workflowJournalPath(join(stateDir, 'subagents', 'workflows', launch.runId));
+    const resultText = await readFile(resultPath, 'utf8');
+    const journalText = await readFile(journalPath, 'utf8');
+
+    // A result record that exists but cannot be parsed must not be silently
+    // ignored in favor of journal-first discovery.
+    await writeFile(resultPath, 'not json');
+    await assertRejectCode(
+      () => runtime2.launch({ resumeFromRunId: launch.runId }),
+      'workflow_input_invalid',
+    );
+    await writeFile(resultPath, resultText);
+
+    // Bytes after the terminal entry are external interference; the completed
+    // source must not be rescued through journal-first discovery.
+    await writeFile(journalPath, `${journalText}{"partial`);
+    await assertRejectCode(
+      () => runtime2.launch({ resumeFromRunId: launch.runId }),
+      'workflow_input_invalid',
+    );
+    await writeFile(journalPath, journalText);
+  } finally {
+    await runtime2.close();
+    await runtime.close();
+  }
+});
+
+test('workflow retry resumes the failed run and reuses completed agent results', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const script = `export const meta = { name: "retry-reuses-cache" };
+const results = await parallel([
+  () => agent("retry-cache:FAIL_ONCE first"),
+  () => agent("retry-cache:second"),
+  () => agent("retry-cache:third")
+]);
+if (results[0] === null) throw new Error("first agent failed after siblings completed");
+return results;`;
+    const first = await runtime.launch({ script });
+    await collectEvents(runtime, first.taskId);
+    assert.equal(runtime.get(first.taskId).status, 'failed');
+    assert.equal(backend.requests.length, 3);
+
+    const retried = await runtime.retry(first.taskId);
+    const events = await collectEvents(runtime, retried.taskId);
+    assert.equal(runtime.get(retried.taskId).status, 'completed');
+    assert.equal(events.filter((event) => event.type === 'workflow.agent.completed' && event.cached === true).length, 2);
+    assert.equal(backend.requests.length, 4);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow agents reject duplicate logical keys at reservation time', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "dup-key" };\nawait agent("first keyed", { key: "dup" });\nreturn await agent("second keyed", { key: "dup" });',
+    });
+    const events = await collectEvents(runtime, launch.taskId);
+    assert.equal(events.at(-1).type, 'workflow.failed');
+    assert.equal(events.at(-1).recovery.reason, 'workflow_input_invalid');
+    assert.match(runtime.get(launch.taskId).error, /already used/);
+    assert.equal(backend.requests.length, 1);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow runtime warns when a resume runs under a different backend model', async () => {
+  const backend1 = new FakeSubagentBackend();
+  const { runtime: runtime1, root } = await createRuntime({ backend: backend1 });
+  const stateDir = join(root, '.ultracode-for-codex');
+  let runId;
+  try {
+    const launch = await runtime1.launch({
+      script: 'export const meta = { name: "model-mismatch" };\nawait agent("model:kept");\nreturn await agent("model:FAIL_AGENT tail");',
+    });
+    await collectEvents(runtime1, launch.taskId);
+    assert.equal(runtime1.get(launch.taskId).status, 'failed');
+    runId = launch.runId;
+  } finally {
+    await runtime1.close();
+  }
+
+  const backend2 = new FakeSubagentBackend();
+  backend2.model = 'fake-model-b';
+  const runtime2 = new WorkflowTaskRegistry({
+    backend: backend2,
+    cwd: root,
+    stateDir,
+    requestTimeoutMs: 30_000,
+  });
+  try {
+    const resumed = await runtime2.launch({ resumeFromRunId: runId });
+    const events = await collectEvents(runtime2, resumed.taskId);
+    assert.ok(events.some((event) => event.type === 'workflow.log' && event.message.includes('Resume model mismatch')));
+    assert.equal(events.filter((event) => event.type === 'workflow.agent.completed' && event.cached === true).length, 0);
+  } finally {
+    await runtime2.close();
+  }
+});
+
+test('workflow runtime discloses workspace drift on resume without blocking cache reuse', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    // README.md is tracked and already dirty before the source run, so only
+    // its CONTENT changes between the runs — the status listing is identical.
+    await writeFile(join(root, 'README.md'), '# worktree fixture\ndirty before the run\n');
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "drift-demo" };\nawait agent("drift:kept");\nreturn await agent("drift:FAIL_ONCE tail");',
+    });
+    await collectEvents(runtime, launch.taskId);
+    assert.equal(runtime.get(launch.taskId).status, 'failed');
+
+    await writeFile(join(root, 'README.md'), '# worktree fixture\ndirty with different content\n');
+
+    const resumed = await runtime.launch({ resumeFromRunId: launch.runId });
+    const events = await collectEvents(runtime, resumed.taskId);
+    assert.equal(runtime.get(resumed.taskId).status, 'completed');
+    assert.ok(events.some((event) => event.type === 'workflow.log' && event.message.includes('Workspace changed')));
+    assert.equal(events.filter((event) => event.type === 'workflow.agent.completed' && event.cached === true).length, 1);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow runtime accepts cancelled runs as resume sources and surfaces the abort reason', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "cancel-resume" };\nawait agent("done early");\nreturn await agent(String(args && args.tail ? args.tail : "WAIT"));',
+    });
+    await waitForEvent(runtime, launch.taskId, 'workflow.agent.completed');
+    await runtime.cancel(launch.taskId);
+    await collectEvents(runtime, launch.taskId);
+    assert.equal(runtime.get(launch.taskId).status, 'failed');
+
+    const resumed = await runtime.launch({ resumeFromRunId: launch.runId, args: { tail: 'tail done' } });
+    const events = await collectEvents(runtime, resumed.taskId);
+    assert.equal(runtime.get(resumed.taskId).status, 'completed');
+    assert.equal(jsonValue(runtime.get(resumed.taskId).result), 'RAW:tail done');
+    assert.ok(events.some((event) => event.type === 'workflow.log' && event.message.includes('workflow_aborted')));
+    assert.equal(events.filter((event) => event.type === 'workflow.agent.completed' && event.cached === true).length, 1);
+  } finally {
+    await runtime.close();
   }
 });
 

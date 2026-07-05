@@ -185,7 +185,9 @@ async function validateExtractedPackage(packageDir) {
     name: 'ultracode-for-codex',
     requiredText: [
       'Codex main context as the orchestrator',
-      'Use the CLI runtime only when the user explicitly asks',
+      'delegate fan-out phases to the local CLI runtime',
+      '--validate',
+      '--resume-from-run-id',
       'Situation Choice Matrix',
       'cumulative ledger',
       'references/progress-visuals.md',

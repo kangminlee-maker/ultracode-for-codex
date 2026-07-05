@@ -1,15 +1,19 @@
 # Ultracode for Codex
 
 Dynamic workflows redesigned for Codex, with parallel subagents, visible
-progress, and an optional local CLI runtime.
+progress, and a local CLI runtime for durable, resumable execution.
 
-The default experience is Codex-native: you ask for `$ultracode-for-codex`, and
-the main Codex chat becomes the orchestrator. It plans the next useful phase,
-runs independent subagents in parallel when that helps, summarizes their
-findings, and shows compact progress snapshots directly in the conversation.
+The default experience is hybrid: you ask for `$ultracode-for-codex`, and the
+main Codex chat becomes the orchestrator. It plans the next useful phase,
+delegates heavy parallel work to the local CLI workflow runtime when the
+package is installed, summarizes results, and shows compact progress
+snapshots directly in the conversation. Delegated phases get schema-enforced
+agent outputs, per-agent effort/model tiers, a durable journal, and resume
+after failures — and they keep running even if the chat session stops.
 
-A local CLI runtime is included for users who want background jobs, reproducible
-workflow runs, package checks, or attached terminal execution.
+The same CLI runtime is available directly for background jobs, reproducible
+workflow runs, package checks, or attached terminal execution. Without the
+CLI, the skill falls back to Codex-native subagents.
 
 ## Why Use It
 
@@ -137,8 +141,9 @@ npm exec -- ultracode-for-codex run \
 The built-in `code-review` workflow collects bounded repository evidence,
 chooses review lenses, runs finder agents in parallel, verifies each candidate,
 and returns JSON with `findings`, `provenance`, `synthesis`, and `stats`.
-Use `{"level":"high"}` to skip the final sweep, or omit it for the default
-`xhigh` review.
+Finder-class agents run at the `high` effort tier while verification and
+synthesis stay at `xhigh`. Use `{"level":"high"}` to skip the final sweep, or
+omit it for the default `xhigh` review.
 
 CLI runs use OS background execution by default. The command prints a launch
 record with a `jobId`, then you can inspect or control the job:
@@ -162,7 +167,9 @@ npm exec -- ultracode-for-codex run \
   --args '{"prompt":"check the release plan"}'
 ```
 
-Resume a completed local workflow from preserved runtime state:
+Resume a completed, failed, cancelled, or interrupted local workflow from
+preserved runtime state (run it from the source run's working directory;
+`status <jobId>` reports the `runId` and `cwd`):
 
 ```bash
 npm exec -- ultracode-for-codex run \
@@ -172,12 +179,21 @@ npm exec -- ultracode-for-codex run \
   --resume-from-run-id run_...
 ```
 
+Validate an authored workflow script without spending agent tokens:
+
+```bash
+npm exec -- ultracode-for-codex run \
+  --accept-llm-guide=v1 \
+  --validate \
+  --script-file .codex/workflows/review.js
+```
+
 ## What Gets Installed
 
 The package includes:
 
 - `ultracode-for-codex`: the local CLI binary;
-- `skills/ultracode-for-codex`: the recommended Codex-native skill;
+- `skills/ultracode-for-codex`: the recommended hybrid orchestration skill;
 - `skills/ultracode-for-codex-cli`: the explicit CLI/runtime skill;
 - `settings.json`: default CLI runtime settings;
 - `ULTRACODE_INSTALL.md`: detailed install and operating guide for agents.
@@ -239,7 +255,7 @@ npm run publish:dry-run
 ## More Documentation
 
 - `ULTRACODE_INSTALL.md`: detailed install and operating guide.
-- `skills/ultracode-for-codex/SKILL.md`: Codex-native orchestration behavior.
+- `skills/ultracode-for-codex/SKILL.md`: hybrid orchestration behavior.
 - `skills/ultracode-for-codex/references/progress-visuals.md`: progress display
   examples.
 - `skills/ultracode-for-codex-cli/SKILL.md`: CLI runtime behavior.

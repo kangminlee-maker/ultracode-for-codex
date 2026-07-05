@@ -11,8 +11,9 @@ Use this skill for the npm package and CLI runtime surface. Runtime authority fo
 this path lives in the `ultracode-for-codex` binary, tests, package exports,
 journal layer, and workflow runtime code.
 
-The default `$ultracode-for-codex` skill is Codex-native and keeps orchestration
-in the main context. This `$ultracode-for-codex-cli` skill is for explicit CLI
+The default `$ultracode-for-codex` skill is Codex-native and keeps planning
+and synthesis in the main context while delegating fan-out phase execution to
+this CLI runtime. This `$ultracode-for-codex-cli` skill is for explicit CLI
 runtime work: background execution, attached runs, package validation, release
 preparation, installed E2E checks, runtime-boundary checks, and local workflow
 artifacts.
@@ -56,10 +57,19 @@ CLI behavior:
   deletion with `archive` or `export`;
 - `wait --result`, `cancel --wait`, `logs --event <event>`, and `--plain`
   provide focused foreground checks;
-- `--resume-from-run-id <runId>` resumes a completed local workflow from
-  preserved runtime state, rejects additional workflow source selectors, and
-  reuses completed agent results only when the runtime-owned call keys still
-  match;
+- `--resume-from-run-id <runId>` resumes a completed, failed, cancelled, or
+  interrupted local workflow from preserved runtime state, rejects additional
+  workflow source selectors, and reuses completed agent results only when the
+  runtime-owned call keys still match; without `--model` it adopts the source
+  run's model, and it must run from the source run's working directory;
+- `run --validate` resolves and parses a workflow source without running
+  agents: structural problems fail loudly, and static schema/key warnings are
+  printed for the author;
+- `status` and `jobs` report the workflow `runId` and `cwd` needed for resume
+  once the child has emitted `workflow.started`;
+- script `agent()` calls accept per-agent `effort` and `model` options; the
+  built-in `code-review` runs finder-class agents at `high` and verdict-class
+  agents at `xhigh`;
 - attached execution is available with `--execution attached` when the caller
   should stay connected until completion;
 - attached progress prints to stderr as JSONL by default;
@@ -108,9 +118,12 @@ CLI behavior:
 - Treat workflow state under `${ULTRACODE_FOR_CODEX_HOME:-~/.ultracode-for-codex}`
   as sensitive local data. Project-local `.ultracode-for-codex/` is legacy
   state and should stay ignored if present.
-- `--resume-from-run-id` reads preserved script, result, and completed journal
-  state from the global workflow state root; script path, script source
-  identity, and inherited args must match the completed journal.
+- `--resume-from-run-id` reads preserved script and journal state from the
+  global workflow state root; completed sources bind through the result
+  record, while failed, cancelled, and interrupted sources are discovered
+  journal-first. Script path, script source identity, and inherited args must
+  match the source journal. Resumed launches disclose the source terminal
+  reason, model mismatches, and workspace drift as progress log lines.
 - Use `isolation: "worktree"` only inside a git repo with at least one commit;
   isolated worktrees are intentionally preserved for review, including clean
   worktrees.

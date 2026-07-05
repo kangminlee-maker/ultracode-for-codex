@@ -1,6 +1,16 @@
 export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 export type Verbosity = 'low' | 'medium' | 'high';
 
+export const REASONING_EFFORTS: readonly ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+
+// Backend model name used when no run-level model is configured. It is a
+// projection placeholder, never a real Codex model id.
+export const SUBAGENT_MODEL_PLACEHOLDER = 'codex-subagent';
+
+export function isReasoningEffort(value: unknown): value is ReasoningEffort {
+  return typeof value === 'string' && (REASONING_EFFORTS as readonly string[]).includes(value);
+}
+
 export interface SubagentMessage {
   readonly role: 'user';
   readonly content: string;

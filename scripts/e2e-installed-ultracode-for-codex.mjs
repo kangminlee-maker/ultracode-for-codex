@@ -35,6 +35,9 @@ const externalWorktreeStore = join(dirname(consumerDir), '.ultracode-for-codex-w
 const codexHome = join(consumerDir, '.codex-home');
 const ultracodeHome = `${consumerDir}-ultracode-home`;
 const fakeCodexPath = join(consumerDir, 'fake-codex.cjs');
+// Keep turn records outside the consumer workspace so they never perturb
+// review evidence snapshots or resume cache identity.
+const fakeTurnsPath = `${consumerDir}-fake-codex-turns.jsonl`;
 
 try {
   await writeFile(join(consumerDir, 'package.json'), JSON.stringify({
@@ -69,6 +72,7 @@ try {
   await assertBuiltinCodeReviewPlain(installedCli);
   await assertBuiltinCodeReviewInvalidEvidence(installedCli);
   await assertInstalledReviewEvidenceContext(installedCli);
+  await assertValidateMode(installedCli);
   await assertPlainProgress(installedCli);
   await assertPermissionAllow(installedCli);
   await assertRetry(installedCli);
@@ -86,6 +90,7 @@ try {
     await rm(consumerDir, { recursive: true, force: true });
     await rm(externalWorktreeStore, { recursive: true, force: true });
     await rm(ultracodeHome, { recursive: true, force: true });
+    await rm(fakeTurnsPath, { force: true });
   }
 }
 
@@ -150,11 +155,13 @@ async function assertSkillCommandPackageContents(installedPackageDir) {
   const cliAgent = await readFile(join(installedPackageDir, 'skills', 'ultracode-for-codex-cli', 'agents', 'openai.yaml'), 'utf8');
   assert.match(nativeSkill, /^name: ultracode-for-codex$/m);
   assert.match(nativeSkill, /Codex main context as the orchestrator/);
-  assert.match(nativeSkill, /Use the CLI runtime only when the user explicitly asks/);
+  assert.match(nativeSkill, /delegate fan-out phases to the local CLI runtime/);
+  assert.match(nativeSkill, /--resume-from-run-id/);
+  assert.match(nativeSkill, /--validate/);
   assert.match(nativeSkill, /Situation Choice Matrix/);
   assert.match(nativeSkill, /cumulative ledger/);
   assert.match(nativeSkill, /references\/progress-visuals\.md/);
-  assert.match(nativeAgent, /Run Codex-native phase-wise parallel orchestration/);
+  assert.match(nativeAgent, /Run hybrid phase-wise parallel orchestration/);
   assert.match(nativeProgressVisuals, /Cumulative Ledger Rule/);
   assert.match(nativeProgressVisuals, /Situation Choice Matrix/);
   assert.match(nativeProgressVisuals, /Each row has at most three user-facing/);
@@ -497,8 +504,44 @@ async function assertBuiltinPlanProgress(installedCli) {
   assertProgressEvent(progress, 'workflow.review.recommended', { status: 'review_recommended' });
 }
 
+async function assertValidateMode(installedCli) {
+  // Keep authored validation fixtures outside the consumer workspace so they
+  // never perturb review evidence snapshots.
+  const authoredPath = `${consumerDir}-validate-authored.js`;
+  await writeFile(authoredPath, [
+    'export const meta = { name: "validate-authored", description: "Authored phase demo" };',
+    'return await parallel([() => agent("a"), () => agent("b")]);',
+    '',
+  ].join('\n'));
+  try {
+    const valid = runCli(installedCli, ['--validate', '--script-file', authoredPath]);
+    assert.equal(valid.status, 0, valid.stderr);
+    const report = JSON.parse(valid.stdout);
+    assert.equal(report.kind, 'ultracode.workflow.validate');
+    assert.equal(report.status, 'valid');
+    assert.equal(report.workflowName, 'validate-authored');
+    assert.equal(report.agentCallSites, 2);
+    assert.equal(report.schemaCallSites, 0);
+    assert.equal(report.warnings.length, 2);
+    assert.match(report.warnings[0], /do not declare a structured output schema/);
+    assert.match(report.warnings[1], /logical \{ key \}/);
+
+    await writeFile(authoredPath, [
+      'export const meta = { name: "validate-bad" };',
+      'return Date.now();',
+      '',
+    ].join('\n'));
+    const invalid = runCli(installedCli, ['--validate', '--script-file', authoredPath]);
+    assert.notEqual(invalid.status, 0);
+    assert.match(`${invalid.stdout}\n${invalid.stderr}`, /workflow_script_nondeterministic/);
+  } finally {
+    await rm(authoredPath, { force: true });
+  }
+}
+
 async function assertBuiltinCodeReviewJsonl(installedCli) {
   await writeCodeReviewFixture();
+  await rm(fakeTurnsPath, { force: true });
   const result = runCliAttached(installedCli, [
     '--name',
     'code-review',
@@ -508,6 +551,15 @@ async function assertBuiltinCodeReviewJsonl(installedCli) {
     'allow',
   ]);
   assert.equal(result.status, 0);
+  // Funnel tiering: finder-class turns run at high; scope, verifier, and
+  // synthesis turns keep the xhigh verdict tier.
+  const turnRecords = (await readFile(fakeTurnsPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+  const finderTurns = turnRecords.filter((record) => /^Code-review (Sweep )?Finder/.test(record.promptHead));
+  assert.equal(finderTurns.length, 3);
+  assert.ok(finderTurns.every((record) => record.effort === 'high'), JSON.stringify(finderTurns));
+  const verdictTurns = turnRecords.filter((record) => !/^Code-review (Sweep )?Finder/.test(record.promptHead));
+  assert.ok(verdictTurns.length >= 4, JSON.stringify(turnRecords));
+  assert.ok(verdictTurns.every((record) => record.effort === 'xhigh'), JSON.stringify(verdictTurns));
   const progress = progressEvents(result.stderr);
   const output = JSON.parse(result.stdout);
   assert.equal(output.level, 'xhigh');
@@ -910,6 +962,7 @@ function cliEnv() {
     CODEX_HOME: codexHome,
     FAKE_ASSERT_NO_DIRECT_PROVIDER_ENV: '1',
     FAKE_EXPECT_CLIENT_VERSION: pkg.version,
+    FAKE_TURNS_PATH: fakeTurnsPath,
     OPENAI_API_KEY: 'fake-openai-key',
     OPENAI_BASE_URL: 'https://example.invalid/openai',
     ULTRACODE_FOR_CODEX_HOME: ultracodeHome,
@@ -1315,6 +1368,12 @@ rl.on('line', (line) => {
     result(payload.id, { turn: { id: turnId } });
     const effort = payload.params && payload.params.effort;
     const outputSchema = payload.params && payload.params.outputSchema;
+    if (process.env.FAKE_TURNS_PATH) {
+      require('node:fs').appendFileSync(process.env.FAKE_TURNS_PATH, JSON.stringify({
+        promptHead: reviewPromptText(input).split('\n')[0] || '',
+        effort: effort || null,
+      }) + '\n');
+    }
     if (outputSchema?.properties?.phases) {
       setTimeout(() => emitTurn(threadId, turnId, JSON.stringify({
         mode: 'phase_parallel',

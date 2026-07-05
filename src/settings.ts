@@ -1,5 +1,8 @@
 import { readFileSync } from 'node:fs';
 import type { ReasoningEffort, Verbosity } from './runtime/types.js';
+import { REASONING_EFFORTS, isReasoningEffort } from './runtime/types.js';
+
+export { isReasoningEffort };
 
 export type WorkflowExecutionMode = 'background' | 'attached';
 export type WorkflowProgressMode = 'jsonl' | 'plain';
@@ -30,7 +33,6 @@ const SETTINGS_URL = new URL('../settings.json', import.meta.url);
 const WORKFLOW_EXECUTION_MODES = ['background', 'attached'] as const;
 const WORKFLOW_PROGRESS_MODES = ['jsonl', 'plain'] as const;
 const WORKFLOW_PERMISSION_POLICIES = ['ask', 'allow', 'deny'] as const;
-const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const;
 const VERBOSITIES = ['low', 'medium', 'high'] as const;
 
 let cachedSettings: UltracodeSettings | null = null;
@@ -142,10 +144,6 @@ export function codexDefaultReasoningEffort(): ReasoningEffort {
 
 export function codexDefaultVerbosity(): Verbosity {
   return loadSettings().codex.verbosity;
-}
-
-export function isReasoningEffort(value: unknown): value is ReasoningEffort {
-  return typeof value === 'string' && REASONING_EFFORTS.includes(value as ReasoningEffort);
 }
 
 export function isVerbosity(value: unknown): value is Verbosity {

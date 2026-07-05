@@ -187,6 +187,10 @@ Required refinements:
 - Keep broad `model`, `effort`, and `agentType` options out of the next
   implementation. If the review harness adds a logical key option, keep it
   narrow, validated, and covered by cache-key tests.
+  - Correction (2026-07-05, P4-A): `model` and `effort` shipped as narrow,
+    runtime-validated `agent()` options with byte-compatible default cache
+    identity; see `docs/ultracode-p4-hybrid-orchestration-design.md`. Only
+    `agentType` and budget-driven tiering remain deferred.
 - Revisit `MAX_SCRIPT_BYTES = 64 * 1024` only if the specialized built-in script
   exceeds it. If raised, add a size-cap test and keep the new cap explicit.
 

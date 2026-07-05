@@ -49,6 +49,8 @@ export interface WorkflowRunStartedEntry extends WorkflowJournalEntryEnvelope {
   readonly runtime: {
     readonly schemaVersion: 1;
     readonly cwd: string;
+    readonly model?: string;
+    readonly workspaceFingerprint?: string;
   };
 }
 
@@ -113,6 +115,13 @@ export type WorkflowJournalEntryPayload =
 export interface WorkflowJournalReadResult {
   readonly entries: readonly WorkflowJournalEntry[];
   readonly truncatedTail: boolean;
+}
+
+export interface WorkflowJournalReadOptions {
+  // An unterminated final line was never durably committed (the writer emits
+  // entry+newline as one buffer), so non-completed resume sources may drop it
+  // even when the bytes happen to parse as complete JSON.
+  readonly dropUnterminatedTail?: boolean;
 }
 
 export interface WorkflowJournalDurability {
@@ -367,22 +376,33 @@ export function workflowJournalHash(entryWithoutEntryHash: unknown): string {
   return sha256(stableJson(entryWithoutEntryHash));
 }
 
-export async function readWorkflowJournal(journalPath: string): Promise<WorkflowJournalReadResult> {
+export async function readWorkflowJournal(
+  journalPath: string,
+  options?: WorkflowJournalReadOptions,
+): Promise<WorkflowJournalReadResult> {
   const raw = await readFile(journalPath, 'utf8');
   const endsWithNewline = raw.endsWith('\n');
   const lines = raw.split('\n');
   if (endsWithNewline) lines.pop();
   let truncatedTail = false;
   if (!endsWithNewline && lines.length > 0) {
-    const tail = lines[lines.length - 1] ?? '';
-    try {
-      JSON.parse(tail);
-      throw new WorkflowJournalValidationError('workflow journal has a non-newline-terminated JSON entry.');
-    } catch (err) {
-      if (err instanceof WorkflowJournalValidationError) throw err;
-      if (!isTruncationParseError(err)) throw err;
+    if (options?.dropUnterminatedTail) {
+      // The writer emits entry+newline in one buffer, so a missing newline
+      // means the entry was never durably committed, whatever its bytes parse
+      // as; drop it without depending on parser error message shapes.
       lines.pop();
       truncatedTail = true;
+    } else {
+      const tail = lines[lines.length - 1] ?? '';
+      try {
+        JSON.parse(tail);
+        throw new WorkflowJournalValidationError('workflow journal has a non-newline-terminated JSON entry.');
+      } catch (err) {
+        if (err instanceof WorkflowJournalValidationError) throw err;
+        if (!isTruncationParseError(err)) throw err;
+        lines.pop();
+        truncatedTail = true;
+      }
     }
   }
   const entries = lines.map((line, index) => parseJournalLine(line, index + 1));
@@ -524,6 +544,13 @@ function assertRunStarted(record: Record<string, unknown>): void {
   const runtime = asRecord(record.runtime);
   if (!runtime || runtime.schemaVersion !== 1 || typeof runtime.cwd !== 'string') {
     throw new WorkflowJournalValidationError('runtime must include schemaVersion 1 and cwd.');
+  }
+  rejectUnknownKeys(runtime, ['schemaVersion', 'cwd', 'model', 'workspaceFingerprint'], 'runtime');
+  if (runtime.model !== undefined && (typeof runtime.model !== 'string' || !runtime.model)) {
+    throw new WorkflowJournalValidationError('runtime.model must be a non-empty string.');
+  }
+  if (runtime.workspaceFingerprint !== undefined && typeof runtime.workspaceFingerprint !== 'string') {
+    throw new WorkflowJournalValidationError('runtime.workspaceFingerprint must be a string.');
   }
 }
 

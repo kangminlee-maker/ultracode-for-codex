@@ -1,31 +1,38 @@
 ---
 name: ultracode-for-codex
-description: Run Ultracode for Codex in Codex-native mode, with the main Codex context planning phases, spawning parallel subagents, synthesizing results, and showing progress directly in the chat.
+description: Run Ultracode for Codex in hybrid mode, with the main Codex context planning phases, delegating fan-out phases to the local CLI workflow runtime for schema-enforced, journaled, resumable parallel execution, and showing progress directly in the chat.
 ---
 
 # Ultracode for Codex
 
 ## Core Rule
 
-This skill is the primary Codex-native Ultracode command. Treat the current
-Codex main context as the orchestrator. Plan adaptive phases, spawn focused
-subagents directly from Codex, synthesize phase outputs, and keep the user
-informed in the chat.
+This skill is the primary Codex Ultracode command. Treat the current
+Codex main context as the orchestrator: plan adaptive phases, synthesize
+phase outputs, and keep the user informed in the chat. For execution,
+delegate fan-out phases to the local CLI runtime (`ultracode-for-codex run`)
+when the package is available. The runtime enforces structured agent
+outputs, journals every agent result durably, runs agents in parallel with
+per-agent `effort`/`model` tiers, and keeps failed or interrupted phases
+resumable.
 
-Use the CLI runtime only when the user explicitly asks for `$ultracode-for-codex-cli`,
-CLI execution, background jobs, packaging, publish preparation, installed
-runtime validation, or reproducible local runtime artifacts.
+Codex-native subagents remain the fallback execution path when the CLI
+runtime is unavailable in the session.
 
-## Required Capability Surface
+## Capability Detection
 
-Use Codex subagent tools for delegated work. If subagent tools are not visible,
-search for the multi-agent tools first. If no subagent surface is available,
-state that native parallel orchestration is unavailable in this session and
-continue with the best single-context workflow.
+Before the first delegated phase, check the CLI runtime once:
 
-Do not make the CLI process the default orchestrator for this skill. The npm
-runtime remains available through `$ultracode-for-codex-cli`, but this command's
-value is high-visibility orchestration in the main context.
+```bash
+npm exec --no -- ultracode-for-codex --version || ultracode-for-codex --version
+```
+
+The `--no` flag keeps `npm exec` from fetching the package when it is not
+already installed; detection must never trigger an install.
+
+If neither resolves, say that the CLI runtime is unavailable, continue with
+Codex-native subagents, and note that per-agent tiering, schema enforcement,
+and crash recovery are unavailable in that mode.
 
 ## Native Workflow
 
@@ -42,15 +49,15 @@ Phase Inspect - 3 agents
 - Tests/package: check coverage, package contents, and install behavior.
 ```
 
-4. Spawn independent phase agents in parallel by default. Use a single agent
-   only when parallel work is risky, wasteful, or blocked by a strictly
-   sequential dependency.
-5. Keep subagent prompts concrete and bounded. Give each agent a distinct angle,
-   expected output shape, and file or responsibility boundary when relevant.
-6. While agents run, do non-overlapping main-context work such as deterministic
-   file inspection, test execution, or integration planning.
-7. As agents complete, report progress with a visual snapshot rather than a
-   dense sentence. Use the Default Live Snapshot golden shape from
+4. Execute fan-out phases through the CLI runtime (see Delegated Phase
+   Execution). Use a direct Codex-native subagent only on the fallback path,
+   or for a single quick delegated lookup where a background run adds no
+   value.
+5. While a phase runs, do non-overlapping main-context work such as
+   deterministic file inspection, test execution, or integration planning.
+6. As agents complete, report progress with a visual snapshot rather than a
+   dense sentence; source the numbers from the run's progress records
+   (`status`, `logs --tail`). Use the Default Live Snapshot golden shape from
    `references/progress-visuals.md` by default. Select task-specific additions
    from the Situation Choice Matrix in that reference. Within one user
    request, keep a cumulative ledger: do not remove completed rows from later
@@ -70,14 +77,69 @@ Checks 5 passed | 0 failed | 2 running
 Elapsed 1m 12s
 ```
 
-8. Synthesize each phase before deciding the next phase. Preserve disagreement,
-   uncertainty, material risks, and exact evidence.
-9. After the final synthesis, include the Completion Impact Summary and
-   Plan-Style Result Summary golden shapes from `references/progress-visuals.md`,
-   followed by a short phase/agent summary.
-10. Recommend that the current session LLM critically re-check the final result
-    before the user relies on it, especially for code, security, release, or
-    architecture decisions.
+7. Synthesize each phase before deciding the next phase. Preserve
+   disagreement, uncertainty, material risks, and exact evidence.
+8. After the final synthesis, include the Completion Impact Summary and
+   Plan-Style Result Summary golden shapes from
+   `references/progress-visuals.md`, followed by a short phase/agent summary.
+9. Recommend that the current session LLM critically re-check the final result
+   before the user relies on it, especially for code, security, release, or
+   architecture decisions.
+
+## Delegated Phase Execution
+
+For each phase that fans out subagents:
+
+1. Select a built-in when it fits — `--name code-review` for review phases,
+   `--name task` for generic phase work; built-ins already enforce schemas,
+   logical keys, and evidence discipline. Otherwise author a small per-phase
+   workflow script.
+2. Authoring contract: `ultracode-for-codex --llm-guide`, section "Author A
+   Workflow Script", is the authoritative script contract. Non-negotiables:
+   pure-literal `meta`; `schema` on every machine-consumed `agent()` call;
+   logical `key`s bound to the evidence snapshot for dynamic parallel agents,
+   never reused within a run; no `Date` or `Math.random`; funnel-tier with
+   `effort` — sweeps and finder-style scans at `high`, verdicts and synthesis
+   at `xhigh`.
+3. Validate before launching; validation spends no agent tokens:
+
+```bash
+npm exec -- ultracode-for-codex run \
+  --accept-llm-guide=v1 \
+  --validate \
+  --script-file ./phase-review.js
+```
+
+   Fix hard failures. Treat schema/key warnings as prompts to fix the script,
+   not noise.
+4. Show the authored script path (and the script itself when short) in the
+   chat, then launch the default background run with `--permission allow`.
+   The user's approval of the launch command is the human gate;
+   `--permission allow` records a standing grant bound to that exact script
+   hash, so any script edit requires a fresh decision.
+5. Record the recovery anchor in the chat as soon as the child starts:
+   `status <jobId>` reports the `runId` and `cwd` a later resume needs. The
+   launch record alone carries only the `jobId`.
+6. Poll `status`/`logs --tail`, or hold with `wait --result`; read the phase
+   result JSON with `result <jobId>`; synthesize in chat; plan the next
+   phase.
+
+Phase results are the workflow result JSON that the runtime validated against
+the phase script's schemas. Markdown tables remain a chat rendering choice,
+never the data channel between phases.
+
+## Recovery
+
+On a new session, or after a stall, act from the source run's working
+directory:
+
+| Situation | Action |
+| --- | --- |
+| Anchor lost | `jobs` (state is global across sessions), then `status <jobId>` for `runId`, `cwd`, and terminal reason |
+| Job still running | `status <jobId>` or `wait --result` |
+| Job completed while away | `result <jobId>`, continue synthesis |
+| Job failed, cancelled, or killed | `run --accept-llm-guide=v1 --resume-from-run-id <runId> --cwd <cwd>` — completed agent results are reused; the resume discloses the source terminal reason, model mismatches, and workspace drift |
+| No `runId` in `status` (job died before `workflow.started`) | relaunch the phase; there is no journal to resume |
 
 ## Planning Heuristics
 
@@ -95,9 +157,10 @@ Default to phase-wise parallel execution. Useful patterns include:
 - loop-until-done: iterate repair and verification only when there is a clear
   stop condition.
 
-For code review, common parallel angles are runtime correctness,
-security/capability boundaries, API/CLI contracts, persistence/retry/cancel
-behavior, user-visible progress, package contents, and test coverage.
+For code review, prefer the built-in `code-review` workflow: it collects
+bounded review evidence, selects dynamic lenses, runs parallel finders at the
+`high` sweep tier, verifies each candidate at `xhigh`, and synthesizes final
+findings with provenance.
 
 For implementation, split by disjoint write ownership where possible. Tell
 subagents they are not alone in the codebase and must not revert unrelated or
@@ -105,13 +168,13 @@ parallel edits.
 
 ## Output Contract
 
-Keep progress visible but concise. Prefer stable visual summaries over prose-only
-status sentences. Use `references/progress-visuals.md` for the golden examples.
-The final answer should include:
+Keep progress visible but concise. Prefer stable visual summaries over
+prose-only status sentences. Use `references/progress-visuals.md` for the
+golden examples. The final answer should include:
 
 - the completed result or findings;
 - evidence and verification performed;
 - a phase/agent summary;
 - residual risk or unverified items;
-- a critical re-check recommendation for the current session LLM when the result
-  will drive action.
+- a critical re-check recommendation for the current session LLM when the
+  result will drive action.

@@ -12,8 +12,9 @@ session.
 
 Skill commands:
 
-- `$ultracode-for-codex`: default Codex-native orchestration. The main Codex
-  context plans phases, spawns focused parallel subagents, synthesizes results,
+- `$ultracode-for-codex`: default hybrid orchestration. The main Codex
+  context plans phases, delegates fan-out phases to this CLI runtime when it
+  is installed (falling back to Codex-native subagents), synthesizes results,
   and shows progress directly in the chat with test-runner-style live snapshots
   and diffstat-plus-plan completion summaries.
 - `$ultracode-for-codex-cli`: explicit CLI runtime operation for background
@@ -113,6 +114,71 @@ runs an `xhigh` sweep, then synthesizes final findings by verified candidate
 index. The final JSON includes `findings`, `provenance`, `synthesis`, and
 `stats`.
 
+## Author A Workflow Script
+
+Use this contract when writing a workflow script for `run --script`,
+`run --script-file`, or a project workflow under `.codex/workflows/`.
+
+Structure:
+
+- The script must start with `export const meta = { ... };` as a pure object
+  literal: `name` (required), `description`, and optional `phases` display
+  hints. No variables, calls, spreads, or template strings inside `meta`.
+- The body is plain async JavaScript (no TypeScript syntax). `return` produces
+  the workflow result JSON.
+- Forbidden inside scripts: `Date`, `Math.random`, dynamic `import`, `eval`,
+  and the `Function` constructor. Scripts are capped at 64 KiB. Violations
+  fail before any agent runs.
+
+API surface:
+
+- `agent(prompt, options)` runs one Codex subagent and returns its raw text,
+  or the validated structured value when `options.schema` is set. Options:
+  - `schema`: JSON Schema for the required structured return value. The
+    runtime forces a StructuredOutput submission and validates it; use
+    `additionalProperties: false` to reject unknown fields. Pass a schema for
+    every result the script or a later phase consumes as data.
+  - `effort`: `none|minimal|low|medium|high|xhigh` (default `xhigh`).
+    Funnel-tier: wide sweeps and finder-style scans at `high` or below,
+    verdicts and synthesis at `xhigh`. Model support varies: the current
+    default Codex model rejects `minimal`, and an unsupported effort fails
+    that agent loudly.
+  - `model`: per-agent model override. Precedence: per-agent `model` beats
+    run-level `--model`, which beats the Codex thread default. Unknown models
+    fail that agent loudly; there is no silent fallback.
+  - `key`: logical identity for resume/cache. Required discipline for dynamic
+    parallel agents: bind the key to the evidence snapshot it depends on
+    (for example fold a `workspaceContext` snapshot hash into the key), and
+    never reuse a key within one run — a duplicate key fails at reservation.
+  - `label` and `phase`: display grouping only; not part of cache identity.
+  - `isolation: "worktree"`: run the agent in an isolated git worktree.
+- `parallel(items)` runs thunks concurrently. A failed item becomes `null`
+  in the result array; the script must check for `null` and fail closed when
+  the result is required.
+- `pipeline(items, ...stages)` moves each item through stages independently.
+  It is item-preserving: stage return arrays are not flattened.
+- `phase(title)` groups later agents in progress output; overlapping calls
+  should pass an explicit `phase` option instead.
+- `workspaceContext(options)` returns deterministic workspace evidence
+  (`includeDiff: true` adds bounded diff evidence and allowed evidence refs).
+- `log(message)`, `announcePlan`, `announcePhasePlan`, `hash(value)`, `args`,
+  and `budget` are available; `setTimeout`/`clearTimeout` work inside the
+  run.
+
+Validate before launching:
+
+```bash
+npm exec -- ultracode-for-codex run \
+  --accept-llm-guide=v1 \
+  --validate \
+  --script-file ./phase-review.js
+```
+
+`--validate` resolves and parses the source without running agents. It
+hard-fails structural problems (meta shape, size cap, forbidden APIs) and
+prints non-blocking static warnings: agent() call sites without `schema` and
+dynamic fan-out without a logical `key`.
+
 Settings defaults:
 
 ```json
@@ -165,10 +231,17 @@ Useful controls:
   asks the current session LLM to critically re-check the final result before
   acting on it.
 - Press `Ctrl-C` once to cancel the running workflow.
-- Use `--retry-limit <n>` to retry failed runs in the same process.
-- Use `--resume-from-run-id <runId>` to resume a completed local workflow from
-  preserved runtime state. Resume always uses the original persisted workflow
-  source; without `--args`, it also reuses the original args.
+- Use `--retry-limit <n>` to retry failed runs in the same process; each
+  retry resumes the failed run, so durably completed agent results are
+  reused instead of re-running.
+- Use `--resume-from-run-id <runId>` to resume a completed, failed, cancelled,
+  or interrupted local workflow from preserved runtime state. Resume always
+  uses the original persisted workflow source; without `--args`, it also
+  reuses the original args, and without `--model`, it adopts the source run's
+  model so cached agent results stay reusable. Run resume from the source
+  run's working directory. `status <jobId>` reports the `runId` and `cwd` the
+  resume needs; a job that died before `workflow.started` has no journal and
+  must be relaunched instead.
 - `--timeout-ms 0` waits for completion, cancellation, or app-server exit.
   Positive values opt into a workflow deadline and per-agent silence budget;
   that budget is not divided by the retry budget.
@@ -199,12 +272,16 @@ Useful controls:
 - Keep `journalPath`, `journal.jsonl`, and journal contents out of CLI output.
   Local runtime state may still contain runtime-owned
   `transcriptDir`, `scriptPath`, and result files.
-- `--resume-from-run-id` reads the preserved runtime script, result record, and
-  completed journal from the workflow state directory under
-  `${ULTRACODE_FOR_CODEX_HOME:-~/.ultracode-for-codex}`; completed agent
-  results are reused only when their runtime-owned call keys still match. The
-  script path, script source identity, and inherited args must match the
-  completed journal.
+- `--resume-from-run-id` reads the preserved runtime script and journal from
+  the workflow state directory under
+  `${ULTRACODE_FOR_CODEX_HOME:-~/.ultracode-for-codex}`. Completed sources
+  bind through the result record; failed, cancelled, and interrupted sources
+  are discovered journal-first from `workflow.run.started`. Completed agent
+  results are reused only when their runtime-owned call keys still match, and
+  the script path, script source identity, and inherited args must match the
+  source journal. Resumed launches disclose the source terminal state, a
+  model mismatch, and workspace drift since the source run as progress log
+  lines; drift does not block cached reuse.
 - Use `isolation: "worktree"` only in git repositories with at least one commit.
   Isolated worktrees are intentionally preserved for review, including clean
   worktrees.
@@ -227,7 +304,7 @@ workflow.
 ## Documentation Map
 
 - `README.md`: human quickstart and common examples.
-- `skills/ultracode-for-codex/SKILL.md`: default Codex-native orchestrator
+- `skills/ultracode-for-codex/SKILL.md`: default hybrid orchestrator
   command.
 - `skills/ultracode-for-codex/references/progress-visuals.md`: golden visual
   progress and completion summary examples for native orchestration.
