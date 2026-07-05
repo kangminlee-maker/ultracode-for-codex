@@ -1,6 +1,47 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
-import { parseOptions } from '../dist/cli.js';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, test } from 'node:test';
+import { codexSkillState, parseOptions } from '../dist/cli.js';
+
+const tempDirs = [];
+
+afterEach(async () => {
+  await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
+test('codexSkillState classifies installed Codex skill folders', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ultracode-skill-state-'));
+  tempDirs.push(root);
+  const source = join(root, 'source');
+  const target = join(root, 'target');
+  await mkdir(join(source, 'references'), { recursive: true });
+  await writeFile(join(source, 'SKILL.md'), '---\nname: demo-skill\n---\nbody\n');
+  await writeFile(join(source, 'references', 'notes.md'), 'reference\n');
+
+  assert.equal(await codexSkillState(source, target, 'demo-skill'), 'missing');
+
+  await mkdir(join(target, 'references'), { recursive: true });
+  await writeFile(join(target, 'SKILL.md'), '---\nname: demo-skill\n---\nbody\n');
+  await writeFile(join(target, 'references', 'notes.md'), 'reference\n');
+  assert.equal(await codexSkillState(source, target, 'demo-skill'), 'current');
+
+  // macOS metadata files must not mark an otherwise current skill stale.
+  await writeFile(join(target, '.DS_Store'), 'noise\n');
+  assert.equal(await codexSkillState(source, target, 'demo-skill'), 'current');
+
+  await writeFile(join(target, 'references', 'notes.md'), 'edited reference\n');
+  assert.equal(await codexSkillState(source, target, 'demo-skill'), 'stale');
+
+  await writeFile(join(target, 'references', 'notes.md'), 'reference\n');
+  await writeFile(join(target, 'extra.md'), 'left behind by an older package\n');
+  assert.equal(await codexSkillState(source, target, 'demo-skill'), 'stale');
+
+  await rm(join(target, 'extra.md'));
+  await writeFile(join(target, 'SKILL.md'), '---\nname: something-else\n---\nbody\n');
+  assert.equal(await codexSkillState(source, target, 'demo-skill'), 'unmanaged');
+});
 
 test('CLI parser keeps value-less flags from swallowing following tokens', () => {
   const options = parseOptions(['--validate', './phase-review.js', '--plain', 'positional-2']);

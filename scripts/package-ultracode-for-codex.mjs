@@ -369,7 +369,7 @@ async function validateConsumerInstall(consumerDir, tarballPath) {
     .split(/\r?\n/)
     .filter((line) => /^  [a-z][a-z-]*\s+/.test(line));
   const exposedCommands = commandLines.map((line) => line.trim().split(/\s+/)[0]);
-  const expectedCommands = ['run', 'status', 'wait', 'logs', 'result', 'cancel', 'jobs', 'list', 'archive', 'export'];
+  const expectedCommands = ['run', 'status', 'wait', 'logs', 'result', 'cancel', 'jobs', 'list', 'archive', 'export', 'skills'];
   const unexpectedCommands = exposedCommands.filter((command) => !expectedCommands.includes(command));
   const missingCommands = expectedCommands.filter((command) => !exposedCommands.includes(command));
   if (unexpectedCommands.length > 0 || missingCommands.length > 0) {

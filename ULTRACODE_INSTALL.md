@@ -37,6 +37,7 @@ Production surface:
 - `ultracode-for-codex list`
 - `ultracode-for-codex archive`
 - `ultracode-for-codex export`
+- `ultracode-for-codex skills`
 
 Progress, cancellation, permission review, retry, and final result projection
 are handled inside the CLI process. Progress is JSONL on stderr by
@@ -61,12 +62,16 @@ npm install --save-dev ./ultracode-for-codex-<version>.tgz
 Optional Codex skill commands:
 
 ```bash
-mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
-cp -R ./node_modules/ultracode-for-codex/skills/ultracode-for-codex \
-  "${CODEX_HOME:-$HOME/.codex}/skills/"
-cp -R ./node_modules/ultracode-for-codex/skills/ultracode-for-codex-cli \
-  "${CODEX_HOME:-$HOME/.codex}/skills/"
+npm exec -- ultracode-for-codex skills --install
 ```
+
+This copies both packaged skill folders into
+`${CODEX_HOME:-$HOME/.codex}/skills`. Installed skill commands do not update
+themselves: re-run it after package updates. `ultracode-for-codex skills`
+(without `--install`) reports `current`, `stale`, or `missing` per skill, and
+`npm install` prints a reminder when previously installed skill commands no
+longer match the package. A skill folder that does not declare the expected
+skill name is reported `unmanaged` and never overwritten.
 
 `$ultracode-for-codex` keeps orchestration in the main Codex context.
 `$ultracode-for-codex-cli` uses the npm CLI runtime. The npm package remains the

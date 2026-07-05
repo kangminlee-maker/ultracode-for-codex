@@ -59,29 +59,27 @@ npm exec -- ultracode-for-codex --llm-guide
 
 ## Install The Codex Skills
 
-After installing the npm package, copy the included skill commands into your
-Codex skills folder.
+After installing the npm package, install (or update) the included skill
+commands into your Codex skills folder.
 
 From a project install:
 
 ```bash
-mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
-cp -R ./node_modules/ultracode-for-codex/skills/ultracode-for-codex \
-  "${CODEX_HOME:-$HOME/.codex}/skills/"
-cp -R ./node_modules/ultracode-for-codex/skills/ultracode-for-codex-cli \
-  "${CODEX_HOME:-$HOME/.codex}/skills/"
+npm exec -- ultracode-for-codex skills --install
 ```
 
 From a global install:
 
 ```bash
-mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
-GLOBAL_NODE_MODULES="$(npm root -g)"
-cp -R "$GLOBAL_NODE_MODULES/ultracode-for-codex/skills/ultracode-for-codex" \
-  "${CODEX_HOME:-$HOME/.codex}/skills/"
-cp -R "$GLOBAL_NODE_MODULES/ultracode-for-codex/skills/ultracode-for-codex-cli" \
-  "${CODEX_HOME:-$HOME/.codex}/skills/"
+ultracode-for-codex skills --install
 ```
+
+The command copies both skill folders into
+`${CODEX_HOME:-$HOME/.codex}/skills` and is safe to re-run after every
+package update — installed skill commands do not update themselves.
+`ultracode-for-codex skills` (without `--install`) reports whether the
+installed copies match the package, and `npm install` prints a reminder when
+previously installed skill commands are out of date.
 
 Restart Codex or start a new Codex session if the skills do not appear
 immediately.

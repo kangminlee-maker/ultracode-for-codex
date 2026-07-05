@@ -1,8 +1,8 @@
 # Provenance Audit
 
 Date: 2026-06-23
-Update 2026-07-05: version references updated to the 0.4.0 (P4) release; the
-0.4.0 change set is project-authored source with no new third-party code, so
+Update 2026-07-05: version references updated to the 0.4.1 release line (P4); the
+P4 change set is project-authored source with no new third-party code, so
 the marker-scan evidence below is unchanged from the 2026-06-23 audit.
 
 ## Scope
@@ -10,7 +10,7 @@ the marker-scan evidence below is unchanged from the 2026-06-23 audit.
 This audit checked:
 
 - tracked repository files;
-- generated npm package contents for `ultracode-for-codex@0.4.0`;
+- generated npm package contents for `ultracode-for-codex@0.4.1`;
 - the locally installed companion Codex skill.
 
 Generated build output and package tarballs were checked as projections of the
@@ -26,7 +26,7 @@ License transition completed:
 
 - Apache-2.0 `LICENSE` file is present;
 - `package.json` and `package-lock.json` declare `Apache-2.0`;
-- audited package metadata version is `0.4.0`;
+- audited package metadata version is `0.4.1`;
 - npm publish state is verified separately during release preparation.
 
 ## Evidence

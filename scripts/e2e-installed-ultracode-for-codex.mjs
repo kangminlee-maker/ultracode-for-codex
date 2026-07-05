@@ -62,7 +62,7 @@ try {
   const installedCli = join(installedPackageDir, 'dist', 'cli.js');
   assertInstalledVersion(installedCli);
   await assertSkillCommandPackageContents(installedPackageDir);
-  await assertSkillCommandInstall(installedPackageDir);
+  await assertSkillCommandInstall(installedPackageDir, installedCli);
   await assertNpmExecRun();
   await assertBackgroundDefault(installedCli);
   await assertCliSmoke(installedCli);
@@ -190,14 +190,25 @@ async function assertSkillCommandPackageContents(installedPackageDir) {
   assert.match(cliAgent, /Operate the Ultracode for Codex npm CLI runtime/);
 }
 
-async function assertSkillCommandInstall(installedPackageDir) {
+async function assertSkillCommandInstall(installedPackageDir, installedCli) {
   const skillsRoot = join(codexHome, 'skills');
-  await mkdir(skillsRoot, { recursive: true });
+  await rm(skillsRoot, { recursive: true, force: true });
+
+  const missing = runCliCommand(installedCli, 'skills');
+  assert.equal(missing.status, 0, missing.stderr);
+  const missingReport = JSON.parse(missing.stdout);
+  assert.equal(missingReport.kind, 'ultracode.skills');
+  assert.equal(missingReport.action, 'status');
+  assert.deepEqual(missingReport.skills.map((skill) => skill.state), ['missing', 'missing']);
+
+  const install = runCliCommand(installedCli, 'skills', ['--install']);
+  assert.equal(install.status, 0, install.stderr);
+  const installReport = JSON.parse(install.stdout);
+  assert.equal(installReport.action, 'install');
+  assert.deepEqual(installReport.skills.map((skill) => skill.state), ['current', 'current']);
+
   for (const name of ['ultracode-for-codex', 'ultracode-for-codex-cli']) {
-    const source = join(installedPackageDir, 'skills', name);
     const destination = join(skillsRoot, name);
-    await rm(destination, { recursive: true, force: true });
-    await cp(source, destination, { recursive: true });
     const installedSkill = await readFile(join(destination, 'SKILL.md'), 'utf8');
     const installedAgent = await readFile(join(destination, 'agents', 'openai.yaml'), 'utf8');
     assert.match(installedSkill, new RegExp(`^name: ${name}$`, 'm'));
@@ -212,6 +223,27 @@ async function assertSkillCommandInstall(installedPackageDir) {
   assert.match(installedVisuals, /Default Live Snapshot/);
   assert.match(installedVisuals, /Completion Impact Summary/);
   assert.match(installedVisuals, /Research Pattern Map/);
+
+  // A locally edited skill file is reported stale and repaired by --install.
+  const nativeSkillPath = join(skillsRoot, 'ultracode-for-codex', 'SKILL.md');
+  await writeFile(nativeSkillPath, `${await readFile(nativeSkillPath, 'utf8')}\nlocal drift\n`);
+  const stale = runCliCommand(installedCli, 'skills');
+  assert.deepEqual(JSON.parse(stale.stdout).skills.map((skill) => skill.state), ['stale', 'current']);
+  const repaired = runCliCommand(installedCli, 'skills', ['--install']);
+  assert.deepEqual(JSON.parse(repaired.stdout).skills.map((skill) => skill.state), ['current', 'current']);
+
+  // A foreign skill folder with the same name is never overwritten.
+  await rm(join(skillsRoot, 'ultracode-for-codex-cli'), { recursive: true, force: true });
+  await mkdir(join(skillsRoot, 'ultracode-for-codex-cli'), { recursive: true });
+  await writeFile(join(skillsRoot, 'ultracode-for-codex-cli', 'SKILL.md'), '---\nname: something-else\n---\n');
+  const unmanaged = runCliCommand(installedCli, 'skills');
+  assert.deepEqual(JSON.parse(unmanaged.stdout).skills.map((skill) => skill.state), ['current', 'unmanaged']);
+  const refused = runCliCommand(installedCli, 'skills', ['--install']);
+  assert.notEqual(refused.status, 0);
+  assert.match(`${refused.stdout}\n${refused.stderr}`, /refusing to overwrite/);
+  await rm(join(skillsRoot, 'ultracode-for-codex-cli'), { recursive: true, force: true });
+  const restored = runCliCommand(installedCli, 'skills', ['--install']);
+  assert.deepEqual(JSON.parse(restored.stdout).skills.map((skill) => skill.state), ['current', 'current']);
 }
 
 function countSituationRows(content) {

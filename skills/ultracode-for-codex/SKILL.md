@@ -24,15 +24,21 @@ runtime is unavailable in the session.
 Before the first delegated phase, check the CLI runtime once:
 
 ```bash
-npm exec --no -- ultracode-for-codex --version || ultracode-for-codex --version
+npm exec --no -- ultracode-for-codex skills || ultracode-for-codex skills
 ```
 
 The `--no` flag keeps `npm exec` from fetching the package when it is not
-already installed; detection must never trigger an install.
+already installed; detection must never trigger a package install.
 
 If neither resolves, say that the CLI runtime is unavailable, continue with
 Codex-native subagents, and note that per-agent tiering, schema enforcement,
 and crash recovery are unavailable in that mode.
+
+The report also states whether the installed skill commands match the
+package. If any skill reports `stale` or `missing`, run
+`ultracode-for-codex skills --install` and tell the user the skill commands
+were refreshed; the next Codex session loads the updated contract, while the
+current session continues with the skill text it already loaded.
 
 ## Native Workflow
 

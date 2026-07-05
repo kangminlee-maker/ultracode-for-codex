@@ -2,7 +2,8 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
-import { chmod, mkdir, open, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, open, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createInterface } from 'node:readline/promises';
@@ -78,6 +79,7 @@ async function main(argv: readonly string[]): Promise<number> {
   if (command === 'cancel') return cancelBackgroundJob(args);
   if (command === 'jobs' || command === 'list') return listBackgroundJobs(args);
   if (command === 'archive' || command === 'export') return archiveBackgroundJob(args);
+  if (command === 'skills') return manageCodexSkills(args);
   process.stderr.write(`Unknown command: ${command}\n\n${helpText()}`);
   return 1;
 }
@@ -233,6 +235,7 @@ interface ParsedOptions {
   readonly name?: string;
   readonly resumeFromRunId?: string;
   readonly validate?: string;
+  readonly install?: string;
   readonly permission?: string;
   readonly retryLimit?: string;
   readonly jobId?: string;
@@ -252,7 +255,7 @@ interface ParsedOptions {
   readonly outputPath?: string;
 }
 
-const VALUELESS_FLAGS = new Set(['plain', 'result', 'wait', 'validate']);
+const VALUELESS_FLAGS = new Set(['install', 'plain', 'result', 'wait', 'validate']);
 
 export function parseOptions(args: readonly string[]): ParsedOptions {
   const out: Record<string, string | string[]> = { _: [] };
@@ -1102,6 +1105,86 @@ function cliEntryPath(): string {
   return realpathSync(entry);
 }
 
+const CODEX_SKILL_NAMES = ['ultracode-for-codex', 'ultracode-for-codex-cli'] as const;
+
+export type CodexSkillState = 'current' | 'stale' | 'missing' | 'unmanaged';
+
+async function manageCodexSkills(args: readonly string[]): Promise<number> {
+  const options = parseOptions(args);
+  if (options._.length > 0) throw new Error('skills does not accept positional arguments.');
+  const install = options.install !== undefined;
+  const sourceRoot = join(dirname(cliEntryPath()), '..', 'skills');
+  const targetRoot = codexSkillsRoot();
+  const skills: { readonly name: string; readonly state: CodexSkillState }[] = [];
+  for (const name of CODEX_SKILL_NAMES) {
+    const sourceDir = join(sourceRoot, name);
+    const targetDir = join(targetRoot, name);
+    let state = await codexSkillState(sourceDir, targetDir, name);
+    if (install) {
+      if (state === 'unmanaged') {
+        throw new Error(`Skill folder ${targetDir} exists but does not declare name: ${name}; refusing to overwrite it.`);
+      }
+      if (state !== 'current') {
+        await mkdir(targetRoot, { recursive: true });
+        await rm(targetDir, { recursive: true, force: true });
+        await cp(sourceDir, targetDir, { recursive: true });
+        state = await codexSkillState(sourceDir, targetDir, name);
+      }
+    }
+    skills.push({ name, state });
+  }
+  if (wantsPlain(options)) {
+    for (const skill of skills) {
+      process.stdout.write(`[skills] ${skill.name} ${skill.state}\n`);
+    }
+    process.stdout.write(`[skills] root=${targetRoot} package=${ultracodePackageVersion()}\n`);
+  } else {
+    process.stdout.write(`${JSON.stringify({
+      kind: 'ultracode.skills',
+      version: 1,
+      action: install ? 'install' : 'status',
+      packageVersion: ultracodePackageVersion(),
+      codexSkillsRoot: targetRoot,
+      skills,
+    }, null, 2)}\n`);
+  }
+  return 0;
+}
+
+function codexSkillsRoot(): string {
+  const configured = process.env.CODEX_HOME?.trim();
+  return join(configured ? configured : join(homedir(), '.codex'), 'skills');
+}
+
+export async function codexSkillState(sourceDir: string, targetDir: string, name: string): Promise<CodexSkillState> {
+  const targetSkill = await readFile(join(targetDir, 'SKILL.md'), 'utf8').catch(() => null);
+  if (targetSkill === null) return 'missing';
+  if (!new RegExp(`^name:\\s*${name}\\s*$`, 'm').test(targetSkill)) return 'unmanaged';
+  const sourceFiles = await listSkillFiles(sourceDir, '');
+  const targetFiles = await listSkillFiles(targetDir, '');
+  if (sourceFiles.join('\n') !== targetFiles.join('\n')) return 'stale';
+  for (const relativePath of sourceFiles) {
+    const [sourceText, targetText] = await Promise.all([
+      readFile(join(sourceDir, relativePath)),
+      readFile(join(targetDir, relativePath)).catch(() => null),
+    ]);
+    if (targetText === null || !sourceText.equals(targetText)) return 'stale';
+  }
+  return 'current';
+}
+
+async function listSkillFiles(root: string, prefix: string): Promise<readonly string[]> {
+  const entries = await readdir(join(root, prefix), { withFileTypes: true }).catch(() => []);
+  const files: string[] = [];
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue;
+    const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) files.push(...await listSkillFiles(root, relativePath));
+    else if (entry.isFile()) files.push(relativePath);
+  }
+  return files.sort((left, right) => left.localeCompare(right));
+}
+
 async function workflowLaunchInputFromOptions(options: ParsedOptions): Promise<WorkflowLaunchInput> {
   const positionalScriptFile = options._[0];
   if (options._.length > 1) throw new Error('run accepts at most one positional workflow script file.');
@@ -1801,6 +1884,7 @@ Commands:
   list       Alias for jobs.
   archive    Export one background workflow job state to an archive JSON file.
   export     Alias for archive.
+  skills     Report whether the installed Codex skill commands match this package; --install updates them.
 
 Options:
   --version, -v                     Print the package version.
@@ -1841,6 +1925,7 @@ Background command options:
   --wait                             cancel waits for terminal workflow status.
   --out-dir <dir>                    archive output directory. Default: .ultracode-for-codex/archive.
   --output-path <path>               archive output file path.
+  --install                          skills copies the packaged skill commands into \${CODEX_HOME:-~/.codex}/skills.
 `;
 }
 
