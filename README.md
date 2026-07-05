@@ -21,6 +21,12 @@ CLI, the skill falls back to Codex-native subagents.
 - Run implementation and verification work phase by phase.
 - See what agents are doing, what finished, and what still needs attention.
 - Keep long CLI workflows running in the OS background when desired.
+- Recover interrupted work: a crashed, killed, or cancelled run resumes with
+  its completed agent results reused instead of re-run.
+- Tier cost to the work: wide sweeps run at a cheaper reasoning effort while
+  verdicts and synthesis stay at full effort, and single agents can pin their
+  own effort or model.
+- Validate an authored workflow script before it spends any agent tokens.
 - Package the same workflow behavior for repeatable local use.
 
 ## Install
@@ -167,19 +173,44 @@ npm exec -- ultracode-for-codex run \
   --args '{"prompt":"check the release plan"}'
 ```
 
-Resume a completed, failed, cancelled, or interrupted local workflow from
-preserved runtime state (run it from the source run's working directory;
-`status <jobId>` reports the `runId` and `cwd`):
+## Recover An Interrupted Run
+
+Workflow state survives crashes, kills, and cancellations. From the source
+run's working directory, find the run and resume it — completed agent
+results are reused, and the resume discloses the source terminal state plus
+any workspace drift since the original run:
+
+```bash
+npm exec -- ultracode-for-codex jobs --cwd /path/to/project
+npm exec -- ultracode-for-codex status <jobId> --cwd /path/to/project
+```
+
+`status` reports the `runId` and `cwd` the resume needs:
 
 ```bash
 npm exec -- ultracode-for-codex run \
   --accept-llm-guide=v1 \
-  --execution attached \
   --cwd /path/to/project \
   --resume-from-run-id run_...
 ```
 
-Validate an authored workflow script without spending agent tokens:
+This accepts completed, failed, cancelled, and interrupted runs. A job that
+died before its first `workflow.started` event has no journal and must be
+relaunched instead. `--retry-limit <n>` uses the same machinery: each retry
+resumes the failed attempt instead of re-running finished agents.
+
+## Author And Validate Workflow Scripts
+
+Project workflow scripts live in `.codex/workflows/`. The authoring contract
+(structure, `agent()` options including per-agent `effort`/`model`/`schema`/
+`key`, and failure semantics) ships in the package:
+
+```bash
+npm exec -- ultracode-for-codex --llm-guide
+```
+
+Validate a script without spending agent tokens — structural problems fail
+loudly, and static warnings flag agent calls without schemas or logical keys:
 
 ```bash
 npm exec -- ultracode-for-codex run \
