@@ -374,10 +374,63 @@ test('built-in code-review fails closed on unsupported finder evidence refs', as
     const snapshot = runtime.get(launch.taskId);
     assert.equal(snapshot.status, 'failed');
     assert.match(snapshot.error, /unsupported evidence ref/);
+    assert.match(
+      snapshot.error,
+      /includes unsupported evidence ref file:outside\.md: not in allowed evidence refs \(\d+ entries\) derived from /,
+    );
+    assert.match(snapshot.error, /; populated by /);
     assert.equal(
       snapshot.events.some((event) => event.type === 'workflow.agent.started' && /code-review-verify-/.test(event.label)),
       false,
     );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('built-in code-review fails before spawning agents when the working tree has no reviewable change evidence', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+
+    const launch = await runtime.launch({
+      name: 'code-review',
+      args: { prompt: 'Review the current repository for correctness risks.' },
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.match(snapshot.error, /no reviewable change evidence in the working tree/);
+    assert.match(snapshot.error, /allowed file refs is empty \(0 entries\) derived from /);
+    assert.match(snapshot.error, /; populated by /);
+    assert.equal(backend.requests.length, 0);
+    assert.equal(snapshot.events.some((event) => event.type === 'workflow.agent.started'), false);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('built-in code-review file rejection names the allowed set, its source, and remediation', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'docs'), { recursive: true });
+    await writeFile(join(root, 'docs', 'other-note.md'), 'An unrelated untracked note.\n');
+
+    const launch = await runtime.launch({
+      name: 'code-review',
+      args: { prompt: 'Review the docs notes.' },
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.match(
+      snapshot.error,
+      /scope\.files\[0\] references unsupported file docs\/client-package-plan\.md: not in allowed file refs \(1 entries\) derived from file: entries in the evidence context/,
+    );
+    assert.match(snapshot.error, /; populated by uncommitted or untracked paths in the working tree/);
   } finally {
     await runtime.close();
   }

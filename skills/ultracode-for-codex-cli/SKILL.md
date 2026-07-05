@@ -23,7 +23,10 @@ Progress, cancellation, permission review, retry, and result projection stay in
 that command process. `settings.json` defaults runs to OS background execution;
 use that path for long Codex-launched CLI work so Codex can keep doing other
 tasks and inspect the background job later. Attached runs stream stderr JSONL for
-Codex-readable status, while stdout remains the final workflow result JSON.
+Codex-readable status, while stdout remains the final workflow result JSON. The
+result channel is total: a terminal failure prints a structured
+`ultracode.workflow.failure` record to stdout instead of leaving it empty, so
+background `result.json` always parses.
 
 ## Install And Run
 
@@ -74,6 +77,12 @@ CLI behavior:
   should stay connected until completion;
 - attached progress prints to stderr as JSONL by default;
 - attached final workflow result prints as JSON to stdout;
+- a terminal failure prints an `ultracode.workflow.failure` record (`status`,
+  `failure.reason`, `failure.error`, `failure.workflowName`, `failure.taskId`,
+  `failure.runId`, plus `failure.phase`/`failure.agentsCompleted` when known)
+  to the same stdout channel, so background `result.json` parses on both
+  outcomes; `status` classifies a failure record as `failed` even without
+  progress events, and `result` prints it with exit code 1;
 - JSONL records include `kind`, `version`, `event`, `status`, and `summary`,
   with agent identity and label fields on agent records;
 - built-in `task` and `code-review` emit `workflow.plan.ready` as a planning
@@ -88,6 +97,10 @@ CLI behavior:
   collects bounded review evidence, selects dynamic lenses, runs parallel finder
   agents, verifies each emitted candidate, optionally runs an `xhigh` sweep, and
   synthesizes final findings by verified candidate index;
+- built-in `code-review` requires pending working-tree change evidence: on a
+  clean tree it fails before spawning any agent with `no reviewable change
+  evidence in the working tree`, and its ref rejections name the allowed set,
+  its size, its source, and what populates it;
 - after a completed run, `workflow.summary.ready` reports phase-level agent
   counts and angles, then `workflow.review.recommended` asks the current
   session LLM to critically re-check the final result before acting on it;

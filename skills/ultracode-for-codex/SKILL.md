@@ -166,7 +166,9 @@ Default to phase-wise parallel execution. Useful patterns include:
 For code review, prefer the built-in `code-review` workflow: it collects
 bounded review evidence, selects dynamic lenses, runs parallel finders at the
 `high` sweep tier, verifies each candidate at `xhigh`, and synthesizes final
-findings with provenance.
+findings with provenance. It reviews pending working-tree changes: on a clean
+tree it fails before spawning any agent with `no reviewable change evidence in
+the working tree`, so make or stage a change first.
 
 For implementation, split by disjoint write ownership where possible. Tell
 subagents they are not alone in the codebase and must not revert unrelated or

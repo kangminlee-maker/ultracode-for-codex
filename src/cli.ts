@@ -139,6 +139,10 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
       }
       renderFailedSnapshot(snapshot, progressMode);
       if (snapshot.failureReason === 'workflow_aborted' || retries >= retryLimit) {
+        // The result channel must stay total: in background mode this stdout
+        // is result.json, so a terminal failure writes a machine-readable
+        // record where consumers otherwise find a 0-byte file.
+        process.stdout.write(`${JSON.stringify(workflowFailureRecord(snapshot), null, 2)}\n`);
         return snapshot.failureReason === 'workflow_aborted' ? 130 : 1;
       }
       retries += 1;
@@ -458,6 +462,69 @@ interface BackgroundArchiveRecord {
   readonly resultText: string | null;
 }
 
+const WORKFLOW_FAILURE_RECORD_KIND = 'ultracode.workflow.failure';
+
+interface WorkflowFailureRecord {
+  readonly kind: typeof WORKFLOW_FAILURE_RECORD_KIND;
+  readonly version: 1;
+  readonly status: 'failed';
+  readonly failure: {
+    readonly reason: string;
+    readonly error: string;
+    readonly workflowName: string;
+    readonly taskId: string;
+    readonly runId: string;
+    readonly phase?: string;
+    readonly agentsCompleted?: number;
+  };
+}
+
+function workflowFailureRecord(snapshot: WorkflowTaskSnapshot): WorkflowFailureRecord {
+  let phase: string | undefined;
+  let agentsCompleted: number | undefined;
+  for (const event of snapshot.events) {
+    if (event.type === 'workflow.phase.started') phase = event.title;
+    if (event.type === 'workflow.agent.completed') agentsCompleted = event.completedAgentCount;
+  }
+  return {
+    kind: WORKFLOW_FAILURE_RECORD_KIND,
+    version: 1,
+    status: 'failed',
+    failure: {
+      reason: snapshot.failureReason ?? 'unknown',
+      error: snapshot.error ?? 'unknown',
+      workflowName: snapshot.workflowName,
+      taskId: snapshot.taskId,
+      runId: snapshot.runId,
+      ...(phase !== undefined ? { phase } : {}),
+      ...(agentsCompleted !== undefined ? { agentsCompleted } : {}),
+    },
+  };
+}
+
+function parseWorkflowFailureRecord(text: string | null): WorkflowFailureRecord | null {
+  if (!text?.trim()) return null;
+  // Cheap containment check first: status/jobs polling reads every result
+  // file, and success results can be large JSON that never needs parsing.
+  if (!text.includes(WORKFLOW_FAILURE_RECORD_KIND)) return null;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (
+      parsed
+      && typeof parsed === 'object'
+      && !Array.isArray(parsed)
+      && (parsed as { kind?: unknown }).kind === WORKFLOW_FAILURE_RECORD_KIND
+      && (parsed as { version?: unknown }).version === 1
+      && (parsed as { status?: unknown }).status === 'failed'
+    ) {
+      return parsed as WorkflowFailureRecord;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 async function showBackgroundStatus(args: readonly string[]): Promise<number> {
   const options = parseOptions(args);
   const status = await inspectBackgroundJob(options);
@@ -484,7 +551,7 @@ async function waitForBackgroundJob(args: readonly string[]): Promise<number> {
     else process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
     return 124;
   }
-  if (wantsResult(options) && waited.status.status === 'completed') {
+  if (wantsResult(options) && (waited.status.status === 'completed' || waited.status.status === 'failed')) {
     return await printBackgroundResult(await resolveBackgroundJobRef(options), waited.status);
   }
   if (wantsPlain(options)) process.stdout.write(renderBackgroundStatusPlain(waited.status));
@@ -525,7 +592,7 @@ async function printBackgroundResult(ref: BackgroundJobRef, status: BackgroundJo
   const text = await readTextFileIfPresent(ref.resultPath);
   if (text !== null && text.trim()) {
     process.stdout.write(text.endsWith('\n') ? text : `${text}\n`);
-    return 0;
+    return parseWorkflowFailureRecord(text) ? 1 : 0;
   }
   process.stderr.write(`Background result is not ready: ${status.status}${status.reason ? ` (${status.reason})` : ''}\n`);
   return status.status === 'failed' ? 1 : 2;
@@ -649,6 +716,7 @@ async function inspectBackgroundJob(options: ParsedOptions): Promise<BackgroundJ
   const progress = await readBackgroundProgress(ref.progressPath);
   const resultText = await readTextFileIfPresent(ref.resultPath);
   const resultReady = Boolean(resultText?.trim());
+  const resultFailure = parseWorkflowFailureRecord(resultText);
   const statusEvents = progress.events.filter((event) => !isPostCompletionGuidanceEvent(event));
   const lastEvent = statusEvents.at(-1);
   // A terminal event counts only while it is the newest status event: an
@@ -659,7 +727,7 @@ async function inspectBackgroundJob(options: ParsedOptions): Promise<BackgroundJ
     || lastEvent.event === 'workflow.failed'
     || lastEvent.event === 'workflow.terminal_failure'
   ) ? lastEvent : undefined;
-  const status = backgroundStatusFrom({ terminalEvent, resultReady, alive });
+  const status = backgroundStatusFrom({ terminalEvent, resultReady, resultIsFailure: resultFailure !== null, alive });
   return {
     kind: 'ultracode.workflow.background.status',
     version: 1,
@@ -680,8 +748,8 @@ async function inspectBackgroundJob(options: ParsedOptions): Promise<BackgroundJ
     lastEvent: lastEvent?.event,
     lastStatus: lastEvent?.status,
     lastSummary: lastEvent?.summary,
-    reason: terminalEvent?.reason,
-    error: terminalEvent?.error,
+    reason: terminalEvent?.reason ?? resultFailure?.failure.reason,
+    error: terminalEvent?.error ?? resultFailure?.failure.error,
     completedAgentCount: lastNumericField(progress.events, 'completedAgentCount'),
     knownAgentCount: lastNumericField(progress.events, 'knownAgentCount'),
     phase: lastStringField(progress.events, 'phase'),
@@ -937,10 +1005,12 @@ function requireMetadataPath(value: string | undefined, key: string): string {
 function backgroundStatusFrom(input: {
   readonly terminalEvent?: ProgressPayload;
   readonly resultReady: boolean;
+  readonly resultIsFailure: boolean;
   readonly alive: boolean;
 }): BackgroundJobStatus['status'] {
   if (input.terminalEvent?.event === 'workflow.completed') return 'completed';
   if (input.terminalEvent?.event === 'workflow.failed' || input.terminalEvent?.event === 'workflow.terminal_failure') return 'failed';
+  if (input.resultIsFailure) return 'failed';
   if (input.resultReady) return 'completed';
   return input.alive ? 'running' : 'exited_unknown';
 }

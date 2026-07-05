@@ -836,12 +836,15 @@ function normalizeKey(value, fallback) {
 function uniquePush(list, item) {
   if (list.indexOf(item) < 0) list.push(item);
 }
+function failUnsupportedRef(prefix, value, refSet) {
+  fail(prefix + " " + value + ": not in " + refSet.name + " (" + refSet.size + " entries) derived from " + refSet.source + "; populated by " + refSet.populatedBy);
+}
 function assertDecisionRefs(refs, label) {
   if (!Array.isArray(refs) || refs.length < 1) fail(label + " must include evidence or decision refs.");
   for (let index = 0; index < refs.length; index += 1) {
     const ref = text(refs[index]);
     if (!allowedEvidenceRefMap[ref] && !unavailableEvidenceRefMap[ref] && ref !== "prompt:request") {
-      fail(label + " includes unsupported decision ref " + ref);
+      failUnsupportedRef(label + " includes unsupported decision ref", ref, decisionRefSet);
     }
   }
 }
@@ -849,12 +852,12 @@ function assertEvidenceRefs(refs, label) {
   if (!Array.isArray(refs) || refs.length < 1) fail(label + " must include at least one evidence ref.");
   for (let index = 0; index < refs.length; index += 1) {
     const ref = text(refs[index]);
-    if (!allowedEvidenceRefMap[ref]) fail(label + " includes unsupported evidence ref " + ref);
+    if (!allowedEvidenceRefMap[ref]) failUnsupportedRef(label + " includes unsupported evidence ref", ref, evidenceRefSet);
   }
 }
 function validateFile(file, label) {
   const ref = "file:" + text(file);
-  if (!allowedFileRefMap[ref]) fail(label + " references unsupported file " + text(file));
+  if (!allowedFileRefMap[ref]) failUnsupportedRef(label + " references unsupported file", text(file), fileRefSet);
 }
 function selectedDecisionMatches(decision, lens) {
   if (decision.action !== "select") return false;
@@ -1194,6 +1197,27 @@ for (let index = 0; index < allowedEvidenceRefs.length; index += 1) {
   if (allowedEvidenceRefs[index].indexOf("file:") === 0) uniquePush(allowedFileRefs, allowedEvidenceRefs[index]);
 }
 const allowedFileRefMap = objectMap(allowedFileRefs);
+const evidenceRefSet = {
+  name: "allowed evidence refs",
+  size: allowedEvidenceRefs.length,
+  source: "the runtime evidence context (git status file: refs and staged/unstaged/committed diff refs)",
+  populatedBy: "uncommitted or untracked paths in the working tree, plus the diffBaseRef commit range when provided"
+};
+const decisionRefSet = {
+  name: "allowed decision refs",
+  size: allowedEvidenceRefs.length + unavailableEvidenceRefs.length + 1,
+  source: "allowed evidence refs, unavailable evidence tokens, and prompt:request",
+  populatedBy: evidenceRefSet.populatedBy
+};
+const fileRefSet = {
+  name: "allowed file refs",
+  size: allowedFileRefs.length,
+  source: "file: entries in the evidence context (git status changed/untracked paths)",
+  populatedBy: "uncommitted or untracked paths in the working tree"
+};
+if (allowedFileRefs.length === 0) {
+  fail("no reviewable change evidence in the working tree: " + fileRefSet.name + " is empty (0 entries) derived from " + fileRefSet.source + "; populated by " + fileRefSet.populatedBy);
+}
 const sourceSnapshotId = firstLineValue(context, "Source Snapshot: ") || firstLineValue(context, "sourceSnapshotId: ") || hash(context);
 const contextHash = firstLineValue(context, "Context Hash: ") || firstLineValue(context, "contextHash: ") || hash({ context: context });
 const allowedEvidenceIndexDigest = firstLineValue(context, "allowedEvidenceIndexDigest: ") || hash(allowedEvidenceRefs);

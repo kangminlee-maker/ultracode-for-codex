@@ -766,7 +766,17 @@ async function assertBuiltinCodeReviewInvalidEvidence(installedCli) {
     !progress.some((event) => event.event === 'workflow.agent.started' && /code-review-verify-/.test(event.label ?? '')),
     'invalid finder evidence should fail before verifier agents start',
   );
-  assert.equal(result.stdout, '');
+  const failureRecord = JSON.parse(result.stdout);
+  assert.equal(failureRecord.kind, 'ultracode.workflow.failure');
+  assert.equal(failureRecord.version, 1);
+  assert.equal(failureRecord.status, 'failed');
+  assert.equal(failureRecord.failure.workflowName, 'code-review');
+  assert.match(
+    failureRecord.failure.error,
+    /includes unsupported evidence ref file:outside\.md: not in allowed evidence refs \(\d+ entries\) derived from /,
+  );
+  assert.match(failureRecord.failure.error, /; populated by /);
+  assert.ok(failureRecord.failure.runId.length > 0);
 }
 
 async function assertInstalledReviewEvidenceContext(installedCli) {
