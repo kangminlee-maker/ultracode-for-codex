@@ -57,6 +57,17 @@ npm exec -- ultracode-for-codex --version
 npm exec -- ultracode-for-codex --llm-guide
 ```
 
+To upgrade an existing install to the latest release:
+
+```bash
+npm install --save-dev ultracode-for-codex@latest   # project install
+npm install -g ultracode-for-codex@latest           # global install
+```
+
+After every upgrade, re-run `skills --install` (next section) so the installed
+Codex skill commands match the new package version — they do not update
+themselves, and `npm install` prints a staleness reminder when they drift.
+
 ## Install The Codex Skills
 
 After installing the npm package, install (or update) the included skill
