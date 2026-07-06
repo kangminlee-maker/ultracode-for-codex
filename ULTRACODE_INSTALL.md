@@ -225,6 +225,12 @@ Useful controls:
   progress events, and `result` prints it with exit code 1.
 - The package default workflow timeout is `0`, meaning the workflow waits until
   it completes, is cancelled, or the Codex app-server exits.
+- Under an unbounded (`0`) timeout, a non-destructive `workflow.heartbeat`
+  progress event is emitted every `workflow.heartbeatMs` (default 120000 ms)
+  while a run is in flight, carrying elapsed time, current phase, and
+  completed/known agent counts. It never aborts or retries the run — it only
+  makes a long or stuck run visible. Override per run with `--heartbeat-ms <n>`;
+  `0` disables it.
 - JSONL records include `kind`, `version`, `event`, `status`, and `summary`;
   agent records also include stable agent identity and label fields.
 - Built-in `task` and `code-review` emit `workflow.plan.ready` as a planning

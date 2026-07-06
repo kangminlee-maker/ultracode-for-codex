@@ -15,6 +15,7 @@ import {
   workflowDefaultProgressMode,
   workflowDefaultRetryLimit,
   workflowDefaultTimeoutMs,
+  workflowDefaultHeartbeatMs,
 } from '../dist/settings.js';
 import { defaultWorkflowStateDir } from '../dist/runtime/state-root.js';
 
@@ -26,6 +27,7 @@ test('settings.json provides Codex workflow runtime defaults', () => {
       permission: 'ask',
       retryLimit: 0,
       timeoutMs: 0,
+      heartbeatMs: 120000,
       background: {
         runDir: '{stateRoot}/background/{jobId}',
         resultFile: 'result.json',
@@ -44,6 +46,7 @@ test('settings.json provides Codex workflow runtime defaults', () => {
   assert.equal(workflowDefaultPermissionPolicy(), 'ask');
   assert.equal(workflowDefaultRetryLimit(), 0);
   assert.equal(workflowDefaultTimeoutMs(), 0);
+  assert.equal(workflowDefaultHeartbeatMs(), 120000);
   assert.deepEqual(workflowBackgroundDefaults(), {
     runDir: '{stateRoot}/background/{jobId}',
     resultFile: 'result.json',

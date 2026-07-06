@@ -127,6 +127,52 @@ return { first, second };`,
   }
 });
 
+test('workflow emits non-destructive heartbeats while running and stays off by default', async () => {
+  const script = `export const meta = { name: "heartbeat-demo", description: "Slow run for heartbeat", phases: [{ title: "Work" }] };
+phase("Work");
+await agent("SILENT_75MS one", { label: "slow-one" });
+await agent("SILENT_75MS two", { label: "slow-two" });
+return "done";`;
+
+  // Heartbeat on: a short interval over a ~150ms run yields >=1 heartbeat, the
+  // run still completes (proving the heartbeat never aborts), and each beat
+  // carries elapsed/phase/agent progress with a strictly increasing seq.
+  const beating = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { heartbeatMs: 20 } });
+  try {
+    const launch = await beating.runtime.launch({ script });
+    const events = await collectEvents(beating.runtime, launch.taskId);
+    const heartbeats = events.filter((event) => event.type === 'workflow.heartbeat');
+    assert.ok(heartbeats.length >= 1, `expected at least one heartbeat, got ${heartbeats.length}`);
+    assert.equal(events.at(-1).type, 'workflow.completed');
+    for (const hb of heartbeats) {
+      assert.equal(typeof hb.elapsedMs, 'number');
+      assert.equal(typeof hb.completedAgentCount, 'number');
+      assert.equal(typeof hb.knownAgentCount, 'number');
+    }
+    assert.deepEqual(
+      heartbeats.map((hb) => hb.seq),
+      heartbeats.map((_, index) => index + 1),
+      'heartbeat seq must be a strictly increasing 1-based sequence',
+    );
+    // No heartbeat may leak after the terminal event.
+    const terminalIndex = events.findIndex((event) => event.type === 'workflow.completed');
+    assert.equal(events.slice(terminalIndex + 1).some((event) => event.type === 'workflow.heartbeat'), false);
+  } finally {
+    await beating.runtime.close();
+  }
+
+  // Default (no heartbeatMs) preserves the pre-heartbeat event stream exactly.
+  const silent = await createRuntime({ backend: new FakeSubagentBackend() });
+  try {
+    const launch = await silent.runtime.launch({ script });
+    const events = await collectEvents(silent.runtime, launch.taskId);
+    assert.equal(events.some((event) => event.type === 'workflow.heartbeat'), false);
+    assert.equal(silent.runtime.get(launch.taskId).status, 'completed');
+  } finally {
+    await silent.runtime.close();
+  }
+});
+
 test('workflow agents reject invalid effort and model values before spending tokens', async () => {
   const backend = new FakeSubagentBackend();
   const { runtime } = await createRuntime({ backend });
@@ -1449,6 +1495,7 @@ async function createRuntime({ backend, runtimeOptions = {} }) {
       requestTimeoutMs: runtimeOptions.requestTimeoutMs ?? 30_000,
       agentStallTimeoutMs: runtimeOptions.agentStallTimeoutMs,
       agentStallRetryLimit: runtimeOptions.agentStallRetryLimit,
+      heartbeatMs: runtimeOptions.heartbeatMs,
       journalDurability: runtimeOptions.journalDurability,
     }),
   };

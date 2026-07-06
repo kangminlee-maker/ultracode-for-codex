@@ -170,6 +170,13 @@ npm exec -- ultracode-for-codex result <jobId> --cwd /path/to/project
 npm exec -- ultracode-for-codex cancel <jobId> --cwd /path/to/project
 ```
 
+Runs wait indefinitely by default (timeout `0`). So a long or stuck run stays
+visible without a hard deadline, the runtime emits a non-destructive
+`workflow.heartbeat` progress event every two minutes with the elapsed time,
+current phase, and completed/known agent counts — it never aborts the run.
+Tune it with `--heartbeat-ms <n>` (or `workflow.heartbeatMs` in settings); `0`
+turns it off.
+
 Use attached execution only when the terminal should stay connected until the
 workflow finishes:
 

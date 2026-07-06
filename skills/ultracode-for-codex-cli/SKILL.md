@@ -77,6 +77,11 @@ CLI behavior:
   should stay connected until completion;
 - attached progress prints to stderr as JSONL by default;
 - attached final workflow result prints as JSON to stdout;
+- while a run is in flight, a non-destructive `workflow.heartbeat` progress
+  event is emitted every `workflow.heartbeatMs` (default 120000 ms; `0`
+  disables, `--heartbeat-ms <n>` overrides) with elapsed time, current phase,
+  and completed/known agent counts — it surfaces a long or stuck run under an
+  unbounded timeout without ever aborting or retrying it;
 - a terminal failure prints an `ultracode.workflow.failure` record (`status`,
   `failure.reason`, `failure.error`, `failure.workflowName`, `failure.taskId`,
   `failure.runId`, plus `failure.phase`/`failure.agentsCompleted` when known)

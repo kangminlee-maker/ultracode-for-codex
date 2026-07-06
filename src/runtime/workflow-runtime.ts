@@ -102,6 +102,19 @@ export type WorkflowEvent =
       readonly message: string;
     }
   | {
+      // Non-destructive liveness signal: emitted every heartbeatMs while a run
+      // is in flight so a long or stuck run stays visible under an unbounded
+      // (timeout 0) deadline. It never aborts or retries anything.
+      readonly type: 'workflow.heartbeat';
+      readonly taskId: string;
+      readonly runId: string;
+      readonly elapsedMs: number;
+      readonly phase?: string;
+      readonly completedAgentCount: number;
+      readonly knownAgentCount: number;
+      readonly seq: number;
+    }
+  | {
       readonly type: 'workflow.agent.started';
       readonly taskId: string;
       readonly runId: string;
@@ -363,6 +376,9 @@ interface WorkflowTaskRegistryOptions {
   readonly requestTimeoutMs: number;
   readonly agentStallTimeoutMs?: number;
   readonly agentStallRetryLimit?: number;
+  // Emit a non-destructive workflow.heartbeat every heartbeatMs while running.
+  // 0 (or omitted) disables it, preserving the pre-heartbeat event stream.
+  readonly heartbeatMs?: number;
   readonly userWorkflowDirs?: readonly string[];
   readonly pluginWorkflows?: readonly WorkflowPluginRegistry[];
   readonly builtinWorkflows?: readonly BuiltinWorkflow[];
@@ -1626,6 +1642,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   private readonly stateDir: string;
   private readonly agentStallTimeoutMs: number;
   private readonly agentStallRetryLimit: number;
+  private readonly heartbeatMs: number;
 
   constructor(private readonly options: WorkflowTaskRegistryOptions) {
     this.stateDir = options.stateDir ?? defaultWorkflowStateDir(options.cwd ?? process.cwd());
@@ -1634,6 +1651,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       options.agentStallTimeoutMs,
       options.requestTimeoutMs,
     );
+    this.heartbeatMs = normalizeHeartbeatMs(options.heartbeatMs);
   }
 
   async launch(input: WorkflowLaunchInput): Promise<WorkflowLaunchResult> {
@@ -2610,6 +2628,25 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
           controller.abort();
         }, this.options.requestTimeoutMs)
       : null;
+    // Non-destructive liveness heartbeat: surfaces phase/elapsed/agent progress
+    // on an interval so a long or stuck run stays visible under an unbounded
+    // deadline. It only emits an event; it never aborts the run.
+    let heartbeatSeq = 0;
+    const heartbeatTimer = this.heartbeatMs > 0
+      ? setInterval(() => {
+          this.emit(task, {
+            type: 'workflow.heartbeat',
+            taskId: task.taskId,
+            runId: task.runId,
+            elapsedMs: Date.now() - ctx.startedAt,
+            phase: ctx.currentPhase,
+            completedAgentCount: task.events.filter((event) => event.type === 'workflow.agent.completed').length,
+            knownAgentCount: ctx.agentCount,
+            seq: (heartbeatSeq += 1),
+          });
+        }, this.heartbeatMs)
+      : null;
+    if (heartbeatTimer && typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
     try {
       if (controller.signal.aborted) throw workflowInputError('Workflow is aborted.');
       const result = await executeInlineWorkflow(parsed, this.createVmGlobals(ctx), controller.signal);
@@ -2651,6 +2688,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       );
     } finally {
       if (workflowTimer) clearTimeout(workflowTimer);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
       for (const timer of ctx.timers.values()) clearTimeout(timer);
       ctx.timers.clear();
     }
@@ -5235,6 +5273,13 @@ function normalizeAgentStallTimeoutMs(
   }
   if (configured === 0 || requestTimeoutMs === 0) return 0;
   return Math.max(1, Math.floor(requestTimeoutMs));
+}
+
+function normalizeHeartbeatMs(configured: number | undefined): number {
+  if (configured !== undefined && Number.isFinite(configured) && configured > 0) {
+    return Math.max(1, Math.floor(configured));
+  }
+  return 0;
 }
 
 function workflowTaskSnapshot(task: WorkflowTaskMutable): WorkflowTaskSnapshot {

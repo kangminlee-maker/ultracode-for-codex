@@ -15,6 +15,7 @@ export interface UltracodeSettings {
     readonly permission: WorkflowPermissionPolicy;
     readonly retryLimit: number;
     readonly timeoutMs: number;
+    readonly heartbeatMs: number;
     readonly background: {
       readonly runDir: string;
       readonly resultFile: string;
@@ -76,6 +77,10 @@ export function loadSettings(): UltracodeSettings {
         workflow?.timeoutMs,
         'workflow.timeoutMs',
       ),
+      heartbeatMs: readNonNegativeIntegerSetting(
+        workflow?.heartbeatMs,
+        'workflow.heartbeatMs',
+      ),
       background: {
         runDir: readTemplateSetting(
           background?.runDir,
@@ -132,6 +137,10 @@ export function workflowDefaultRetryLimit(): number {
 
 export function workflowDefaultTimeoutMs(): number {
   return loadSettings().workflow.timeoutMs;
+}
+
+export function workflowDefaultHeartbeatMs(): number {
+  return loadSettings().workflow.heartbeatMs;
 }
 
 export function workflowBackgroundDefaults(): UltracodeSettings['workflow']['background'] {

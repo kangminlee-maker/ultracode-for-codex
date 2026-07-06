@@ -27,6 +27,7 @@ import {
   workflowDefaultProgressMode,
   workflowDefaultRetryLimit,
   workflowDefaultTimeoutMs,
+  workflowDefaultHeartbeatMs,
 } from './settings.js';
 import type { ReasoningEffort, Verbosity } from './runtime/types.js';
 import type { WorkflowExecutionMode, WorkflowPermissionPolicy, WorkflowProgressMode } from './settings.js';
@@ -106,6 +107,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
     return launchBackgroundWorkflow(args, cwd);
   }
   const timeoutMs = parseIntOption(options.timeoutMs, workflowDefaultTimeoutMs());
+  const heartbeatMs = parseNonNegativeIntOption(options.heartbeatMs, workflowDefaultHeartbeatMs(), 'heartbeat-ms');
   const retryLimit = parseRetryLimit(options.retryLimit);
   const permissionPolicy = parsePermissionPolicy(options.permission);
   const progressMode = parseProgressMode(options.progress);
@@ -125,6 +127,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
     backend,
     cwd,
     requestTimeoutMs: timeoutMs,
+    heartbeatMs,
   });
 
   try {
@@ -227,6 +230,7 @@ interface ParsedOptions {
   readonly command?: string;
   readonly model?: string;
   readonly timeoutMs?: string;
+  readonly heartbeatMs?: string;
   readonly cwd?: string;
   readonly execution?: string;
   readonly reasoningEffort?: string;
@@ -1468,6 +1472,9 @@ function renderWorkflowEvent(event: WorkflowEvent, progressMode: ProgressMode): 
     case 'workflow.log':
       process.stderr.write(`[log] ${event.message}\n`);
       return;
+    case 'workflow.heartbeat':
+      process.stderr.write(`[heartbeat] ${formatElapsedDuration(event.elapsedMs)} elapsed${event.phase ? ` phase=${event.phase}` : ''} agents=${event.completedAgentCount}/${event.knownAgentCount}\n`);
+      return;
     case 'workflow.agent.started':
       process.stderr.write(`[agent:${event.agentIndex + 1}] started ${event.label}\n`);
       return;
@@ -1683,6 +1690,7 @@ interface ProgressPayload {
   readonly knownAgentCount?: number;
   readonly phaseCompletedAgentCount?: number;
   readonly phaseKnownAgentCount?: number;
+  readonly seq?: number;
   readonly skipped?: boolean;
   readonly worktreePreserved?: boolean;
   readonly preservedWorktrees?: readonly unknown[];
@@ -1806,6 +1814,19 @@ function progressPayloadForEvent(event: WorkflowEvent): ProgressPayload {
         taskId: event.taskId,
         runId: event.runId,
         message: event.message,
+      };
+    case 'workflow.heartbeat':
+      return {
+        event: event.type,
+        status: 'running',
+        summary: `Still running: ${formatElapsedDuration(event.elapsedMs)} elapsed${event.phase ? `, phase ${event.phase}` : ''}, ${event.completedAgentCount}/${event.knownAgentCount} agents completed`,
+        taskId: event.taskId,
+        runId: event.runId,
+        elapsedMs: event.elapsedMs,
+        phase: event.phase,
+        completedAgentCount: event.completedAgentCount,
+        knownAgentCount: event.knownAgentCount,
+        seq: event.seq,
       };
     case 'workflow.agent.started':
       return {
@@ -1975,6 +1996,7 @@ Options:
   --command <path>                   Override Codex CLI binary path.
   --model <model>                    Pass a model to Codex app-server.
   --timeout-ms <number>              Runtime timeout; 0 waits for completion/cancel. Default: settings.json (${workflowDefaultTimeoutMs()}).
+  --heartbeat-ms <number>            Emit a non-destructive workflow.heartbeat every N ms while running; 0 disables. Default: settings.json (${workflowDefaultHeartbeatMs()}).
   --cwd <dir>                        Working directory for workflow execution. Default: current cwd.
   --reasoning-effort <effort>        Codex reasoning effort. Default: settings.json (${codexDefaultReasoningEffort()}).
   --verbosity <verbosity>            Codex verbosity. Default: settings.json (${codexDefaultVerbosity()}).
