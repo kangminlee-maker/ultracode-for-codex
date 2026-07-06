@@ -5,6 +5,10 @@ background runs; all three are runtime-generic (they were *surfaced* through the
 but none is review-specific — they bind every workflow that runs on this runtime, built-in or
 user-authored).
 
+Status (2026-07-06): RESOLVED in `ultracode-for-codex` 0.4.2 — F1/F2/F3 re-verified against the
+installed package via a live re-run of the F1 repro (see "Verification" at the end). This handoff is
+retained as the finding/spec record; the three gaps no longer reproduce.
+
 Pinned state: repo `~/Documents/ultracode-for-codex` @ `ad7d0cf` (main); installed package
 `ultracode-for-codex@0.4.1` (global npm, `/opt/homebrew/lib/node_modules/ultracode-for-codex`);
 observations from background jobs run 2026-07-05 22:35–22:40 KST with cwd `~/Documents/agent-dotfiles`
@@ -117,3 +121,24 @@ All three items implemented on top of `ad7d0cf`; F1–F3 re-verified against sou
   failure with 0 backend requests; rejection-message cause/remediation segments) and
   `test/cli-result-contract.test.mjs` (attached/background failure records, success negative
   controls, progress-loss classification).
+
+## Verification (2026-07-06, installed 0.4.2)
+
+Re-ran the original F1 repro against the installed package (`ultracode-for-codex 0.4.2`,
+`/opt/homebrew/bin/ultracode-for-codex`), same conditions as the 2026-07-05 observations: background
+`code-review` with cwd `~/Documents/agent-dotfiles` (clean working tree). Job
+`job_2c3ce94b-1ff3-4e09-aca7-472afd1383ed` reached terminal `failed`. All three gaps closed:
+
+- F1 — fails pre-agent. Progress is exactly `workflow.started → plan.ready → phase.started (Evidence)
+  → failed → terminal_failure` (5 events, no `agent.*`); the run terminates in the Evidence phase with
+  0 agents spawned. (Was: ~1–2 min xhigh Scope agent, then fail.)
+- F2 — diagnostic carries cause + remediation: `code-review invalid: no reviewable change evidence in
+  the working tree: allowed file refs is empty (0 entries) derived from file: entries in the evidence
+  context (git status changed/untracked paths); populated by uncommitted or untracked paths in the
+  working tree`.
+- F3 — `result.json` is a 589-byte `ultracode.workflow.failure` record (`status:"failed"`,
+  `failure.{reason:"workflow_failed",error,workflowName,taskId,runId,phase:"Evidence"}`) and
+  `json.load` parses it cleanly. (Was: 0 bytes, `json.load` → `Expecting value`.)
+
+Deterministic suite green on 0.4.2: `npm test` → 67/67 pass, including the (a)/(b)/(c) regression
+fixtures above.
