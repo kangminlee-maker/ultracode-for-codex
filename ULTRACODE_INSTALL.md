@@ -217,6 +217,12 @@ Useful controls:
   available for shorter foreground checks.
 - Progress events are printed to stderr as JSONL by default.
 - The final workflow result is printed as JSON to stdout.
+- A terminal failure prints an `ultracode.workflow.failure` record (`status`,
+  `failure.reason`, `failure.error`, `failure.workflowName`, `failure.taskId`,
+  `failure.runId`, plus `failure.phase`/`failure.agentsCompleted` when known)
+  to the same stdout channel, so background `result.json` parses on both
+  outcomes. `status` classifies a failure record as `failed` even without
+  progress events, and `result` prints it with exit code 1.
 - The package default workflow timeout is `0`, meaning the workflow waits until
   it completes, is cancelled, or the Codex app-server exits.
 - JSONL records include `kind`, `version`, `event`, `status`, and `summary`;
@@ -265,14 +271,19 @@ Useful controls:
 - Route progress, cancellation, permission review, retry, and result projection
   through the CLI command.
 - Keep stdout reserved for the final JSON result; stream progress records to
-  stderr as JSONL unless a human chooses `--progress plain`.
+  stderr as JSONL unless a human chooses `--progress plain`. The channel is
+  total: terminal failures print an `ultracode.workflow.failure` record
+  instead of leaving stdout (and background `result.json`) empty.
 - Strip direct provider credentials from child CLI environments.
 - Run Codex subagents against the requested workflow cwd and provide bounded
   read-only workspace tools for text file reads and directory listings.
 - Built-in `task` adds deterministic workspace context to planner-selected
   phase-wise parallel subagents. Built-in `code-review` uses deterministic
   review evidence, allowed evidence refs, dynamic lenses, candidate verification,
-  and bounded final synthesis.
+  and bounded final synthesis. It reviews pending working-tree changes: on a
+  clean tree it fails before spawning any agent with `no reviewable change
+  evidence in the working tree`, and ref rejections name the allowed set, its
+  size, its source, and what populates it.
 - Install consumers from a packaged artifact.
 - Keep `journalPath`, `journal.jsonl`, and journal contents out of CLI output.
   Local runtime state may still contain runtime-owned
