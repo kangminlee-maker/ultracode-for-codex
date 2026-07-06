@@ -159,9 +159,9 @@
 
     <section class="grid" aria-label="Current status">
       <div class="tile"><strong>Current goal</strong><span>Runtime failure-contract DX: total result channel, pre-agent empty-evidence precondition, and three-part rejection diagnostics (F1–F3 handoff)</span></div>
-      <div class="tile"><strong>Runtime health</strong><span>0.4.2 release line: F1–F3 fixes with regression fixtures (clean-tree pre-agent fail, failure-record result channel, rejection message segments); unit and installed E2E green</span></div>
-      <div class="tile"><strong>Main risk</strong><span>Consumers that treated a non-empty result file as success must key on the ultracode.workflow.failure envelope, not on file presence</span></div>
-      <div class="tile"><strong>Next decision</strong><span>Re-measure runtime reliability on 0.4.2 task-mode runs (tracked outside the failure-contract handoff)</span></div>
+      <div class="tile"><strong>Runtime health</strong><span>0.4.2: F1–F3 fixes green; live reliability study (53 real-Codex runs) shows 0 hard failures, code-review 30/30, resume 8/8 with cache reuse — see docs/20260706-runtime-reliability-study-0.4.2.md</span></div>
+      <div class="tile"><strong>Main risk</strong><span>task-mode tail latency: 2/15 runs breached the 480 s deadline in the synthesis phase (latency, not a defect); code-review unaffected</span></div>
+      <div class="tile"><strong>Next decision</strong><span>Decide task-mode deadline/synthesis-tail handling (raise deadline vs time-boxed synthesis); code-review needs no action</span></div>
     </section>
 
     <h2>Service Blueprint</h2>
