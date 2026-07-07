@@ -798,7 +798,7 @@ async function assertInstalledReviewEvidenceContext(installedCli) {
   ]);
   assert.equal(result.status, 0);
   const context = JSON.parse(result.stdout);
-  assert.match(context, /### Review Evidence/);
+  assert.match(context, /### Change Evidence/);
   assert.match(context, /truncation: \{"unstaged":true,"staged":false,"committed":false\}/);
   assert.match(context, /diff:unstaged:src\/evidence-large\.txt/);
   assert.match(context, /diff:unstaged:src\/evidence-deleted\.txt/);

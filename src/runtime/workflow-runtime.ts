@@ -3587,8 +3587,8 @@ async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptio
   });
   const gitStatusPathParse = parseGitStatusPaths(gitStatusPaths, runtimeStateExcludedPaths);
   const excludedWorkspacePaths = new Set(gitStatusPathParse.excludedPaths.map(workspacePathKey));
-  const reviewEvidence = options.includeDiff
-    ? await buildReviewEvidenceContext(root, gitStatusPaths, options, statusUnavailableEvidence, runtimeStateExcludedPaths)
+  const changeEvidence = options.includeDiff
+    ? await buildChangeEvidenceContext(root, gitStatusPaths, options, statusUnavailableEvidence, runtimeStateExcludedPaths)
     : undefined;
   const explicitPaths = [
     ...options.files,
@@ -3620,18 +3620,18 @@ async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptio
   return [
     '## Workspace Context',
     `Root: ${root}`,
-    ...(reviewEvidence ? [
-      `Source Snapshot: ${reviewEvidence.sourceSnapshotId}`,
-      `Context Hash: ${reviewEvidence.contextHash}`,
+    ...(changeEvidence ? [
+      `Source Snapshot: ${changeEvidence.sourceSnapshotId}`,
+      `Context Hash: ${changeEvidence.contextHash}`,
       '',
-      '### Review Evidence',
-      reviewEvidence.text,
+      '### Change Evidence',
+      changeEvidence.text,
       '',
       '### Allowed Evidence Refs',
-      reviewEvidence.allowedEvidenceRefs.length ? reviewEvidence.allowedEvidenceRefs.join('\n') : '(none)',
+      changeEvidence.allowedEvidenceRefs.length ? changeEvidence.allowedEvidenceRefs.join('\n') : '(none)',
       '',
       '### Unavailable Evidence',
-      reviewEvidence.unavailableEvidence.length ? reviewEvidence.unavailableEvidence.join('\n') : '(none)',
+      changeEvidence.unavailableEvidence.length ? changeEvidence.unavailableEvidence.join('\n') : '(none)',
     ] : []),
     '',
     '### Git Status',
@@ -3642,7 +3642,7 @@ async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptio
   ].join('\n');
 }
 
-interface ReviewEvidenceContext {
+interface ChangeEvidenceContext {
   readonly sourceSnapshotId: string;
   readonly contextHash: string;
   readonly allowedEvidenceRefs: readonly string[];
@@ -3661,13 +3661,13 @@ interface BoundedGitText {
   readonly truncated: boolean;
 }
 
-async function buildReviewEvidenceContext(
+async function buildChangeEvidenceContext(
   root: string,
   gitStatus: string,
   options: WorkspaceContextOptions,
   initialUnavailableEvidence: readonly string[] = [],
   runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
-): Promise<ReviewEvidenceContext> {
+): Promise<ChangeEvidenceContext> {
   const unavailableEvidence: string[] = [...initialUnavailableEvidence];
   const gitStatusPaths = parseGitStatusPaths(gitStatus, runtimeStateExcludedPaths);
   const changedPaths = gitStatusPaths.paths.filter((path) => shouldIncludeWorkspaceContextPath(path, runtimeStateExcludedPaths));

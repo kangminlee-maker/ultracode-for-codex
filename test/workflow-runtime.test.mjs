@@ -364,7 +364,7 @@ test('built-in code-review runs dynamic lens finders, candidate verifiers, sweep
     const scopePrompt = backend.requests
       .map((request) => request.messages[0].content)
       .find((content) => /Code-review Scope/.test(content));
-    assert.match(scopePrompt, /### Review Evidence/);
+    assert.match(scopePrompt, /### Change Evidence/);
     assert.match(scopePrompt, /file:docs\/client-package-plan\.md/);
     assert.match(scopePrompt, /platform token/);
     const journal = await readWorkflowJournal(workflowJournalPath(snapshot.transcriptDir));
@@ -589,7 +589,7 @@ return { result, events };`,
   }
 });
 
-test('workspaceContext includeDiff returns deterministic review evidence refs', async () => {
+test('workspaceContext includeDiff returns deterministic change evidence refs', async () => {
   const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend() });
   try {
     await initializeGitRepo(root);
@@ -644,7 +644,7 @@ return await workspaceContext({
     await collectEvents(runtime, launch.taskId);
     const snapshot = runtime.get(launch.taskId);
     assert.equal(snapshot.status, 'completed');
-    assert.match(snapshot.result, /### Review Evidence/);
+    assert.match(snapshot.result, /### Change Evidence/);
     assert.match(snapshot.result, /sourceSnapshotId: git:[0-9a-f]{40}:sha256:[0-9a-f]{64}/);
     assert.match(snapshot.result, /contextHash: sha256:[0-9a-f]{64}/);
     assert.match(snapshot.result, /allowedEvidenceIndexDigest: sha256:[0-9a-f]{64}/);
