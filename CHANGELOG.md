@@ -8,6 +8,8 @@ the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-07-07
+
 ### Added
 
 - `setup` command (alias `doctor`): a single readiness preflight that reports
