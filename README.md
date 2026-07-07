@@ -100,17 +100,18 @@ immediately.
 Use the default skill for normal work:
 
 ```text
-$ultracode-for-codex Review this change for correctness and security risks.
+$ultracode-for-codex Investigate why the checkout flow drops sessions and propose a fix.
 ```
 
-Good tasks for the default skill:
+Good tasks for the default skill — any work that benefits from parallel
+perspectives, for example:
 
-- code review;
-- implementation planning;
-- multi-step verification;
+- implementation planning and multi-step investigation;
 - architecture or design critique;
-- release readiness checks;
-- work that benefits from parallel perspectives.
+- migrations and repository-wide changes;
+- research and synthesis across sources;
+- code review (also available as the built-in `code-review` workflow);
+- release readiness checks and verification.
 
 The default skill shows a phase plan before work starts and keeps a cumulative
 progress snapshot as agents finish.

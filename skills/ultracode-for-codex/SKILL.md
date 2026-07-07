@@ -163,12 +163,23 @@ Default to phase-wise parallel execution. Useful patterns include:
 - loop-until-done: iterate repair and verification only when there is a clear
   stop condition.
 
-For code review, prefer the built-in `code-review` workflow: it collects
-bounded review evidence, selects dynamic lenses, runs parallel finders at the
-`high` sweep tier, verifies each candidate at `xhigh`, and synthesizes final
-findings with provenance. It reviews pending working-tree changes: on a clean
-tree it fails before spawning any agent with `no reviewable change evidence in
-the working tree`, so make or stage a change first.
+Most work is served by authoring a phase-wise workflow from these patterns on
+the generic host API, or by the general `task` built-in (LLM-planned phases).
+`references/example-workflows/` has runnable, non-review starting points:
+`research-fan-out` (fan-out-and-synthesize), `migrate-pipeline`
+(discover→transform→verify over the pending change evidence), and `judge-panel`
+(generate→judge→decide).
+
+The built-in `code-review` is deliberately the most elaborate built-in because
+it produces evidence-bound, verified, provenance-carrying findings — that
+machinery is specific to review's contract, not the runtime's center of
+gravity. The general path is intentionally open-ended and planner-driven, not
+under-built. For a review, prefer that built-in: it collects bounded change
+evidence, selects dynamic lenses, runs parallel finders at the `high` sweep
+tier, verifies each candidate at `xhigh`, and synthesizes findings with
+provenance. It reviews pending working-tree changes: on a clean tree it fails
+before spawning any agent with `no reviewable change evidence in the working
+tree`, so make or stage a change first.
 
 For implementation, split by disjoint write ownership where possible. Tell
 subagents they are not alone in the codebase and must not revert unrelated or
