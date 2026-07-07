@@ -38,6 +38,7 @@ Production surface:
 - `ultracode-for-codex archive`
 - `ultracode-for-codex export`
 - `ultracode-for-codex skills`
+- `ultracode-for-codex setup`
 
 Progress, cancellation, permission review, retry, and final result projection
 are handled inside the CLI process. Progress is JSONL on stderr by
@@ -170,6 +171,14 @@ API surface:
   and `budget` are available; `setTimeout`/`clearTimeout` work inside the
   run.
 
+This contract governs script *structure*. For the natural-language `prompt`
+body of each `agent()` call — outcome-first framing, grounding and verification
+rules, and per-task shape for the current Codex model family — follow
+`skills/ultracode-for-codex/references/codex-agent-prompting.md`. It enforces
+the division of labor: `schema` owns output shape, `effort` owns reasoning
+depth, and the prompt owns intent and evidence discipline, so do not restate
+JSON shape or ask an agent to "think harder" in the prompt.
+
 Validate before launching:
 
 ```bash
@@ -223,6 +232,10 @@ Useful controls:
   to the same stdout channel, so background `result.json` parses on both
   outcomes. `status` classifies a failure record as `failed` even without
   progress events, and `result` prints it with exit code 1.
+- A failed agent's error message carries a `[codex thread <id>]` correlation id
+  so the failure can be traced to its Codex app-server thread in run logs. The
+  thread is ephemeral and its isolated home is removed on close, so this is a
+  diagnostic correlation id, not a `codex resume` handle.
 - The package default workflow timeout is `0`, meaning the workflow waits until
   it completes, is cancelled, or the Codex app-server exits.
 - Under an unbounded (`0`) timeout, a non-destructive `workflow.heartbeat`
@@ -267,6 +280,25 @@ Useful controls:
 - Use `--progress plain` for human-readable log lines.
 - Use `--execution background` for OS background runs and `--execution attached`
   only when the caller should stay connected until completion.
+
+## Model And Config Conventions
+
+- Models follow current Codex naming: the GPT-5.5 family (`gpt-5.5`,
+  `gpt-5.5-codex`). The runtime default subagent model is `gpt-5.5`. Set a
+  specific one with run-level `--model` or per-agent `model`.
+- Effort follows Codex reasoning-effort naming: `none|low|medium|high|xhigh`
+  (`minimal` is also accepted by the enum but the current default model rejects
+  it). This family defaults to `medium`; the runtime funnel uses `high` for
+  finder-class agents and `xhigh` for verdict/synthesis agents.
+- Auth and the default model are inherited from your Codex install: the runtime
+  copies `auth.json` and reads the top-level `model` from
+  `${CODEX_HOME:-~/.codex}` (and its `config.toml`). Run `setup` to confirm
+  Codex is installed and authenticated before a delegated phase.
+- Subagents otherwise run under an isolated, minimal `config.toml`
+  (`web_search` disabled, read-only sandbox, analytics off) for reproducibility.
+  Project-level `.codex/config.toml` overrides beyond the default model are
+  intentionally not applied to subagents — steer per run with `--model` /
+  `--reasoning-effort`, or per agent with `model` / `effort`.
 
 ## Runtime Contract
 
@@ -317,7 +349,17 @@ Useful controls:
 npm exec -- ultracode-for-codex --help
 npm exec -- ultracode-for-codex --version
 npm exec -- ultracode-for-codex --llm-guide
+npm exec -- ultracode-for-codex setup
 ```
+
+`setup` (alias `doctor`) verifies the whole chain in one call — package
+version, Codex CLI presence and version, Codex app-server reachability, Codex
+authentication (ChatGPT login, API key, or a no-auth provider), and whether the
+installed skill commands match this package. It prints JSON by default (`--plain`
+for human lines) and exits non-zero when anything blocks a delegated phase, so a
+failing auth or a missing Codex install is caught before a workflow starts
+instead of mid-run. When it reports not authenticated, run `!codex login`; when
+it reports stale or missing skills, run `ultracode-for-codex skills --install`.
 
 If this guide is missing, treat the package as invalid. If `run` is used without
 `--accept-llm-guide=v1`, the CLI prints this guide and exits before executing a
@@ -330,6 +372,8 @@ workflow.
   command.
 - `skills/ultracode-for-codex/references/progress-visuals.md`: golden visual
   progress and completion summary examples for native orchestration.
+- `skills/ultracode-for-codex/references/codex-agent-prompting.md`: how to write
+  the natural-language `agent()` prompt body for the current Codex model family.
 - `skills/ultracode-for-codex-cli/SKILL.md`: explicit CLI runtime command.
 - `docs/ultracode-p3a-journal-design.md`: implemented journal contract.
 - `docs/ultracode-p3b-resume-cache.md`: local resume/cache contract.

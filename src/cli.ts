@@ -8,6 +8,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { CodexSubagentBackend } from './codex/subagent-backend.js';
+import { probeCodexSetup } from './codex/setup-probe.js';
 import { WorkflowTaskRegistry } from './runtime/workflow-runtime.js';
 import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError } from './runtime/types.js';
 import { ultracodePackageVersion } from './runtime/package-info.js';
@@ -81,6 +82,7 @@ async function main(argv: readonly string[]): Promise<number> {
   if (command === 'jobs' || command === 'list') return listBackgroundJobs(args);
   if (command === 'archive' || command === 'export') return archiveBackgroundJob(args);
   if (command === 'skills') return manageCodexSkills(args);
+  if (command === 'setup' || command === 'doctor') return runCodexSetup(args);
   process.stderr.write(`Unknown command: ${command}\n\n${helpText()}`);
   return 1;
 }
@@ -1225,6 +1227,67 @@ async function manageCodexSkills(args: readonly string[]): Promise<number> {
   return 0;
 }
 
+async function runCodexSetup(args: readonly string[]): Promise<number> {
+  const options = parseOptions(args);
+  if (options._.length > 0) throw new Error('setup does not accept positional arguments.');
+  const cwd = typeof options.cwd === 'string' && options.cwd ? options.cwd : process.cwd();
+  const probe = await probeCodexSetup({ command: options.command, cwd });
+  const skills = await collectCodexSkillStates();
+  const skillsReady = skills.every((skill) => skill.state === 'current');
+  const ready = probe.ready && skillsReady;
+  if (wantsPlain(options)) {
+    process.stdout.write(`[setup] package ${probe.packageVersion}  node ${probe.nodeVersion}\n`);
+    process.stdout.write(probe.codexInstalled
+      ? `[setup] codex installed  ${probe.codexVersion}\n`
+      : `[setup] codex missing  ${probe.detail}\n`);
+    if (probe.codexInstalled) {
+      process.stdout.write(`[setup] app-server ${probe.appServerReachable ? 'reachable' : 'unreachable'}\n`);
+      process.stdout.write(`[setup] auth ${probe.detail}\n`);
+    }
+    for (const skill of skills) process.stdout.write(`[setup] skill ${skill.name} ${skill.state}\n`);
+    if (!skillsReady) {
+      process.stdout.write('[setup] run "ultracode-for-codex skills --install" to refresh skill commands\n');
+    }
+    process.stdout.write(`[setup] ready: ${ready ? 'yes' : 'no'}\n`);
+  } else {
+    process.stdout.write(`${JSON.stringify({
+      kind: 'ultracode.setup',
+      version: 1,
+      ready,
+      packageVersion: probe.packageVersion,
+      nodeVersion: probe.nodeVersion,
+      codex: {
+        command: probe.command,
+        installed: probe.codexInstalled,
+        version: probe.codexVersion,
+        appServerReachable: probe.appServerReachable,
+      },
+      auth: {
+        checked: probe.authChecked,
+        loggedIn: probe.loggedIn,
+        method: probe.authMethod,
+        account: probe.account,
+        requiresOpenaiAuth: probe.requiresOpenaiAuth,
+      },
+      detail: probe.detail,
+      codexSkillsRoot: codexSkillsRoot(),
+      skills,
+    }, null, 2)}\n`);
+  }
+  return ready ? 0 : 1;
+}
+
+async function collectCodexSkillStates(): Promise<{ readonly name: string; readonly state: CodexSkillState }[]> {
+  const sourceRoot = join(dirname(cliEntryPath()), '..', 'skills');
+  const targetRoot = codexSkillsRoot();
+  const skills: { readonly name: string; readonly state: CodexSkillState }[] = [];
+  for (const name of CODEX_SKILL_NAMES) {
+    const state = await codexSkillState(join(sourceRoot, name), join(targetRoot, name), name);
+    skills.push({ name, state });
+  }
+  return skills;
+}
+
 function codexSkillsRoot(): string {
   const configured = process.env.CODEX_HOME?.trim();
   return join(configured ? configured : join(homedir(), '.codex'), 'skills');
@@ -1976,6 +2039,7 @@ Commands:
   archive    Export one background workflow job state to an archive JSON file.
   export     Alias for archive.
   skills     Report whether the installed Codex skill commands match this package; --install updates them.
+  setup      Check readiness: package, Codex CLI, app-server, authentication, and installed skill commands (alias: doctor).
 
 Options:
   --version, -v                     Print the package version.

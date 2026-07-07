@@ -223,6 +223,12 @@ export class CodexSubagentBackend implements SubagentBackend {
         usage,
         latencyMs: Date.now() - startedAt,
       };
+    } catch (error) {
+      // Attach the Codex thread id as a diagnostic correlation id so a failed
+      // agent can be traced to its app-server thread in run logs. The thread is
+      // ephemeral and its isolated home is removed on close, so this is a
+      // correlation id for live-run debugging, not a `codex resume` handle.
+      throw withCodexThreadContext(error, threadId);
     } finally {
       if (signal) signal.removeEventListener('abort', onAbort);
       if (threadId) this.archiveThread(threadId);
@@ -901,6 +907,13 @@ export async function createCodexIsolation(options: {
     workDir,
     defaultModel,
   };
+}
+
+function withCodexThreadContext(error: unknown, threadId: string | null): Error {
+  const base = error instanceof Error ? error : new Error(String(error));
+  if (!threadId || base.message.includes(threadId)) return base;
+  base.message = `${base.message} [codex thread ${threadId}]`;
+  return base;
 }
 
 export function minimalCodexConfigToml(options: {
