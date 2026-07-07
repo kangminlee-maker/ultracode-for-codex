@@ -158,10 +158,10 @@
     <p>Current state of the hybrid skill command, CLI workflow runtime, and npm package release path.</p>
 
     <section class="grid" aria-label="Current status">
-      <div class="tile"><strong>Current goal</strong><span>Runtime failure-contract DX: total result channel, pre-agent empty-evidence precondition, and three-part rejection diagnostics (F1–F3 handoff)</span></div>
-      <div class="tile"><strong>Runtime health</strong><span>0.4.2: F1–F3 fixes green; live reliability study (53 real-Codex runs) shows 0 hard failures, code-review 30/30, resume 8/8 with cache reuse — see docs/20260706-runtime-reliability-study-0.4.2.md</span></div>
-      <div class="tile"><strong>Main risk</strong><span>task-mode synthesis-phase tail latency remains (visible, not shortened); default timeout is 0 (wait) so it no longer aborts, and a non-destructive workflow.heartbeat (120 s) surfaces long/stuck runs</span></div>
-      <div class="tile"><strong>Next decision</strong><span>0.4.3 published with the heartbeat; optionally shorten the task synthesis tail later (lighter-tier synthesis) — no correctness gap open</span></div>
+      <div class="tile"><strong>Current goal</strong><span>Reinforce general-workflow-runtime identity (change-evidence rename, general example workflows) and land the setup/doctor + prompting DX; task effort tier settled by measurement</span></div>
+      <div class="tile"><strong>Runtime health</strong><span>0.4.3 published; unreleased on main: W1 change-evidence rename, W2 general examples, and setup/doctor + codex-agent-prompting DX (b0c3f52). Unit + installed E2E green</span></div>
+      <div class="tile"><strong>Main risk</strong><span>None open on task cost/tail: W3 A/B (task xhigh vs high, 15+15 live) shows identical cost/latency/quality — cost is plan-shape-driven, not effort — see docs/20260707-task-effort-ab.md</span></div>
+      <div class="tile"><strong>Next decision</strong><span>Cut 0.4.4 bundling W1 + W2 + the setup/doctor DX; W3 needs no code change (keep xhigh default for task)</span></div>
     </section>
 
     <h2>Service Blueprint</h2>

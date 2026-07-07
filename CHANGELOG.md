@@ -21,11 +21,26 @@ the project uses [semantic versioning](https://semver.org/).
   natural-language `agent()` prompt body (outcome-first framing, grounding, and
   verification for the GPT-5.5 Codex family), keeping `schema` as the owner of
   output shape and `effort` as the owner of reasoning depth.
+- `references/example-workflows/`: three runnable, non-review example workflows on
+  the generic host API — `research-fan-out` (fan-out-and-synthesize),
+  `migrate-pipeline` (discover→transform→verify, using `includeDiff` so a
+  non-review path exercises change evidence), and `judge-panel`
+  (generate→judge→decide). A test runs the static validator over each so a broken
+  example fails `npm test`.
 - A failed agent's error now carries a `[codex thread <id>]` correlation id for
   tracing the failure to its Codex app-server thread in run logs.
 
 ### Changed
 
+- Renamed the `workspaceContext` diff-evidence concept from "review evidence" to
+  the general "change evidence" (`buildChangeEvidenceContext`,
+  `ChangeEvidenceContext`, and the `### Change Evidence` context header). It is a
+  general primitive any workflow can consume, not review-only; digest-,
+  provenance-, and parse-contract-neutral (an in-flight run resumed across the
+  upgrade re-runs agents — correct output, extra spend — same class as git drift).
+- Reframed the README and default skill toward "general workflow runtime,
+  code-review is one built-in"; the code-review vs task machinery asymmetry is
+  documented as intentional, not neglect.
 - Review guidance is now explicitly review-only: findings are presented ranked
   by severity, and fixes are never auto-applied off the back of a review.
 - Documented the Codex model and config conventions the runtime follows: current

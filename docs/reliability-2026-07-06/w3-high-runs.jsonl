@@ -1,0 +1,15 @@
+{"index":0,"effort":"high","outcome":"completed","durationMs":152534,"observedWallMs":156605,"agents":9,"tokens":40381,"foundWordCountBug":true,"resultChars":1858,"ts":"2026-07-07T11:38:08.310Z"}
+{"index":1,"effort":"high","outcome":"completed","durationMs":147541,"observedWallMs":151606,"agents":9,"tokens":38176,"foundWordCountBug":true,"resultChars":1485,"ts":"2026-07-07T11:41:03.484Z"}
+{"index":2,"effort":"high","outcome":"completed","durationMs":177142,"observedWallMs":181223,"agents":9,"tokens":42945,"foundWordCountBug":true,"resultChars":2067,"ts":"2026-07-07T11:44:04.709Z"}
+{"index":3,"effort":"high","outcome":"completed","durationMs":142679,"observedWallMs":146783,"agents":9,"tokens":40200,"foundWordCountBug":true,"resultChars":1473,"ts":"2026-07-07T11:46:31.495Z"}
+{"index":4,"effort":"high","outcome":"completed","durationMs":140062,"observedWallMs":144168,"agents":9,"tokens":39920,"foundWordCountBug":true,"resultChars":1417,"ts":"2026-07-07T11:48:55.666Z"}
+{"index":5,"effort":"high","outcome":"completed","durationMs":158945,"observedWallMs":163052,"agents":9,"tokens":42923,"foundWordCountBug":true,"resultChars":1852,"ts":"2026-07-07T11:51:38.722Z"}
+{"index":6,"effort":"high","outcome":"completed","durationMs":150665,"observedWallMs":154772,"agents":9,"tokens":39851,"foundWordCountBug":true,"resultChars":1710,"ts":"2026-07-07T11:54:13.497Z"}
+{"index":7,"effort":"high","outcome":"completed","durationMs":188060,"observedWallMs":192164,"agents":8,"tokens":37348,"foundWordCountBug":true,"resultChars":1845,"ts":"2026-07-07T11:57:25.664Z"}
+{"index":8,"effort":"high","outcome":"completed","durationMs":180145,"observedWallMs":184210,"agents":9,"tokens":43470,"foundWordCountBug":true,"resultChars":1690,"ts":"2026-07-07T12:00:29.876Z"}
+{"index":9,"effort":"high","outcome":"completed","durationMs":398621,"observedWallMs":402714,"agents":9,"tokens":40844,"foundWordCountBug":true,"resultChars":1720,"ts":"2026-07-07T12:07:12.593Z"}
+{"index":10,"effort":"high","outcome":"completed","durationMs":113041,"observedWallMs":117149,"agents":9,"tokens":37439,"foundWordCountBug":true,"resultChars":1286,"ts":"2026-07-07T12:09:09.745Z"}
+{"index":11,"effort":"high","outcome":"completed","durationMs":155109,"observedWallMs":159211,"agents":9,"tokens":41059,"foundWordCountBug":true,"resultChars":1734,"ts":"2026-07-07T12:11:48.958Z"}
+{"index":12,"effort":"high","outcome":"completed","durationMs":145101,"observedWallMs":149204,"agents":9,"tokens":39521,"foundWordCountBug":true,"resultChars":1304,"ts":"2026-07-07T12:14:18.163Z"}
+{"index":13,"effort":"high","outcome":"completed","durationMs":154017,"observedWallMs":158085,"agents":9,"tokens":40400,"foundWordCountBug":true,"resultChars":1694,"ts":"2026-07-07T12:16:56.249Z"}
+{"index":14,"effort":"high","outcome":"completed","durationMs":124880,"observedWallMs":128952,"agents":8,"tokens":33275,"foundWordCountBug":true,"resultChars":2151,"ts":"2026-07-07T12:19:05.201Z"}
