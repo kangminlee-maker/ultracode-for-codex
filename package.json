@@ -44,6 +44,7 @@
     "skills/ultracode-for-codex-cli/",
     "settings.json",
     "README.md",
+    "CHANGELOG.md",
     "docs/provenance-audit.md",
     "docs/ultracode-p3a-journal-design.md",
     "docs/ultracode-p3b-resume-cache.md",

@@ -21,24 +21,30 @@ runtime is unavailable in the session.
 
 ## Capability Detection
 
-Before the first delegated phase, check the CLI runtime once:
+Before the first delegated phase, run the readiness preflight once:
 
 ```bash
-npm exec --no -- ultracode-for-codex skills || ultracode-for-codex skills
+npm exec --no -- ultracode-for-codex setup || ultracode-for-codex setup
 ```
 
 The `--no` flag keeps `npm exec` from fetching the package when it is not
 already installed; detection must never trigger a package install.
 
-If neither resolves, say that the CLI runtime is unavailable, continue with
-Codex-native subagents, and note that per-agent tiering, schema enforcement,
-and crash recovery are unavailable in that mode.
+`setup` (alias `doctor`) is the single preflight. It reports the package
+version, Codex CLI presence, app-server reachability, Codex authentication, and
+per-skill install state, and exits non-zero when anything blocks a delegated
+phase. Act on its result:
 
-The report also states whether the installed skill commands match the
-package. If any skill reports `stale` or `missing`, run
-`ultracode-for-codex skills --install` and tell the user the skill commands
-were refreshed; the next Codex session loads the updated contract, while the
-current session continues with the skill text it already loaded.
+- If neither invocation resolves, the CLI runtime is unavailable: say so,
+  continue with Codex-native subagents, and note that per-agent tiering, schema
+  enforcement, and crash recovery are unavailable in that mode.
+- If it reports Codex not authenticated (`loggedIn: false`), tell the user to
+  run `!codex login` before delegating; the runtime cannot start subagents
+  otherwise.
+- If any skill reports `stale` or `missing`, run
+  `ultracode-for-codex skills --install` and tell the user the skill commands
+  were refreshed; the next Codex session loads the updated contract, while the
+  current session continues with the skill text it already loaded.
 
 ## Native Workflow
 
@@ -106,7 +112,11 @@ For each phase that fans out subagents:
    logical `key`s bound to the evidence snapshot for dynamic parallel agents,
    never reused within a run; no `Date` or `Math.random`; funnel-tier with
    `effort` — sweeps and finder-style scans at `high`, verdicts and synthesis
-   at `xhigh`.
+   at `xhigh`. For the natural-language `agent()` prompt body — outcome-first
+   framing, grounding, and verification tuned for the current Codex model
+   family — follow `references/codex-agent-prompting.md`: `schema` owns output
+   shape and `effort` owns depth, so the prompt carries only intent and evidence
+   discipline (no restated JSON, no "think harder").
 3. Validate before launching; validation spends no agent tokens:
 
 ```bash
@@ -180,6 +190,12 @@ tier, verifies each candidate at `xhigh`, and synthesizes findings with
 provenance. It reviews pending working-tree changes: on a clean tree it fails
 before spawning any agent with `no reviewable change evidence in the working
 tree`, so make or stage a change first.
+
+Review is review-only. After synthesizing findings, present them ranked by
+severity and stop. Do not apply fixes, edit files, or start an implementation
+phase off the back of a review — even when a fix looks obvious. Ask the user
+which findings, if any, to act on, and treat that as a separate implementation
+request with its own phase plan.
 
 For implementation, split by disjoint write ownership where possible. Tell
 subagents they are not alone in the codebase and must not revert unrelated or
