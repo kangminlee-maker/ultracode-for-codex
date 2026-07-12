@@ -125,7 +125,7 @@ test('CodexSubagentBackend prefers an explicit per-request model over the config
   }
 });
 
-test('CodexSubagentBackend uses the per-request model when no run-level model is configured', async () => {
+test('CodexSubagentBackend resolves the inherited catalog model when no run-level model is configured', async () => {
   process.env.CODEX_HOME = await createCodexHome();
   const backend = new CodexSubagentBackend({
     command: fakeCodex,
@@ -138,7 +138,7 @@ test('CodexSubagentBackend uses the per-request model when no run-level model is
     assert.equal(JSON.parse(overridden.text).turnStart.model, 'per-agent-model');
 
     const defaulted = await backend.generate(textRequest({ prompt: 'DEBUG_PAYLOAD' }));
-    assert.equal(JSON.parse(defaulted.text).turnStart.model, undefined);
+    assert.equal(JSON.parse(defaulted.text).turnStart.model, 'gpt-test-model');
   } finally {
     await backend.close();
   }
@@ -165,6 +165,7 @@ test('CodexSubagentBackend uses an Ultracode-only app-server surface', async () 
     assert.equal(payload.threadStart.config.model_reasoning_effort, 'xhigh');
     assert.equal(payload.threadStart.config.model_verbosity, 'medium');
     assert.equal(payload.threadStart.cwd, process.cwd());
+    assert.equal(payload.threadStart.model, 'gpt-test-model');
     assert.deepEqual(payload.threadStart.runtimeWorkspaceRoots, [process.cwd()]);
     assert.equal(payload.threadStart.dynamicTools[0].name, 'workspace');
     assert.deepEqual(payload.threadStart.dynamicTools[0].tools.map((tool) => tool.name), [
@@ -174,6 +175,29 @@ test('CodexSubagentBackend uses an Ultracode-only app-server surface', async () 
     assert.equal(payload.turnStart.effort, 'xhigh');
     assert.equal(payload.turnStart.summary, 'none');
     assert.equal(payload.turnStart.personality, 'none');
+  } finally {
+    await backend.close();
+  }
+});
+
+test('CodexSubagentBackend validates model and effort against model/list before a turn', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  const backend = new CodexSubagentBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+    reasoningEffort: 'high',
+  });
+
+  try {
+    await backend.prepare();
+    assert.equal(backend.model, 'gpt-test-model');
+    const max = await backend.generate(textRequest({ prompt: 'DEBUG_PAYLOAD', reasoningEffort: 'max' }));
+    assert.equal(JSON.parse(max.text).turnStart.effort, 'max');
+    await assert.rejects(
+      () => backend.generate(textRequest({ model: 'missing-model' })),
+      /model "missing-model" is unavailable/,
+    );
   } finally {
     await backend.close();
   }

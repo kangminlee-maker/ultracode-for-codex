@@ -1,7 +1,10 @@
-export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+// `ultra` is intentionally excluded: Codex interprets it as proactive native
+// delegation, which would escape this runtime's journal, cache, and cost
+// accounting. `max` remains a single-agent reasoning tier inside that boundary.
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export type Verbosity = 'low' | 'medium' | 'high';
 
-export const REASONING_EFFORTS: readonly ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+export const REASONING_EFFORTS: readonly ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 // Backend model name used when no run-level model is configured. It is a
 // projection placeholder, never a real Codex model id.
@@ -64,6 +67,7 @@ export interface SubagentResult {
 export interface SubagentBackend {
   readonly name: string;
   readonly model: string;
+  prepare?(): Promise<void>;
   generate(request: SubagentRequest, signal?: AbortSignal): Promise<SubagentResult>;
   close(): Promise<void>;
 }

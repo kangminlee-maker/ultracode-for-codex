@@ -1,7 +1,7 @@
 {
   "name": "ultracode-for-codex",
-  "version": "0.4.4",
-  "description": "Run Codex-native Ultracode orchestration with an optional local CLI runtime.",
+  "version": "0.4.5",
+  "description": "Run durable, schema-enforced, resumable multi-agent workflows with Codex.",
   "keywords": [
     "codex",
     "workflow",

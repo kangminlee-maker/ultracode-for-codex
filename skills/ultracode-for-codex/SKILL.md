@@ -1,6 +1,6 @@
 ---
 name: ultracode-for-codex
-description: Run Ultracode for Codex in hybrid mode, with the main Codex context planning phases, delegating fan-out phases to the local CLI workflow runtime for schema-enforced, journaled, resumable parallel execution, and showing progress directly in the chat.
+description: Run durable, schema-enforced, journaled, resumable Codex workflows, with the main context owning decisions and edits while the local CLI runtime executes auditable fan-out phases.
 ---
 
 # Ultracode for Codex
@@ -16,8 +16,11 @@ outputs, journals every agent result durably, runs agents in parallel with
 per-agent `effort`/`model` tiers, and keeps failed or interrupted phases
 resumable.
 
-Codex-native subagents remain the fallback execution path when the CLI
-runtime is unavailable in the session.
+Use native Codex Ultra for ordinary ad-hoc parallel work when model-directed
+delegation and synthesis are sufficient. Use this skill when the task needs
+schema enforcement, durable journals, completed-step reuse, background jobs,
+or reproducible phase boundaries. Codex-native subagents remain the fallback
+execution path when the CLI runtime is unavailable in the session.
 
 ## Capability Detection
 
@@ -31,9 +34,9 @@ The `--no` flag keeps `npm exec` from fetching the package when it is not
 already installed; detection must never trigger a package install.
 
 `setup` (alias `doctor`) is the single preflight. It reports the package
-version, Codex CLI presence, app-server reachability, Codex authentication, and
-per-skill install state, and exits non-zero when anything blocks a delegated
-phase. Act on its result:
+version, Codex CLI presence, app-server reachability, Codex authentication,
+selected model, supported Ultracode efforts, and per-skill install state. It
+exits non-zero when anything blocks a delegated phase. Act on its result:
 
 - If neither invocation resolves, the CLI runtime is unavailable: say so,
   continue with Codex-native subagents, and note that per-agent tiering, schema
@@ -41,6 +44,9 @@ phase. Act on its result:
 - If it reports Codex not authenticated (`loggedIn: false`), tell the user to
   run `!codex login` before delegating; the runtime cannot start subagents
   otherwise.
+- If the selected model/effort is unsupported, choose from the reported
+  `supportedReasoningEfforts`; prefer `gpt-5.6-sol` with `medium` for bounded
+  analysis or `high` for correctness-sensitive work.
 - If any skill reports `stale` or `missing`, run
   `ultracode-for-codex skills --install` and tell the user the skill commands
   were refreshed; the next Codex session loads the updated contract, while the
@@ -111,8 +117,10 @@ For each phase that fans out subagents:
    pure-literal `meta`; `schema` on every machine-consumed `agent()` call;
    logical `key`s bound to the evidence snapshot for dynamic parallel agents,
    never reused within a run; no `Date` or `Math.random`; funnel-tier with
-   `effort` — sweeps and finder-style scans at `high`, verdicts and synthesis
-   at `xhigh`. For the natural-language `agent()` prompt body — outcome-first
+   `effort` — bounded planning/scans at `medium`, correctness-sensitive work at
+   `high`, and `xhigh`/`max` only when evidence shows the extra cost is needed.
+   Never use `ultra` inside a workflow agent. For the natural-language
+   `agent()` prompt body — outcome-first
    framing, grounding, and verification tuned for the current Codex model
    family — follow `references/codex-agent-prompting.md`: `schema` owns output
    shape and `effort` owns depth, so the prompt carries only intent and evidence
@@ -185,9 +193,9 @@ it produces evidence-bound, verified, provenance-carrying findings — that
 machinery is specific to review's contract, not the runtime's center of
 gravity. The general path is intentionally open-ended and planner-driven, not
 under-built. For a review, prefer that built-in: it collects bounded change
-evidence, selects dynamic lenses, runs parallel finders at the `high` sweep
-tier, verifies each candidate at `xhigh`, and synthesizes findings with
-provenance. It reviews pending working-tree changes: on a clean tree it fails
+evidence, selects dynamic lenses, and synthesizes findings with provenance.
+Use `{"level":"high"}` for the medium/high profile; omit it for the deeper
+high/xhigh profile. It reviews pending working-tree changes: on a clean tree it fails
 before spawning any agent with `no reviewable change evidence in the working
 tree`, so make or stage a change first.
 
@@ -197,9 +205,11 @@ phase off the back of a review — even when a fix looks obvious. Ask the user
 which findings, if any, to act on, and treat that as a separate implementation
 request with its own phase plan.
 
-For implementation, split by disjoint write ownership where possible. Tell
-subagents they are not alone in the codebase and must not revert unrelated or
-parallel edits.
+The built-in `task` is read-only analysis and implementation guidance. The
+main Codex context owns implementation and verification. A custom workflow may
+request `isolation: "worktree"` after permission review; preserved worktrees
+must be inspected and integrated explicitly because the runtime never
+auto-merges them.
 
 ## Output Contract
 

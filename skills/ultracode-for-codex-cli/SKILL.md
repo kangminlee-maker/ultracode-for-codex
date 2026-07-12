@@ -71,8 +71,9 @@ CLI behavior:
 - `status` and `jobs` report the workflow `runId` and `cwd` needed for resume
   once the child has emitted `workflow.started`;
 - script `agent()` calls accept per-agent `effort` and `model` options; the
-  built-in `code-review` runs finder-class agents at `high` and verdict-class
-  agents at `xhigh`;
+  run-level effort is inherited when omitted; `max` is accepted when the live
+  model catalog supports it, while `ultra` is rejected because native proactive
+  delegation is outside the CLI journal;
 - attached execution is available with `--execution attached` when the caller
   should stay connected until completion;
 - attached progress prints to stderr as JSONL by default;
@@ -102,6 +103,10 @@ CLI behavior:
   collects bounded review evidence, selects dynamic lenses, runs parallel finder
   agents, verifies each emitted candidate, optionally runs an `xhigh` sweep, and
   synthesizes final findings by verified candidate index;
+- built-in `task` is read-only analysis: its planner runs at `medium`, its
+  other agents inherit the run-level effort, and the main Codex context owns
+  edits; `code-review` level `high` uses medium/high while the default uses
+  high/xhigh;
 - built-in `code-review` requires pending working-tree change evidence: on a
   clean tree it fails before spawning any agent with `no reviewable change
   evidence in the working tree`, and its ref rejections name the allowed set,
@@ -125,6 +130,9 @@ CLI behavior:
 - Keep direct provider credentials out of Codex child process environments.
 - Codex subagents run against the requested workflow cwd and have bounded
   read-only workspace tools for text file reads and directory listings.
+- The runtime resolves the model and effort through Codex `model/list` before
+  the first turn, has no hard-coded model fallback, and caps Codex multi-agent
+  V2 at one total thread so a worker cannot create unjournaled descendants.
 - Built-in `task` injects deterministic workspace context into planner-selected
   phase-wise parallel subagents. Built-in `code-review` uses deterministic
   review evidence, allowed evidence refs, dynamic lenses, candidate verification,

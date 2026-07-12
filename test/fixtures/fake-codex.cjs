@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 const readline = require('node:readline');
 
+if (process.argv.includes('--version')) {
+  process.stdout.write('codex-cli 0.144.1-test\n');
+  process.exit(0);
+}
+
 assertNoDirectProviderEnv();
 
 let threadSeq = 0;
@@ -136,6 +141,19 @@ rl.on('line', (line) => {
     result(payload.id);
     return;
   }
+  if (payload.method === 'model/list') {
+    result(payload.id, fakeModelCatalog([
+      'gpt-test-model',
+      'configured-model',
+      'per-agent-model',
+      'gpt-5.6-sol',
+    ], 'gpt-test-model'));
+    return;
+  }
+  if (payload.method === 'account/read') {
+    result(payload.id, { account: { type: 'chatgpt' }, requiresOpenaiAuth: true });
+    return;
+  }
   if (payload.method === 'thread/start') {
     threadSeq += 1;
     lastThreadStartParams = payload.params ?? null;
@@ -218,6 +236,7 @@ function debugPayload() {
     ]),
     threadStart: pick(lastThreadStartParams, [
       'cwd',
+      'model',
       'runtimeWorkspaceRoots',
       'sandbox',
       'dynamicTools',
@@ -238,6 +257,24 @@ function debugPayload() {
       'outputSchema',
       'input',
     ]),
+  };
+}
+
+function fakeModelCatalog(models, defaultModel) {
+  const efforts = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+  return {
+    data: models.map((model) => ({
+      id: model,
+      model,
+      hidden: false,
+      isDefault: model === defaultModel,
+      defaultReasoningEffort: 'medium',
+      supportedReasoningEfforts: efforts.map((reasoningEffort) => ({
+        reasoningEffort,
+        description: reasoningEffort,
+      })),
+    })),
+    nextCursor: null,
   };
 }
 

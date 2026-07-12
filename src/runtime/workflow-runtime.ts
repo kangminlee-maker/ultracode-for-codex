@@ -374,6 +374,7 @@ interface WorkflowTaskRegistryOptions {
   readonly cwd?: string;
   readonly stateDir?: string;
   readonly requestTimeoutMs: number;
+  readonly defaultReasoningEffort?: ReasoningEffort;
   readonly agentStallTimeoutMs?: number;
   readonly agentStallRetryLimit?: number;
   // Emit a non-destructive workflow.heartbeat every heartbeatMs while running.
@@ -637,12 +638,12 @@ const DEFAULT_BUILTIN_WORKFLOWS: readonly BuiltinWorkflow[] = [
     name: 'task',
     script: phaseWiseBuiltinWorkflowScript({
       name: 'task',
-      description: 'Run an LLM-planned phase-wise parallel task workflow',
-      defaultPrompt: 'Complete the requested repository task.',
-      plannerKind: 'general task',
-      plannerGuidance: 'Plan phases that make the work faster and more accurate through parallel agents. Default to phase_parallel. Choose single only for tiny changes, strictly sequential investigations, or one indivisible failure mode. Pick workflow patterns that match the request instead of using one fixed shape.',
-      agentGuidance: 'Complete the assigned phase work. Prefer concrete evidence, file paths, commands, and risks over broad narration.',
-      finalGuidance: 'Return the completed task result, key evidence, decisions made, verification status, and residual risk.',
+      description: 'Run a read-only, evidence-bound planning and analysis workflow for a repository task',
+      defaultPrompt: 'Analyze the requested repository task and return evidence-bound implementation guidance.',
+      plannerKind: 'read-only repository analysis task',
+      plannerGuidance: 'Choose the smallest non-overlapping plan that covers the request. Default to phase_parallel only when agents can inspect distinct evidence or challenge distinct risks. Choose single for tiny, sequential, or indivisible work.',
+      agentGuidance: 'Produce the assigned analysis outcome, not a broad essay. Ground material claims in files actually read or the supplied workspace evidence, label inferences, re-check conclusions, and state missing evidence instead of guessing. The main orchestrator owns any edits.',
+      finalGuidance: 'Return implementation-ready guidance: observed evidence, reasoned conclusions, decisions, verification needed, and residual risk. Do not claim files were changed or checks were run unless an agent output proves it.',
     }),
   },
   {
@@ -684,6 +685,8 @@ const prompt = typeof workflowInput.prompt === "string" && workflowInput.prompt.
   ? workflowInput.prompt
   : "Review the current repository for correctness risks.";
 const level = workflowInput.level === "high" ? "high" : "xhigh";
+const scopeEffort = level === "high" ? "medium" : "xhigh";
+const verdictEffort = level === "high" ? "high" : "xhigh";
 const caps = level === "high"
   ? { maxFinders: 8, maxCandidatesPerLens: 6, sweep: false, reportCap: 10 }
   : { maxFinders: 10, maxCandidatesPerLens: 8, sweep: true, reportCap: 15 };
@@ -1005,6 +1008,7 @@ function reviewLensStage(lens) {
       label: verifierLabel(envelope),
       phase: "Verify",
       schema: verifierSchema,
+      effort: verdictEffort,
       key: verifierKey(envelope)
     }))).then((verifierResults) => {
       if (verifierResults.length !== envelopes.length) fail("verifier count mismatch for " + lens.lensKey);
@@ -1084,6 +1088,7 @@ function reviewSweepCandidates(lens, rawCandidates) {
     label: verifierLabel(envelope),
     phase: "Verify",
     schema: verifierSchema,
+    effort: verdictEffort,
     key: verifierKey(envelope)
   }))).then((verifierResults) => {
     if (verifierResults.length !== envelopes.length) fail("sweep verifier count mismatch");
@@ -1265,6 +1270,7 @@ const scope = await agent([
   label: "code-review-scope",
   phase: "Scope",
   schema: scopeSchema,
+  effort: scopeEffort,
   key: "code-review/scope/" + sourceSnapshotHashKey
 });
 const activeLenses = validateScope(scope);
@@ -1375,6 +1381,7 @@ if (nonRefuted.length > 0) {
     label: "code-review-synthesis",
     phase: "Synthesize",
     schema: synthesisSchema,
+    effort: verdictEffort,
     key: "code-review/synthesis/" + sourceSnapshotHashKey + "/" + scopeDigest.slice(7, 23) + "/" + hash(nonRefuted).slice(7, 23)
   });
   synthesis = normalizeSynthesis(rawSynthesis, nonRefuted);
@@ -1457,10 +1464,11 @@ const plan = await agent([
   ${JSON.stringify(`Plan the phase-wise execution strategy for ${input.plannerKind}.`)},
   "",
   ${JSON.stringify(input.plannerGuidance)},
+  "Each agent needs one bounded outcome, a distinct evidence focus, and a stop condition. Do not duplicate the same repository scan across agents.",
   "",
   ${JSON.stringify(DYNAMIC_WORKFLOW_PATTERN_GUIDANCE)},
   "A phase runs after previous phase summaries are available. Within each phase, use parallel agents by default.",
-  "Return 1 to 4 phases. For ordinary work, prefer 2 phases with 2 to 4 parallel agents each. Use concise stable ids.",
+  "Return 1 to 4 phases. Prefer the fewest phases and agents that cover the request; use concise stable ids.",
   "",
   "User request:",
   prompt,
@@ -1468,6 +1476,7 @@ const plan = await agent([
   context
 ].join("\\n"), {
   label: ${JSON.stringify(`${input.name}-planner`)},
+  effort: "medium",
   schema: {
     type: "object",
     additionalProperties: false,
@@ -1546,7 +1555,7 @@ if (plan.mode === "single") {
     "",
     ${JSON.stringify(input.agentGuidance)},
     "",
-    "Use the deterministic workspace context below as primary evidence. Mention any missing evidence explicitly.",
+    "Use the deterministic workspace context below as primary evidence. Label inferences, mention missing evidence, and re-check each material conclusion before finalizing.",
     "",
     context
   ].join("\\n"), { label: ${JSON.stringify(`${input.name}-single`)}, phase: singlePhase.title });
@@ -1573,7 +1582,7 @@ for (const rawPhasePlan of selectedPhases) {
         "",
         ${JSON.stringify(input.agentGuidance)},
         "",
-        "Use the deterministic workspace context below as primary evidence. Mention any missing evidence explicitly.",
+        "Use the deterministic workspace context below as primary evidence. Label inferences, mention missing evidence, and re-check each material conclusion before finalizing.",
         "",
         context
       ].join("\\n"), { label: ${JSON.stringify(`${input.name}-`)} + phasePlan.id + "-" + agents[0].id, phase: phasePlan.title })]
@@ -1591,7 +1600,7 @@ for (const rawPhasePlan of selectedPhases) {
         "",
         ${JSON.stringify(input.agentGuidance)},
         "",
-        "Use the deterministic workspace context below as primary evidence. Mention any missing evidence explicitly.",
+        "Use the deterministic workspace context below as primary evidence. Label inferences, mention missing evidence, and re-check each material conclusion before finalizing.",
         "",
         context
       ].join("\\n"), { label: ${JSON.stringify(`${input.name}-`)} + phasePlan.id + "-" + phaseAgent.id, phase: phasePlan.title })));
@@ -1606,7 +1615,7 @@ for (const rawPhasePlan of selectedPhases) {
     "Agent outputs:",
     JSON.stringify(agentOutputs, null, 2),
     "",
-    "Return a concise phase summary with material findings, completed work, open questions, and what the next phase should know."
+    "Synthesize only what the agent outputs support. Separate observations, inferences, and unknowns; preserve disagreement. Return material findings, open questions, and what the next phase should know."
   ].join("\\n"), { label: ${JSON.stringify(`${input.name}-phase-`)} + phasePlan.id + "-synthesis", phase: phasePlan.title });
   const phaseRecord = {
     id: phasePlan.id,
@@ -1630,7 +1639,8 @@ return await agent([
   "Phase outputs:",
   JSON.stringify(phaseOutputs, null, 2),
   "",
-  ${JSON.stringify(input.finalGuidance)}
+  ${JSON.stringify(input.finalGuidance)},
+  "Before finalizing, verify that every completion or verification claim is supported by a phase output; downgrade unsupported claims to recommendations or unknowns."
 ].join("\\n"), { label: ${JSON.stringify(`${input.name}-final-synthesis`)} });`;
 }
 
@@ -1670,6 +1680,13 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       isolationReview,
     );
     if (permissionRequired) return permissionRequired;
+    if (workflowReferencesAgentCapability(resolved.script)) {
+      // Prepare model capability truth only for workflows that can spend agent
+      // tokens. This keeps deterministic/no-agent workflows independent of
+      // Codex auth while ensuring the effective model is known before journal
+      // creation and cache identity assignment.
+      await this.options.backend.prepare?.();
+    }
     const resumeCache = resumePlan.sourceTask
       ? await this.createResumeCache(resumePlan.sourceTask)
       : undefined;
@@ -2820,7 +2837,9 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     const schema = normalizeStructuredOutputSchema(options?.schema);
     const isolation = normalizeAgentIsolation(options?.isolation);
     const logicalKey = normalizeAgentLogicalKey(options?.key);
-    const effort = normalizeAgentEffort(options?.effort) ?? 'xhigh';
+    const effort = normalizeAgentEffort(options?.effort)
+      ?? this.options.defaultReasoningEffort
+      ?? 'xhigh';
     const model = normalizeAgentModel(options?.model) ?? ctx.model;
     if (logicalKey) {
       // A repeated logical key would produce duplicate agent call keys, which
@@ -3512,7 +3531,7 @@ function normalizeAgentLogicalKey(value: unknown): string | undefined {
 function normalizeAgentEffort(value: unknown): ReasoningEffort | undefined {
   if (value === undefined) return undefined;
   if (!isReasoningEffort(value)) {
-    throw workflowInputError('agent effort must be one of none, minimal, low, medium, high, xhigh.');
+    throw workflowInputError('agent effort must be one of none, minimal, low, medium, high, xhigh, max.');
   }
   return value;
 }
@@ -6407,6 +6426,73 @@ function workflowAuthoringScan(script: string): {
     warnings.push('No agent() call site passes a logical { key }; dynamic parallel agents without keys lose resume cache hits after reorder.');
   }
   return { agentCallSites, schemaCallSites, keyedCallSites, warnings };
+}
+
+// Unlike workflowAuthoringScan (a warning heuristic), this scanner controls a
+// runtime gate. It therefore ignores comments and literal text and treats any
+// real `agent` identifier reference as use of the delegated-agent capability,
+// including aliases such as `const run = agent`.
+function workflowReferencesAgentCapability(script: string): boolean {
+  for (let index = 0; index < script.length; index += 1) {
+    const char = script[index] ?? '';
+    const next = script[index + 1] ?? '';
+    if (char === '/' && next === '/') {
+      index = skipLineComment(script, index + 2);
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      index = skipBlockComment(script, index + 2);
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      const literal = readStringLiteral(script, index, char);
+      if (literal) index = literal.end;
+      continue;
+    }
+    if (char === '`') {
+      const end = templateLiteralEndAndAgentReference(script, index);
+      if (end.referencesAgent) return true;
+      index = end.end;
+      continue;
+    }
+    if (
+      script.startsWith('agent', index)
+      && !isIdentifierChar(script[index - 1] ?? '')
+      && !isIdentifierChar(script[index + 'agent'.length] ?? '')
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function templateLiteralEndAndAgentReference(
+  script: string,
+  start: number,
+): { readonly end: number; readonly referencesAgent: boolean } {
+  let escaped = false;
+  for (let index = start + 1; index < script.length; index += 1) {
+    const char = script[index] ?? '';
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (char === '`') return { end: index, referencesAgent: false };
+    if (char === '$' && script[index + 1] === '{') {
+      const expressionStart = index + 2;
+      const expressionEnd = findMatchingExpressionBrace(script, expressionStart);
+      if (expressionEnd === -1) return { end: script.length - 1, referencesAgent: false };
+      if (workflowReferencesAgentCapability(script.slice(expressionStart, expressionEnd))) {
+        return { end: expressionEnd, referencesAgent: true };
+      }
+      index = expressionEnd;
+    }
+  }
+  return { end: script.length - 1, referencesAgent: false };
 }
 
 function workflowResumeSourceInfoFromJournal(

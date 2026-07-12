@@ -8,6 +8,31 @@ the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-07-12
+
+### Added
+
+- Live Codex `model/list` capability selection for setup and workflow runs,
+  including fail-before-turn validation and catalog-supported `max` effort.
+- A balanced `gpt-5.6-sol` path: task planning at `medium` with run-level
+  medium/high inheritance, plus a code-review `high` profile using
+  medium/high only.
+
+### Changed
+
+- Removed the hard-coded GPT-5.5 fallback. Explicit, inherited, and catalog
+  default models now resolve in that order and the effective model is journaled.
+- Capped native Codex multi-agent V2 at one total worker thread and kept
+  `ultra` outside the workflow effort enum, preventing unjournaled descendant
+  delegation.
+- On POSIX hosts, Codex app-server cleanup now terminates the backend-owned
+  process group, so shell-wrapped Codex binaries do not keep an attached CLI
+  alive after result delivery. Windows continues to terminate the direct child
+  process only.
+- Clarified that native Codex Ultra owns ad-hoc proactive delegation, while
+  Ultracode owns durable workflow guarantees; the built-in task is explicitly
+  read-only analysis and the main Codex context owns edits.
+
 ## [0.4.4] - 2026-07-07
 
 ### Added

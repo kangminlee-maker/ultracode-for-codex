@@ -1,4 +1,4 @@
 interface:
   display_name: "Ultracode for Codex"
-  short_description: "Run hybrid phase-wise parallel orchestration."
-  default_prompt: "Use the Codex main context as the Ultracode orchestrator, plan adaptive phases, delegate fan-out phases to the local CLI workflow runtime, synthesize results, and keep progress visible."
+  short_description: "Run durable, resumable Codex workflows."
+  default_prompt: "Use the Codex main context for decisions and edits, and use the Ultracode CLI runtime for schema-enforced, journaled, resumable fan-out phases with visible progress."

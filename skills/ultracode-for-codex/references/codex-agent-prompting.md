@@ -30,21 +30,32 @@ discipline** — not structure and not effort.
 
 ## Model Context
 
-Current Codex models are the **GPT-5.5 family** (`gpt-5.5`, `gpt-5.5-codex`);
-the runtime default is `gpt-5.5`. Newer previews may appear over time — pin a
-specific one with per-agent `model` only when a task needs it.
+The live Codex `model/list` response is the authority for model and effort
+support. The runtime selects an explicit run-level model, the inherited
+top-level Codex model, or the catalog default in that order, then validates
+each agent's model/effort before its first turn. Do not hard-code a fallback in
+workflow prompts.
 
-This family rewards **outcome-first** prompts, a shift from the XML-block-heavy
-"operator" style tuned for older models. Do not port an old prompt verbatim;
-start from the smallest prompt that preserves the task contract, then tighten.
+For `gpt-5.6-sol`, start with `medium` for bounded planning, classification,
+and mechanical evidence scans; use `high` for correctness-sensitive analysis,
+verification, and synthesis. Use `xhigh` or `max` only when a measured quality
+gap justifies the extra cost. `ultra` is deliberately unavailable to workflow
+agents because it activates Codex-native proactive delegation outside the
+Ultracode journal and cache.
+
+The current Codex family rewards **outcome-first** prompts rather than a large
+stack of procedural instructions. Start from the smallest prompt that
+preserves the task contract, then tighten success criteria, evidence rules,
+and the stop condition.
 
 - Describe the destination — what a good answer contains, which constraints
   matter, what evidence is available — not a step-by-step procedure, unless the
   exact path is itself the requirement.
 - Reserve `ALWAYS`/`NEVER`/`MUST` for true invariants; overusing them degrades
   instruction following.
-- Reasoning effort defaults to `medium` in this family. Treat `medium` as the
-  balanced starting point and raise it only after the prompt contract is tight.
+- The built-in `task` planner runs at `medium`; its other agents inherit the
+  run-level effort. This makes `--model gpt-5.6-sol --reasoning-effort medium`
+  an all-medium path and `--reasoning-effort high` a medium-plan/high-work path.
 
 ## The Outcome-First Prompt Shape
 
@@ -86,14 +97,17 @@ optional structure, not required ritual.
 
 Match `effort` to the job, funnel-style, rather than begging for depth in prose:
 
-- Wide sweeps, finders, and mechanical scans → `medium` (or `high` for
-  correctness-sensitive finders).
-- Verdicts, adversarial verification, and final synthesis → `high` or `xhigh`.
+- Bounded planning, classification, and mechanical scans → `medium`.
+- Correctness-sensitive finders, verdicts, adversarial verification, and final
+  synthesis → `high`.
+- First-of-kind or unusually high-blast-radius verdicts → `xhigh` or `max`
+  only after the medium/high prompt contract and evidence packet are sound.
 - Before raising effort to solve a weak result, first add success criteria, a
   verification step, and grounding rules — a tighter contract beats more tokens.
 
-Note: `effort` accepts `none|minimal|low|medium|high|xhigh`, but the current
-default model rejects `minimal`; an unsupported effort fails that agent loudly.
+Note: `effort` accepts `none|minimal|low|medium|high|xhigh|max`. Availability is
+model-specific and checked against the live catalog. `ultra` is rejected by the
+runtime rather than normalized or silently downgraded.
 
 ## Anti-Patterns
 
