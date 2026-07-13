@@ -38,6 +38,7 @@ const fakeCodexPath = join(consumerDir, 'fake-codex.cjs');
 // Keep turn records outside the consumer workspace so they never perturb
 // review evidence snapshots or resume cache identity.
 const fakeTurnsPath = `${consumerDir}-fake-codex-turns.jsonl`;
+const fakeRequestsPath = `${consumerDir}-fake-codex-requests.jsonl`;
 
 try {
   await writeFile(join(consumerDir, 'package.json'), JSON.stringify({
@@ -63,6 +64,7 @@ try {
   assertInstalledVersion(installedCli);
   await assertSkillCommandPackageContents(installedPackageDir);
   await assertSkillCommandInstall(installedPackageDir, installedCli);
+  await assertInstalledModelProfiles(installedCli);
   await assertNpmExecRun();
   await assertBackgroundDefault(installedCli);
   await assertCliSmoke(installedCli);
@@ -91,6 +93,7 @@ try {
     await rm(externalWorktreeStore, { recursive: true, force: true });
     await rm(ultracodeHome, { recursive: true, force: true });
     await rm(fakeTurnsPath, { force: true });
+    await rm(fakeRequestsPath, { force: true });
   }
 }
 
@@ -147,6 +150,77 @@ function assertInstalledVersion(installedCli) {
   assert.equal(result.stderr, '');
 }
 
+async function assertInstalledModelProfiles(installedCli) {
+  for (const profile of [
+    { model: 'gpt-5.6-sol', effort: 'medium' },
+    { model: 'gpt-5.6-sol', effort: 'high' },
+    { model: 'gpt-5.6-terra', effort: 'high' },
+  ]) {
+    const setup = runCliCommand(installedCli, 'setup', [
+      '--command',
+      fakeCodexPath,
+      '--cwd',
+      consumerDir,
+      '--model',
+      profile.model,
+      '--reasoning-effort',
+      profile.effort,
+    ]);
+    assert.equal(setup.status, 0, setup.stderr);
+    const report = JSON.parse(setup.stdout);
+    assert.equal(report.kind, 'ultracode.setup');
+    assert.equal(report.version, 2);
+    assert.equal(report.ready, true, report.detail);
+    assert.equal(report.model.selected, profile.model);
+    assert.equal(report.model.reasoningEffort, profile.effort);
+    assert.equal(report.model.reasoningEffortSupported, true);
+
+    const before = await requestRecords();
+    const runResult = runCliAttached(installedCli, [
+      '--script',
+      'export const meta = { name: "installed-model-profile" }; return await agent("Return OK for the selected installed profile.", { label: "profile-agent" });',
+      '--permission',
+      'allow',
+      '--model',
+      profile.model,
+      '--reasoning-effort',
+      profile.effort,
+    ]);
+    assert.equal(runResult.status, 0, runResult.stderr);
+    assert.equal(JSON.parse(runResult.stdout), profile.effort === 'medium' ? 'MEDIUM_OK' : 'OK');
+    const calls = (await requestRecords()).slice(before.length);
+    assert.ok(calls.some((call) => call.method === 'thread/start' && call.model === profile.model), JSON.stringify(calls));
+    assert.ok(calls.some((call) => call.method === 'turn/start' && call.model === profile.model && call.effort === profile.effort), JSON.stringify(calls));
+  }
+
+  const before = await requestRecords();
+  const unsupported = runCliAttached(installedCli, [
+    '--script',
+    'export const meta = { name: "installed-unsupported-profile" }; return await agent("This turn must never start.");',
+    '--permission',
+    'allow',
+    '--model',
+    'gpt-e2e-restricted',
+    '--reasoning-effort',
+    'medium',
+  ]);
+  assert.notEqual(unsupported.status, 0);
+  assert.match(`${unsupported.stdout}\n${unsupported.stderr}`, /does not support reasoning effort "medium"/);
+  const calls = (await requestRecords()).slice(before.length);
+  assert.ok(calls.some((call) => call.method === 'model/list'), JSON.stringify(calls));
+  assert.ok(!calls.some((call) => call.method === 'thread/start' || call.method === 'turn/start'), JSON.stringify(calls));
+}
+
+async function requestRecords() {
+  try {
+    const text = await readFile(fakeRequestsPath, 'utf8');
+    return text.trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
 async function assertSkillCommandPackageContents(installedPackageDir) {
   const nativeSkill = await readFile(join(installedPackageDir, 'skills', 'ultracode-for-codex', 'SKILL.md'), 'utf8');
   const nativeAgent = await readFile(join(installedPackageDir, 'skills', 'ultracode-for-codex', 'agents', 'openai.yaml'), 'utf8');
@@ -161,7 +235,8 @@ async function assertSkillCommandPackageContents(installedPackageDir) {
   assert.match(nativeSkill, /Situation Choice Matrix/);
   assert.match(nativeSkill, /cumulative ledger/);
   assert.match(nativeSkill, /references\/progress-visuals\.md/);
-  assert.match(nativeAgent, /Run hybrid phase-wise parallel orchestration/);
+  assert.match(nativeAgent, /Run durable, resumable Codex workflows/);
+  assert.match(nativeAgent, /main context for decisions and edits/);
   assert.match(nativeProgressVisuals, /Cumulative Ledger Rule/);
   assert.match(nativeProgressVisuals, /Situation Choice Matrix/);
   assert.match(nativeProgressVisuals, /Each row has at most three user-facing/);
@@ -1004,6 +1079,7 @@ function cliEnv() {
     CODEX_HOME: codexHome,
     FAKE_ASSERT_NO_DIRECT_PROVIDER_ENV: '1',
     FAKE_EXPECT_CLIENT_VERSION: pkg.version,
+    FAKE_REQUESTS_PATH: fakeRequestsPath,
     FAKE_TURNS_PATH: fakeTurnsPath,
     OPENAI_API_KEY: 'fake-openai-key',
     OPENAI_BASE_URL: 'https://example.invalid/openai',
@@ -1144,6 +1220,11 @@ async function findFiles(root, fileName) {
 function fakeCodexSource() {
   return String.raw`#!/usr/bin/env node
 const readline = require('node:readline');
+
+if (process.argv.includes('--version')) {
+  process.stdout.write('codex-cli 0.144.1-e2e\n');
+  process.exit(0);
+}
 
 assertNoDirectProviderEnv();
 
@@ -1387,12 +1468,61 @@ rl.on('line', (line) => {
   }
 
   if (payload.id === undefined) return;
+  if (process.env.FAKE_REQUESTS_PATH) {
+    require('node:fs').appendFileSync(process.env.FAKE_REQUESTS_PATH, JSON.stringify({
+      method: payload.method || null,
+      model: payload.params && payload.params.model || null,
+      effort: payload.params && payload.params.effort || null,
+    }) + '\n');
+  }
   if (payload.method === 'initialize') {
     if (process.env.FAKE_EXPECT_CLIENT_VERSION && payload.params?.clientInfo?.version !== process.env.FAKE_EXPECT_CLIENT_VERSION) {
       process.stderr.write('unexpected clientInfo.version: ' + payload.params?.clientInfo?.version + '\n');
       process.exit(92);
     }
     result(payload.id);
+    return;
+  }
+  if (payload.method === 'model/list') {
+    result(payload.id, {
+      data: [
+        {
+          id: 'gpt-e2e-model',
+          model: 'gpt-e2e-model',
+          hidden: false,
+          isDefault: true,
+          defaultReasoningEffort: 'medium',
+          supportedReasoningEfforts: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map((reasoningEffort) => ({
+            reasoningEffort,
+            description: reasoningEffort,
+          })),
+        },
+        ...['gpt-5.6-sol', 'gpt-5.6-terra'].map((model) => ({
+          id: model,
+          model,
+          hidden: false,
+          isDefault: false,
+          defaultReasoningEffort: 'medium',
+          supportedReasoningEfforts: ['medium', 'high', 'xhigh', 'max'].map((reasoningEffort) => ({
+            reasoningEffort,
+            description: reasoningEffort,
+          })),
+        })),
+        {
+          id: 'gpt-e2e-restricted',
+          model: 'gpt-e2e-restricted',
+          hidden: false,
+          isDefault: false,
+          defaultReasoningEffort: 'high',
+          supportedReasoningEfforts: [{ reasoningEffort: 'high', description: 'high' }],
+        },
+      ],
+      nextCursor: null,
+    });
+    return;
+  }
+  if (payload.method === 'account/read') {
+    result(payload.id, { account: { type: 'chatgpt' }, requiresOpenaiAuth: true });
     return;
   }
   if (payload.method === 'thread/start') {

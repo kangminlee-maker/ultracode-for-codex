@@ -41,6 +41,8 @@ test('Codex isolation copies auth and writes deterministic workflow-only config'
   assert.match(config, /model_reasoning_effort = "xhigh"/);
   assert.match(config, /sandbox_mode = "read-only"/);
   assert.match(config, /image_generation = false/);
+  assert.match(config, /\[features\.multi_agent_v2\]\nmax_concurrent_threads_per_session = 1/);
+  assert.match(config, /Native subagent delegation is unavailable/);
   assert.match(config, /\[shell_environment_policy\]\ninherit = "none"/);
 });
 
@@ -56,6 +58,8 @@ test('Codex app-server args pin runtime-owned config overrides', () => {
   assert.match(args, /model_verbosity="low"/);
   assert.match(args, /shell_environment_policy\.inherit="none"/);
   assert.match(args, /features\.image_generation=false/);
+  assert.match(args, /features\.multi_agent_v2\.max_concurrent_threads_per_session=1/);
+  assert.match(args, /features\.multi_agent_v2\.multi_agent_mode_hint_text=/);
 });
 
 test('minimal Codex config is workflow-only and side-effect constrained', () => {
@@ -71,4 +75,5 @@ test('minimal Codex config is workflow-only and side-effect constrained', () => 
   assert.match(toml, /approval_policy = "never"/);
   assert.match(toml, /sandbox_mode = "read-only"/);
   assert.match(toml, /image_generation = false/);
+  assert.match(toml, /max_concurrent_threads_per_session = 1/);
 });

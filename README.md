@@ -1,7 +1,12 @@
 # Ultracode for Codex
 
-Dynamic workflows redesigned for Codex, with parallel subagents, visible
-progress, and a local CLI runtime for durable, resumable execution.
+Durable, schema-enforced, resumable multi-agent workflows for Codex.
+
+Codex Ultra already provides native proactive delegation for ordinary ad-hoc
+parallel work. Ultracode adds the workflow guarantees that native delegation
+does not make canonical: deterministic scripts, per-agent schemas and tiers,
+hash-chained journals, completed-step reuse, background job control, and
+permission-reviewed worktree isolation.
 
 The default experience is hybrid: you ask for `$ultracode-for-codex`, and the
 main Codex chat becomes the orchestrator. It plans the next useful phase,
@@ -17,8 +22,9 @@ CLI, the skill falls back to Codex-native subagents.
 
 ## Why Use It
 
-- Get multi-angle reviews instead of a single linear pass.
-- Run implementation and verification work phase by phase.
+- Make repeated or long-running multi-agent work auditable and recoverable.
+- Plan and verify implementation work phase by phase while the main Codex
+  context owns edits.
 - See what agents are doing, what finished, and what still needs attention.
 - Keep long CLI workflows running in the OS background when desired.
 - Recover interrupted work: a crashed, killed, or cancelled run resumes with
@@ -97,7 +103,10 @@ immediately.
 
 ## Use In Codex
 
-Use the default skill for normal work:
+Use native Codex Ultra for ordinary one-off work where model-directed
+delegation is enough. Use the default Ultracode skill when the work benefits
+from durable phase records, schema enforcement, background execution, or
+resume/cache guarantees:
 
 ```text
 $ultracode-for-codex Investigate why the checkout flow drops sessions and propose a fix.
@@ -134,12 +143,14 @@ Next: synthesize material findings
 Use `$ultracode-for-codex-cli` or the `ultracode-for-codex` binary when you
 explicitly want a local command-owned workflow run.
 
-Run a built-in task workflow:
+Run the read-only built-in task analysis workflow with the Sol balanced tier:
 
 ```bash
 npm exec -- ultracode-for-codex run \
   --accept-llm-guide=v1 \
   --cwd /path/to/project \
+  --model gpt-5.6-sol \
+  --reasoning-effort high \
   --name task \
   --args '{"prompt":"review correctness risks and propose fixes"}'
 ```
@@ -150,16 +161,24 @@ Run a code review:
 npm exec -- ultracode-for-codex run \
   --accept-llm-guide=v1 \
   --cwd /path/to/project \
+  --model gpt-5.6-sol \
+  --reasoning-effort high \
   --name code-review \
-  --args '{"prompt":"review the current change"}'
+  --args '{"prompt":"review the current change","level":"high"}'
 ```
 
 The built-in `code-review` workflow collects bounded repository evidence,
 chooses review lenses, runs finder agents in parallel, verifies each candidate,
 and returns JSON with `findings`, `provenance`, `synthesis`, and `stats`.
-Finder-class agents run at the `high` effort tier while verification and
-synthesis stay at `xhigh`. Use `{"level":"high"}` to skip the final sweep, or
-omit it for the default `xhigh` review.
+Use `{"level":"high"}` for the Sol medium/high profile: scope runs at
+`medium`, while finders, verification, and synthesis run at `high`, and the
+final sweep is skipped. Omit it for the deeper default review, where finders
+run at `high` and scope/verdict/synthesis run at `xhigh`.
+
+The built-in `task` delegates read-only analysis. Its planner runs at `medium`;
+other agents inherit `--reasoning-effort`. The main Codex context applies any
+resulting changes. Custom scripts can opt into `isolation: "worktree"`, and the
+runtime preserves those worktrees for explicit review rather than auto-merging.
 
 CLI runs use OS background execution by default. The command prints a launch
 record with a `jobId`, then you can inspect or control the job:

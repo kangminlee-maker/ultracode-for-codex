@@ -64,6 +64,8 @@ test('settings.json provides Codex workflow runtime defaults', () => {
 
 test('settings validators accept only supported Codex model controls', () => {
   assert.equal(isReasoningEffort('medium'), true);
+  assert.equal(isReasoningEffort('max'), true);
+  assert.equal(isReasoningEffort('ultra'), false);
   assert.equal(isReasoningEffort('tiny'), false);
   assert.equal(isVerbosity('medium'), true);
   assert.equal(isVerbosity('tiny'), false);

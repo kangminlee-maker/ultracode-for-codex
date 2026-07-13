@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { copyFile, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import readline from 'node:readline';
 import {
@@ -20,6 +20,14 @@ import type {
 import { SUBAGENT_MODEL_PLACEHOLDER, estimateTokens } from '../runtime/types.js';
 import { ultracodePackageVersion } from '../runtime/package-info.js';
 import { codexChildProcessEnv } from './env.js';
+import {
+  assertCodexModelSupportsEffort,
+  codexSourceHome,
+  parseCodexModelCatalogPage,
+  readConfiguredCodexModel,
+  selectCodexModelCapability,
+  type CodexModelCapability,
+} from './model-catalog.js';
 
 interface CodexSubagentBackendOptions {
   readonly command?: string;
@@ -84,10 +92,12 @@ export interface CodexIsolation {
 const USAGE_NOTIFICATION_GRACE_MS = 100;
 const BUFFERED_TURN_STATE_TTL_MS = 30_000;
 const DEFAULT_CODEX_RPC_TIMEOUT_MS = 30_000;
-const FALLBACK_CODEX_MODEL = 'gpt-5.5';
 const WORKSPACE_DYNAMIC_TOOL_NAMESPACE = 'workspace';
 const MAX_WORKSPACE_TOOL_READ_BYTES = 200_000;
 const MAX_WORKSPACE_TOOL_DIRECTORY_ENTRIES = 200;
+const CODEX_MODEL_CATALOG_PAGE_LIMIT = 100;
+const CODEX_MODEL_CATALOG_MAX_PAGES = 20;
+const NATIVE_MULTI_AGENT_MODE_HINT = 'Native subagent delegation is unavailable inside this Ultracode workflow worker. Complete only the assigned bounded unit; the Ultracode runtime owns fan-out, journaling, retries, and synthesis.';
 const DISABLED_CODEX_CONTEXT_FEATURES = [
   'apps',
   'browser_use',
@@ -143,7 +153,6 @@ const WORKSPACE_DYNAMIC_TOOLS = [
 
 export class CodexSubagentBackend implements SubagentBackend {
   readonly name = 'codex-subagent';
-  readonly model: string;
 
   private readonly command: string;
   private readonly cwd: string;
@@ -162,11 +171,16 @@ export class CodexSubagentBackend implements SubagentBackend {
   private readonly bufferedTurnStates = new Map<string, BufferedTurnState>();
   private readonly threadReadRoots = new Map<string, string>();
   private isolation: CodexIsolation | null = null;
+  private resolvedModel?: string;
+  private modelCatalog: readonly CodexModelCapability[] = [];
+
+  get model(): string {
+    return this.resolvedModel ?? this.configuredModel ?? SUBAGENT_MODEL_PLACEHOLDER;
+  }
 
   constructor(options: CodexSubagentBackendOptions) {
     this.command = options.command ?? 'codex';
     this.cwd = options.cwd;
-    this.model = options.model ?? SUBAGENT_MODEL_PLACEHOLDER;
     this.configuredModel = options.model;
     this.timeoutMs = normalizeOptionalTimeoutMs(options.timeoutMs);
     this.rpcTimeoutMs = this.timeoutMs > 0 ? this.timeoutMs : DEFAULT_CODEX_RPC_TIMEOUT_MS;
@@ -178,8 +192,13 @@ export class CodexSubagentBackend implements SubagentBackend {
     const startedAt = Date.now();
     await this.ensureStarted();
     const reasoningEffort = request.reasoningEffort ?? this.reasoningEffort;
+    const requestedModel = request.model && request.model !== SUBAGENT_MODEL_PLACEHOLDER
+      ? request.model
+      : this.model;
+    const capability = selectCodexModelCapability(this.modelCatalog, requestedModel);
+    assertCodexModelSupportsEffort(capability, reasoningEffort);
     const structuredTool = structuredOutputToolFor(request);
-    const prompt = workflowAgentPrompt(request, structuredTool);
+    const prompt = workflowAgentPrompt(request);
     let threadId: string | null = null;
     let turnId: string | null = null;
     const interruptTurn = async (): Promise<void> => {
@@ -193,14 +212,14 @@ export class CodexSubagentBackend implements SubagentBackend {
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
     try {
       const cwd = request.worktreePath ?? this.cwd;
-      threadId = await this.startThread(reasoningEffort, this.verbosity, Boolean(structuredTool), cwd, Boolean(request.worktreePath));
+      threadId = await this.startThread(capability.model, reasoningEffort, this.verbosity, Boolean(structuredTool), cwd, Boolean(request.worktreePath));
       const turn = await this.send('turn/start', {
         threadId,
         cwd,
         runtimeWorkspaceRoots: [cwd],
         environments: [],
         input: [{ type: 'text', text: prompt, text_elements: [] }],
-        model: this.modelOverrideFor(request.model),
+        model: capability.model,
         effort: reasoningEffort,
         summary: 'none',
         personality: 'none',
@@ -213,7 +232,7 @@ export class CodexSubagentBackend implements SubagentBackend {
       const usage = result.usage ?? estimatedUsage(prompt, text);
       return {
         id: `subagent_${randomUUID()}`,
-        model: request.model,
+        model: capability.model,
         text: structuredTool ? '' : text,
         toolCalls: structuredTool ? [{
           id: `call_${randomUUID()}`,
@@ -236,6 +255,7 @@ export class CodexSubagentBackend implements SubagentBackend {
   }
 
   async close(): Promise<void> {
+    const child = this.child;
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error('codex subagent backend closed'));
@@ -248,11 +268,22 @@ export class CodexSubagentBackend implements SubagentBackend {
     this.clearBufferedTurnStates();
     this.threadReadRoots.clear();
     this.lineReader?.close();
-    this.child?.kill('SIGTERM');
+    if (child) {
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      terminateOwnedCodexProcess(child);
+    }
     this.child = null;
     this.lineReader = null;
     this.initialized = null;
+    this.resolvedModel = undefined;
+    this.modelCatalog = [];
     await this.cleanupIsolation();
+  }
+
+  async prepare(): Promise<void> {
+    await this.ensureStarted();
   }
 
   private async ensureStarted(): Promise<void> {
@@ -271,7 +302,7 @@ export class CodexSubagentBackend implements SubagentBackend {
     const appServerArgs = [
       'app-server',
       ...codexContextIsolationArgs({
-        model: this.configuredModel ?? isolation.defaultModel ?? FALLBACK_CODEX_MODEL,
+        model: this.configuredModel ?? isolation.defaultModel,
         reasoningEffort: this.reasoningEffort,
         verbosity: this.verbosity,
       }),
@@ -281,6 +312,7 @@ export class CodexSubagentBackend implements SubagentBackend {
     this.child = spawn(this.command, appServerArgs, {
       cwd: isolation.workDir,
       shell: false,
+      detached: process.platform !== 'win32',
       env: codexChildProcessEnv({ CODEX_HOME: isolation.homeDir }),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -314,9 +346,17 @@ export class CodexSubagentBackend implements SubagentBackend {
       },
     });
     this.notify('initialized', {});
+    this.modelCatalog = await this.readModelCatalog();
+    const selected = selectCodexModelCapability(
+      this.modelCatalog,
+      this.configuredModel ?? isolation.defaultModel,
+    );
+    assertCodexModelSupportsEffort(selected, this.reasoningEffort);
+    this.resolvedModel = selected.model;
   }
 
   private async startThread(
+    model: string,
     reasoningEffort: ReasoningEffort,
     verbosity: Verbosity,
     structured: boolean,
@@ -325,6 +365,7 @@ export class CodexSubagentBackend implements SubagentBackend {
   ): Promise<string> {
     const thread = await this.send('thread/start', {
       cwd,
+      model,
       runtimeWorkspaceRoots: [cwd],
       approvalPolicy: 'never',
       sandbox: workspaceWrite ? 'workspace-write' : 'read-only',
@@ -349,6 +390,28 @@ export class CodexSubagentBackend implements SubagentBackend {
     if (!threadId) throw new Error('codex app-server did not return a thread id');
     this.threadReadRoots.set(threadId, await realpath(cwd).catch(() => resolve(cwd)));
     return threadId;
+  }
+
+  private async readModelCatalog(): Promise<readonly CodexModelCapability[]> {
+    const catalog: CodexModelCapability[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | null = null;
+    for (let pageIndex = 0; pageIndex < CODEX_MODEL_CATALOG_MAX_PAGES; pageIndex += 1) {
+      const response = await this.send('model/list', {
+        cursor,
+        limit: CODEX_MODEL_CATALOG_PAGE_LIMIT,
+        includeHidden: true,
+      });
+      const page = parseCodexModelCatalogPage(asRecord(response)?.result);
+      catalog.push(...page.models);
+      if (!page.nextCursor) return catalog;
+      if (seenCursors.has(page.nextCursor)) {
+        throw new Error('Codex model/list returned a repeated pagination cursor.');
+      }
+      seenCursors.add(page.nextCursor);
+      cursor = page.nextCursor;
+    }
+    throw new Error(`Codex model/list exceeded ${CODEX_MODEL_CATALOG_MAX_PAGES} pages.`);
   }
 
   private archiveThread(threadId: string): void {
@@ -683,13 +746,6 @@ export class CodexSubagentBackend implements SubagentBackend {
     this.clearBufferedTurnStates();
   }
 
-  private modelOverrideFor(requestModel: string): string | undefined {
-    if (requestModel && requestModel !== this.model && requestModel !== SUBAGENT_MODEL_PLACEHOLDER) {
-      return requestModel;
-    }
-    return this.configuredModel;
-  }
-
   private bufferTurnState(key: string, apply: (state: BufferedTurnState) => void): void {
     const state = this.bufferedTurnStates.get(key) ?? {
       textDeltas: [],
@@ -727,14 +783,8 @@ function structuredOutputToolFor(request: SubagentRequest): SubagentTool | null 
   return request.tools.length === 1 ? request.tools[0] ?? null : null;
 }
 
-function workflowAgentPrompt(request: SubagentRequest, structuredTool: SubagentTool | null): string {
-  const prompt = request.messages.map((message) => message.content).join('\n\n').trim();
-  if (!structuredTool) return prompt;
-  return [
-    prompt,
-    '',
-    'Return only the JSON value for StructuredOutput. No Markdown, code fence, or prose.',
-  ].join('\n');
+function workflowAgentPrompt(request: SubagentRequest): string {
+  return request.messages.map((message) => message.content).join('\n\n').trim();
 }
 
 function estimatedUsage(prompt: string, text: string): SubagentUsage {
@@ -843,13 +893,12 @@ export function usageFromCodexTokenUsage(value: unknown): SubagentUsage | null {
 }
 
 export function codexContextIsolationArgs(options: {
-  readonly model: string;
+  readonly model?: string;
   readonly reasoningEffort: ReasoningEffort;
   readonly verbosity: Verbosity;
 }): string[] {
   return [
-    '-c',
-    `model=${tomlString(options.model)}`,
+    ...(options.model ? ['-c', `model=${tomlString(options.model)}`] : []),
     '-c',
     `model_reasoning_effort=${tomlString(options.reasoningEffort)}`,
     '-c',
@@ -868,6 +917,10 @@ export function codexContextIsolationArgs(options: {
       '-c',
       `features.${feature}=false`,
     ]),
+    '-c',
+    'features.multi_agent_v2.max_concurrent_threads_per_session=1',
+    '-c',
+    `features.multi_agent_v2.multi_agent_mode_hint_text=${tomlString(NATIVE_MULTI_AGENT_MODE_HINT)}`,
     '-c',
     'notify=[]',
     '-c',
@@ -888,13 +941,13 @@ export async function createCodexIsolation(options: {
     mkdir(workDir, { recursive: true }),
   ]);
 
-  const sourceHome = sourceCodexHome();
-  const defaultModel = options.configuredModel ?? await readTopLevelStringConfig(sourceHome, 'model');
+  const sourceHome = codexSourceHome();
+  const defaultModel = options.configuredModel ?? await readConfiguredCodexModel(sourceHome);
   await copyCodexAuth(sourceHome, homeDir);
   await writeFile(
     join(homeDir, 'config.toml'),
     minimalCodexConfigToml({
-      model: defaultModel ?? FALLBACK_CODEX_MODEL,
+      model: defaultModel,
       reasoningEffort: options.reasoningEffort,
       verbosity: options.verbosity,
     }),
@@ -917,12 +970,12 @@ function withCodexThreadContext(error: unknown, threadId: string | null): Error 
 }
 
 export function minimalCodexConfigToml(options: {
-  readonly model: string;
+  readonly model?: string;
   readonly reasoningEffort: ReasoningEffort;
   readonly verbosity: Verbosity;
 }): string {
   return [
-    `model = ${tomlString(options.model)}`,
+    ...(options.model ? [`model = ${tomlString(options.model)}`] : []),
     `model_reasoning_effort = ${tomlString(options.reasoningEffort)}`,
     'model_reasoning_summary = "none"',
     `model_verbosity = ${tomlString(options.verbosity)}`,
@@ -936,16 +989,14 @@ export function minimalCodexConfigToml(options: {
     '[features]',
     ...DISABLED_CODEX_CONTEXT_FEATURES.map((feature) => `${feature} = false`),
     '',
+    '[features.multi_agent_v2]',
+    'max_concurrent_threads_per_session = 1',
+    `multi_agent_mode_hint_text = ${tomlString(NATIVE_MULTI_AGENT_MODE_HINT)}`,
+    '',
     '[shell_environment_policy]',
     'inherit = "none"',
     '',
   ].join('\n');
-}
-
-function sourceCodexHome(): string {
-  return process.env.CODEX_HOME && process.env.CODEX_HOME.trim()
-    ? process.env.CODEX_HOME
-    : join(homedir(), '.codex');
 }
 
 async function copyCodexAuth(sourceHome: string, targetHome: string): Promise<void> {
@@ -956,24 +1007,24 @@ async function copyCodexAuth(sourceHome: string, targetHome: string): Promise<vo
   }
 }
 
-async function readTopLevelStringConfig(sourceHome: string, key: string): Promise<string | undefined> {
-  let text: string;
-  try {
-    text = await readFile(join(sourceHome, 'config.toml'), 'utf8');
-  } catch {
-    return undefined;
-  }
-  const match = new RegExp(`^${escapeRegExp(key)}\\s*=\\s*"([^"\\\\]*(?:\\\\.[^"\\\\]*)*)"\\s*$`, 'm').exec(text);
-  if (!match?.[1]) return undefined;
-  return match[1].replace(/\\(["\\])/g, '$1');
-}
-
 function tomlString(value: string): string {
   return JSON.stringify(value);
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function terminateOwnedCodexProcess(child: ChildProcessWithoutNullStreams): void {
+  if (process.platform !== 'win32' && child.pid) {
+    try {
+      process.kill(-child.pid, 'SIGTERM');
+      return;
+    } catch {
+      // Fall through when the child exited between the state check and kill.
+    }
+  }
+  try {
+    child.kill('SIGTERM');
+  } catch {
+    // The owned child is already gone.
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

@@ -117,18 +117,20 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   const resumeModel = input.resumeFromRunId && !options.model
     ? await resolveResumeBackendModel(cwd, input.resumeFromRunId)
     : undefined;
+  const reasoningEffort = parseReasoningEffort(options.reasoningEffort);
   const backend = new CodexSubagentBackend({
     command: options.command,
     cwd,
     model: options.model ?? resumeModel,
     timeoutMs,
-    reasoningEffort: parseReasoningEffort(options.reasoningEffort),
+    reasoningEffort,
     verbosity: parseVerbosity(options.verbosity),
   });
   const runtime = new WorkflowTaskRegistry({
     backend,
     cwd,
     requestTimeoutMs: timeoutMs,
+    defaultReasoningEffort: reasoningEffort,
     heartbeatMs,
   });
 
@@ -1231,7 +1233,12 @@ async function runCodexSetup(args: readonly string[]): Promise<number> {
   const options = parseOptions(args);
   if (options._.length > 0) throw new Error('setup does not accept positional arguments.');
   const cwd = typeof options.cwd === 'string' && options.cwd ? options.cwd : process.cwd();
-  const probe = await probeCodexSetup({ command: options.command, cwd });
+  const probe = await probeCodexSetup({
+    command: options.command,
+    cwd,
+    model: options.model,
+    reasoningEffort: parseReasoningEffort(options.reasoningEffort),
+  });
   const skills = await collectCodexSkillStates();
   const skillsReady = skills.every((skill) => skill.state === 'current');
   const ready = probe.ready && skillsReady;
@@ -1242,7 +1249,10 @@ async function runCodexSetup(args: readonly string[]): Promise<number> {
       : `[setup] codex missing  ${probe.detail}\n`);
     if (probe.codexInstalled) {
       process.stdout.write(`[setup] app-server ${probe.appServerReachable ? 'reachable' : 'unreachable'}\n`);
-      process.stdout.write(`[setup] auth ${probe.detail}\n`);
+      process.stdout.write(`[setup] detail ${probe.detail}\n`);
+      process.stdout.write(probe.selectedModel
+        ? `[setup] model ${probe.selectedModel}  effort=${probe.reasoningEffort}  supported=${probe.supportedReasoningEfforts.join(',')}\n`
+        : `[setup] model unavailable  effort=${probe.reasoningEffort}\n`);
     }
     for (const skill of skills) process.stdout.write(`[setup] skill ${skill.name} ${skill.state}\n`);
     if (!skillsReady) {
@@ -1252,7 +1262,7 @@ async function runCodexSetup(args: readonly string[]): Promise<number> {
   } else {
     process.stdout.write(`${JSON.stringify({
       kind: 'ultracode.setup',
-      version: 1,
+      version: 2,
       ready,
       packageVersion: probe.packageVersion,
       nodeVersion: probe.nodeVersion,
@@ -1268,6 +1278,13 @@ async function runCodexSetup(args: readonly string[]): Promise<number> {
         method: probe.authMethod,
         account: probe.account,
         requiresOpenaiAuth: probe.requiresOpenaiAuth,
+      },
+      model: {
+        catalogChecked: probe.modelCatalogChecked,
+        selected: probe.selectedModel,
+        reasoningEffort: probe.reasoningEffort,
+        reasoningEffortSupported: probe.reasoningEffortSupported,
+        supportedReasoningEfforts: probe.supportedReasoningEfforts,
       },
       detail: probe.detail,
       codexSkillsRoot: codexSkillsRoot(),
@@ -2010,7 +2027,7 @@ function parseExecutionMode(value: string | undefined): ExecutionMode {
 function parseReasoningEffort(value: string | undefined): ReasoningEffort {
   if (value === undefined) return codexDefaultReasoningEffort();
   if (isReasoningEffort(value)) return value;
-  throw new Error('reasoning effort must be one of none, minimal, low, medium, high, or xhigh.');
+  throw new Error('reasoning effort must be one of none, minimal, low, medium, high, xhigh, or max. Ultra is reserved for native Codex delegation.');
 }
 
 function parseVerbosity(value: string | undefined): Verbosity {
@@ -2039,7 +2056,7 @@ Commands:
   archive    Export one background workflow job state to an archive JSON file.
   export     Alias for archive.
   skills     Report whether the installed Codex skill commands match this package; --install updates them.
-  setup      Check readiness: package, Codex CLI, app-server, authentication, and installed skill commands (alias: doctor).
+  setup      Check readiness: package, Codex CLI, app-server, authentication, selected model/effort, and installed skill commands (alias: doctor).
 
 Options:
   --version, -v                     Print the package version.
@@ -2058,11 +2075,11 @@ Options:
   --progress <jsonl|plain>           Progress format on stderr. Default: settings.json (${workflowDefaultProgressMode()}).
   --execution <background|attached>  Execution mode. Default: settings.json (${workflowDefaultExecutionMode()}).
   --command <path>                   Override Codex CLI binary path.
-  --model <model>                    Pass a model to Codex app-server.
+  --model <model>                    Select a model verified against Codex model/list. Example: gpt-5.6-sol.
   --timeout-ms <number>              Runtime timeout; 0 waits for completion/cancel. Default: settings.json (${workflowDefaultTimeoutMs()}).
   --heartbeat-ms <number>            Emit a non-destructive workflow.heartbeat every N ms while running; 0 disables. Default: settings.json (${workflowDefaultHeartbeatMs()}).
   --cwd <dir>                        Working directory for workflow execution. Default: current cwd.
-  --reasoning-effort <effort>        Codex reasoning effort. Default: settings.json (${codexDefaultReasoningEffort()}).
+  --reasoning-effort <effort>        Codex effort: none|minimal|low|medium|high|xhigh|max. Default: settings.json (${codexDefaultReasoningEffort()}).
   --verbosity <verbosity>            Codex verbosity. Default: settings.json (${codexDefaultVerbosity()}).
 
 Background command options:

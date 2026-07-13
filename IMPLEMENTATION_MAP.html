@@ -155,21 +155,21 @@
 <body>
   <main>
     <h1>Ultracode for Codex Implementation Map</h1>
-    <p>Current state of the hybrid skill command, CLI workflow runtime, and npm package release path.</p>
+    <p>Current state of the durable Codex workflow runtime, model capability boundary, and hybrid skill route.</p>
 
     <section class="grid" aria-label="Current status">
-      <div class="tile"><strong>Current goal</strong><span>Reinforce general-workflow-runtime identity (change-evidence rename, general example workflows) and land the setup/doctor + prompting DX; task effort tier settled by measurement</span></div>
-      <div class="tile"><strong>Runtime health</strong><span>0.4.3 published; unreleased on main: W1 change-evidence rename, W2 general examples, and setup/doctor + codex-agent-prompting DX (b0c3f52). Unit + installed E2E green</span></div>
-      <div class="tile"><strong>Main risk</strong><span>None open on task cost/tail: W3 A/B (task xhigh vs high, 15+15 live) shows identical cost/latency/quality — cost is plan-shape-driven, not effort — see docs/20260707-task-effort-ab.md</span></div>
-      <div class="tile"><strong>Next decision</strong><span>0.4.4 in release (W1 change-evidence rename + W2 general examples + setup/doctor & prompting DX); W3 measured — no task tier change</span></div>
+      <div class="tile"><strong>Current goal</strong><span>Release 0.4.5 with live Codex model capabilities authoritative and gpt-5.6-sol medium/high/max available without unjournaled native descendants</span></div>
+      <div class="tile"><strong>Runtime health</strong><span>Model/effort boundary and Sol profiles implemented; full test suite, packaged E2E, no-token prompt inspection, and live Sol medium/high N=1 paths green</span></div>
+      <div class="tile"><strong>Main risk</strong><span>Live N=1 proves dispatch, file read, schema submission, and POSIX clean shutdown—not comparative quality on representative repository tasks; Windows terminates only the direct child</span></div>
+      <div class="tile"><strong>Next decision</strong><span>After 0.4.5, run a representative medium/high quality-cost A/B before changing the default effort</span></div>
     </section>
 
     <h2>Service Blueprint</h2>
-    <p>Judgment question: which surface owns planning and which owns execution for the requested workflow?</p>
+    <p>Judgment question: how does a requested model/effort become a bounded, journaled workflow execution?</p>
     <div class="svg-wrap">
       <svg role="img" aria-labelledby="bp-title bp-desc" width="940" height="620" viewBox="0 0 940 620">
-        <title id="bp-title">Ultracode skill and CLI blueprint</title>
-        <desc id="bp-desc">Shows native skill requests and explicit CLI runtime requests flowing through route selection, main-context orchestration, CLI runtime execution, artifacts, projections, and verification.</desc>
+        <title id="bp-title">Ultracode model and workflow authority blueprint</title>
+        <desc id="bp-desc">Shows a user request and model tier flowing through native-versus-durable route selection, the live model catalog gate, main-context orchestration, bounded workers, journal artifacts, and verification.</desc>
         <defs>
           <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
             <path d="M0,0 L0,6 L9,3 z" fill="#475569"></path>
@@ -185,10 +185,10 @@
         <text class="lane-title" x="760" y="42">Artifacts and projection</text>
 
         <rect x="40" y="64" width="180" height="116" rx="8" fill="var(--input)" stroke="var(--input-stroke)"></rect>
-        <text class="node-title" x="58" y="92">Skill commands</text>
-        <text class="node-line" x="58" y="116">$ultracode-for-codex</text>
-        <text class="node-line" x="58" y="136">$ultracode-for-codex-cli</text>
-        <text class="node-line" x="58" y="156">task intent</text>
+        <text class="node-title" x="58" y="92">User request</text>
+        <text class="node-line" x="58" y="116">task intent</text>
+        <text class="node-line" x="58" y="136">model + effort</text>
+        <text class="node-line" x="58" y="156">durability need</text>
 
         <rect x="40" y="230" width="180" height="116" rx="8" fill="var(--input)" stroke="var(--input-stroke)"></rect>
         <text class="node-title" x="58" y="258">CLI command</text>
@@ -198,23 +198,23 @@
 
         <rect x="260" y="64" width="210" height="116" rx="8" fill="var(--gate)" stroke="var(--gate-stroke)"></rect>
         <text class="node-title" x="278" y="92">Route selection</text>
-        <text class="node-line" x="278" y="116">hybrid by default</text>
-        <text class="node-line" x="278" y="136">CLI runs fan-out phases</text>
-        <text class="node-line" x="278" y="156">native fallback</text>
+        <text class="node-line" x="278" y="116">native Ultra: ad-hoc</text>
+        <text class="node-line" x="278" y="136">CLI: durable workflow</text>
+        <text class="node-line" x="278" y="156">main context owns edits</text>
 
         <rect x="260" y="230" width="210" height="136" rx="8" fill="var(--runtime)" stroke="var(--runtime-stroke)"></rect>
-        <text class="node-title" x="278" y="258">CLI runtime</text>
-        <text class="node-line" x="278" y="282">parse pure meta</text>
-        <text class="node-line" x="278" y="302">validate VM script</text>
-        <text class="node-line" x="278" y="322">schedule agents</text>
+        <text class="node-title" x="278" y="258">Runtime gates</text>
+        <text class="node-line" x="278" y="282">model/list capability</text>
+        <text class="node-line" x="278" y="302">schema + permission</text>
+        <text class="node-line" x="278" y="322">native thread cap = 1</text>
         <text class="node-line" x="278" y="342">retry/cancel authority</text>
 
         <rect x="520" y="230" width="190" height="116" rx="8" fill="#fef3c7" stroke="#d97706"></rect>
-        <text class="node-title" x="538" y="258">Main orchestrator</text>
-        <text class="node-line" x="538" y="282">phase planning</text>
-        <text class="node-line" x="538" y="302">delegates fan-out to CLI</text>
-        <text class="node-line" x="538" y="322">phase synthesis</text>
-        <text class="node-line" x="538" y="342">chat progress</text>
+        <text class="node-title" x="538" y="258">Bounded Codex work</text>
+        <text class="node-line" x="538" y="282">medium planning/scans</text>
+        <text class="node-line" x="538" y="302">high verification</text>
+        <text class="node-line" x="538" y="322">structured submit</text>
+        <text class="node-line" x="538" y="342">read-only by default</text>
 
         <rect x="760" y="64" width="160" height="116" rx="8" fill="var(--artifact)" stroke="var(--artifact-stroke)"></rect>
         <text class="node-title" x="778" y="92">Journal</text>
@@ -248,24 +248,52 @@
     <h2>Current Architecture</h2>
     <table>
       <tr><th>Area</th><th>Current contract</th></tr>
-      <tr><td>Hybrid skill</td><td><code>skills/ultracode-for-codex/SKILL.md</code> is the default user-facing command. The Codex main context owns adaptive phase planning, phase synthesis, visual progress snapshots from <code>references/progress-visuals.md</code>, and the final critical re-check recommendation; fan-out phases execute through the CLI runtime (validate-then-launch background runs, schema-enforced outputs, journaled results, resume anchors of <code>jobId</code>/<code>runId</code>/<code>cwd</code>). Codex-native subagents remain the fallback when the CLI is unavailable.</td></tr>
+      <tr><td>Hybrid skill</td><td><code>skills/ultracode-for-codex/SKILL.md</code> positions native Codex Ultra for ad-hoc model-directed delegation and this package for durable workflows. The main Codex context owns decisions, edits, phase synthesis, progress projection, and critical re-checks; the CLI owns schema-enforced, journaled fan-out and resume anchors of <code>jobId</code>/<code>runId</code>/<code>cwd</code>.</td></tr>
       <tr><td>CLI skill</td><td><code>skills/ultracode-for-codex-cli/SKILL.md</code> owns explicit CLI runtime operations: background jobs, attached runs, packaging, release checks, runtime-boundary validation, installed E2E, and local runtime artifacts.</td></tr>
-      <tr><td>CLI</td><td><code>src/cli.ts</code> exposes <code>run</code> (including <code>--validate</code> for no-token authoring checks and <code>--resume-from-run-id</code> for all terminal source classes), background <code>status</code>/<code>wait</code>/<code>logs</code>/<code>result</code>/<code>cancel</code>/<code>jobs</code>/<code>archive</code> (status/jobs project <code>runId</code> and <code>cwd</code>), <code>skills</code> (installed skill-command status and <code>--install</code> sync into <code>CODEX_HOME</code>, with postinstall staleness notices), help, install guide, and package-version reporting. <code>settings.json</code> defaults to OS background execution so long Codex-launched runs can continue while Codex performs other work; <code>--execution attached</code> keeps progress on stderr JSONL and result on stdout JSON when blocking is desired; terminal failures write an <code>ultracode.workflow.failure</code> record to the same stdout/result.json channel, <code>status</code> classifies that record as failed even without progress events, and <code>result</code> prints it with exit 1. Completed runs add a phase/agent angle summary and a critical re-check recommendation for the current session LLM.</td></tr>
-      <tr><td>Settings</td><td><code>settings.json</code> owns workflow execution mode, progress mode, permission default, retry limit, opt-in timeout, background file names, and Codex model controls. The packaged timeout default is <code>0</code>, so workflows wait for completion, cancellation, or app-server exit.</td></tr>
-      <tr><td>Runtime</td><td><code>src/runtime/workflow-runtime.ts</code> owns parsing, validation, phase-wise parallel scheduling, permission, retry, cancel, resume, and progress events. Script <code>agent()</code> calls accept per-agent <code>effort</code>/<code>model</code> options with byte-compatible default cache identity; duplicate logical keys fail at reservation. Resume accepts completed, failed, cancelled, and interrupted sources (journal-first discovery, widened exact-key reuse, model adoption, workspace-drift disclosure). Built-in <code>code-review</code> runs finder-class agents at <code>high</code> and verdict-class agents at <code>xhigh</code>. Runtime-owned workflow state and isolated worktrees are preserved for review.</td></tr>
+      <tr><td>CLI</td><td><code>src/cli.ts</code> exposes durable run, validate, resume, background control, skill sync, and setup surfaces. Before creating runtime truth, an attached child prepares the Codex backend: <code>model/list</code> resolves the effective model and validates the run-level effort. <code>setup</code> version 2 reports that same selected model and Ultracode-safe effort set. Progress remains stderr JSONL and the total result/failure channel remains stdout JSON.</td></tr>
+      <tr><td>Settings</td><td><code>settings.json</code> owns workflow execution, progress, permission, retry, timeout, heartbeat, background paths, and the default run-level effort. The current default remains <code>xhigh</code> for compatibility; explicit <code>medium</code>, <code>high</code>, and catalog-supported <code>max</code> are first-class paths.</td></tr>
+      <tr><td>Runtime</td><td><code>src/runtime/workflow-runtime.ts</code> owns parsing, validation, scheduling, permission, retry, cancel, resume, and progress. An agent without explicit effort inherits the run-level effort. Built-in <code>task</code> is read-only analysis: its planner is <code>medium</code> and workers inherit the run tier. <code>code-review</code> level <code>high</code> is medium/high; the default deep profile is high/xhigh. <code>max</code> is accepted, while <code>ultra</code> is structurally rejected.</td></tr>
       <tr><td>Journal</td><td><code>src/runtime/workflow-journal.ts</code> owns durable hash-chained workflow truth.</td></tr>
-      <tr><td>Subagent backend</td><td><code>src/codex/subagent-backend.ts</code> talks to Codex app-server over stdio, strips direct provider credentials, runs turns in the requested workflow cwd, and serves bounded read-only workspace tools.</td></tr>
+      <tr><td>Model catalog</td><td><code>src/codex/model-catalog.ts</code> parses paginated app-server catalog responses, selects explicit/inherited/default models, exposes only runtime-safe efforts, and fails unsupported model/effort combinations before a turn.</td></tr>
+      <tr><td>Subagent backend</td><td><code>src/codex/subagent-backend.ts</code> has no hard-coded model fallback. It prepares the live catalog before the runtime journals an agent-capable run, strips provider credentials, serves bounded workspace tools, and caps Codex multi-agent V2 at one total thread so workers cannot create unjournaled descendants. Workers are read-only unless a permission-reviewed custom script requests worktree isolation. On POSIX, app-server shutdown terminates only the backend-owned process group, including shell wrappers; Windows currently terminates the direct child.</td></tr>
       <tr><td>Package</td><td>Package contents are the CLI runtime, install guide, both Codex skill command folders, docs, and public type exports. CLI <code>--version</code> and Codex <code>clientInfo.version</code> read package metadata, so packaging and npm version bumps update runtime surfaces together.</td></tr>
+    </table>
+
+    <h2>Current Decisions And Risks</h2>
+    <table>
+      <tr><th>Decision or risk</th><th>Current state</th></tr>
+      <tr><td>Native versus durable orchestration</td><td>Native Ultra is the lightweight route; Ultracode is selected when schema, journal, cache, background, or reproducibility guarantees matter.</td></tr>
+      <tr><td>Effort boundary</td><td><code>medium</code>/<code>high</code> are the balanced Sol path; <code>max</code> stays single-agent; <code>ultra</code> cannot enter a workflow agent request.</td></tr>
+      <tr><td>Implementation ownership</td><td>The built-in task analyzes but does not edit. Main-context edits are canonical; custom worktree writes remain isolated and require explicit integration.</td></tr>
+      <tr><td>Residual quality risk</td><td>Fixture and fake-provider checks prove wiring and contracts only. Live medium/high N=1 probes verify provider routing; comparative quality still needs representative A/B tasks.</td></tr>
+    </table>
+
+    <h2>Current Roadmap</h2>
+    <table>
+      <tr><th>Gate</th><th>Done when</th></tr>
+      <tr><td>Capability gate</td><td>Setup and run agree on selected model and effort; unsupported combinations fail before a turn.</td></tr>
+      <tr><td>Isolation gate</td><td>No-token prompt inspection proves the worker receives one total native thread slot.</td></tr>
+      <tr><td>Release gate</td><td>Typecheck, runtime-boundary check, full tests, installed package E2E, HTML render, and live Sol medium/high probes pass.</td></tr>
+    </table>
+
+    <h2>Change Impact</h2>
+    <table>
+      <tr><th>Surface</th><th>User-visible effect</th></tr>
+      <tr><td>Setup</td><td>Reports catalog-selected model and supported Ultracode efforts.</td></tr>
+      <tr><td>Run</td><td><code>--model gpt-5.6-sol --reasoning-effort medium|high|max</code> is validated and inherited by agents without overrides.</td></tr>
+      <tr><td>Built-ins</td><td>Task execution claims are read-only and evidence-bound; high-level review avoids xhigh by using a medium/high funnel.</td></tr>
+      <tr><td>Recovery</td><td>The effective catalog model is journaled, strengthening resume cache identity and mismatch disclosure.</td></tr>
     </table>
 
     <h2>Verification</h2>
     <table>
       <tr><th>Check</th><th>Status</th></tr>
-      <tr><td><code>npm test</code></td><td>Build, runtime boundary verification, unit and integration tests.</td></tr>
-      <tr><td><code>npm run test:e2e:ultracode-for-codex</code></td><td>Packaged CLI E2E with fake Codex app-server boundary.</td></tr>
-      <tr><td><code>npm run pack:ultracode-for-codex</code></td><td>Tarball contents, both skill command folders, exports, and install checks.</td></tr>
-      <tr><td><code>npm run publish:dry-run</code></td><td>npm registry publish payload and lifecycle checks before release.</td></tr>
-      <tr><td><code>ULTRACODE_LIVE_SMOKE=1 npm run smoke:live</code></td><td>Opt-in local Codex CLI smoke outside CI.</td></tr>
+      <tr><td><code>npm test</code></td><td>Pass: build, runtime boundary verification, and the full unit/integration suite.</td></tr>
+      <tr><td><code>npm run test:e2e:ultracode-for-codex</code></td><td>Pass: packaged tarball installed into an isolated consumer and exercised through the fake app-server boundary.</td></tr>
+      <tr><td><code>npm run publish:dry-run</code></td><td>Pass: 0.4.5 ran the complete prepublish test/E2E/prepack chain and produced the public npm publish projection without publishing.</td></tr>
+      <tr><td><code>codex debug prompt-input</code></td><td>Pass: medium/high both receive the no-native-delegation hint and one total concurrency slot.</td></tr>
+      <tr><td>Live Sol N=1</td><td>Pass: medium and high each read <code>package.json</code> and submitted the required schema; high also confirmed clean POSIX process-group shutdown after the lifecycle fix.</td></tr>
+      <tr><td>Comparative quality A/B</td><td>Open: required before changing the packaged default effort from <code>xhigh</code>.</td></tr>
     </table>
   </main>
 </body>

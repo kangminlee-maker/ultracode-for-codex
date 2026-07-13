@@ -144,11 +144,12 @@ API surface:
     runtime forces a StructuredOutput submission and validates it; use
     `additionalProperties: false` to reject unknown fields. Pass a schema for
     every result the script or a later phase consumes as data.
-  - `effort`: `none|minimal|low|medium|high|xhigh` (default `xhigh`).
-    Funnel-tier: wide sweeps and finder-style scans at `high` or below,
-    verdicts and synthesis at `xhigh`. Model support varies: the current
-    default Codex model rejects `minimal`, and an unsupported effort fails
-    that agent loudly.
+  - `effort`: `none|minimal|low|medium|high|xhigh|max` (the run-level setting
+    defaults to `xhigh`). An agent without an explicit effort inherits
+    `--reasoning-effort`. `ultra` is intentionally unavailable because Codex
+    maps it to proactive native delegation outside this runtime's journal and
+    cost accounting. Model support is checked against `model/list` before the
+    first turn; unsupported combinations fail before agent-token spend.
   - `model`: per-agent model override. Precedence: per-agent `model` beats
     run-level `--model`, which beats the Codex thread default. Unknown models
     fail that agent loudly; there is no silent fallback.
@@ -283,19 +284,27 @@ Useful controls:
 
 ## Model And Config Conventions
 
-- Models follow current Codex naming: the GPT-5.5 family (`gpt-5.5`,
-  `gpt-5.5-codex`). The runtime default subagent model is `gpt-5.5`. Set a
-  specific one with run-level `--model` or per-agent `model`.
-- Effort follows Codex reasoning-effort naming: `none|low|medium|high|xhigh`
-  (`minimal` is also accepted by the enum but the current default model rejects
-  it). This family defaults to `medium`; the runtime funnel uses `high` for
-  finder-class agents and `xhigh` for verdict/synthesis agents.
+- The live Codex `model/list` catalog owns available models and efforts. A
+  run-level `--model`, inherited top-level Codex model, or catalog default is
+  selected in that order; there is no hard-coded model fallback.
+- `gpt-5.6-sol` supports the recommended balanced paths:
+  `--reasoning-effort medium` for bounded analysis and `high` for
+  correctness-sensitive work. `max` is available when the selected catalog
+  model supports it. `ultra` remains native-Codex-only.
+- Built-in `task` runs its planner at `medium`; other task agents inherit the
+  run-level effort. Built-in `code-review` with `{"level":"high"}` uses
+  `medium` scope plus `high` find/verify/synthesis. The default deep review
+  keeps the high/xhigh funnel.
 - Auth and the default model are inherited from your Codex install: the runtime
   copies `auth.json` and reads the top-level `model` from
-  `${CODEX_HOME:-~/.codex}` (and its `config.toml`). Run `setup` to confirm
-  Codex is installed and authenticated before a delegated phase.
+  `${CODEX_HOME:-~/.codex}` (and its `config.toml`). Run `setup --model
+  gpt-5.6-sol --reasoning-effort high` to confirm authentication and the exact
+  model/effort capability before a delegated phase.
 - Subagents otherwise run under an isolated, minimal `config.toml`
   (`web_search` disabled, read-only sandbox, analytics off) for reproducibility.
+  Native multi-agent concurrency is capped at one total thread, so delegated
+  agents cannot spawn unjournaled descendants even when model metadata enables
+  Codex multi-agent V2.
   Project-level `.codex/config.toml` overrides beyond the default model are
   intentionally not applied to subagents — steer per run with `--model` /
   `--reasoning-effort`, or per agent with `model` / `effort`.
@@ -315,8 +324,9 @@ Useful controls:
 - Strip direct provider credentials from child CLI environments.
 - Run Codex subagents against the requested workflow cwd and provide bounded
   read-only workspace tools for text file reads and directory listings.
-- Built-in `task` adds deterministic workspace context to planner-selected
-  phase-wise parallel subagents. Built-in `code-review` uses deterministic
+- Built-in `task` adds deterministic workspace context to planner-selected,
+  read-only phase-wise analysis subagents; the main orchestrator owns edits.
+  Built-in `code-review` uses deterministic
   review evidence, allowed evidence refs, dynamic lenses, candidate verification,
   and bounded final synthesis. It reviews pending working-tree changes: on a
   clean tree it fails before spawning any agent with `no reviewable change

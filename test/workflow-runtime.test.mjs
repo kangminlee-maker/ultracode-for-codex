@@ -127,6 +127,58 @@ return { first, second };`,
   }
 });
 
+test('workflow agents inherit the run-level medium/high effort unless a script overrides it', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({
+    backend,
+    runtimeOptions: { defaultReasoningEffort: 'medium' },
+  });
+  try {
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "run-effort" };
+const inherited = await agent("inherit medium");
+const raised = await agent("raise for verdict", { effort: "high" });
+const maxed = await agent("bounded max", { effort: "max" });
+return { inherited, raised, maxed };`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    assert.deepEqual(
+      backend.requests.map((request) => request.reasoningEffort),
+      ['medium', 'high', 'max'],
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow prepares model capability truth only when a script can call an agent', async () => {
+  const backend = new FakeSubagentBackend();
+  backend.model = 'codex-subagent';
+  let prepareCalls = 0;
+  backend.prepare = async () => {
+    prepareCalls += 1;
+    backend.model = 'catalog-model';
+  };
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const deterministic = await runtime.launch({
+      script: 'export const meta = { name: "no-agent" };\n// agent("comment only")\nreturn { text: "agent( is literal text" };',
+    });
+    await collectEvents(runtime, deterministic.taskId);
+    assert.equal(prepareCalls, 0);
+
+    const delegated = await runtime.launch({
+      script: 'export const meta = { name: "with-agent" };\nreturn await agent("inspect");',
+    });
+    await collectEvents(runtime, delegated.taskId);
+    assert.equal(prepareCalls, 1);
+    const journal = await readWorkflowJournal(workflowJournalPath(runtime.get(delegated.taskId).transcriptDir));
+    assert.equal(journal.entries[0].runtime.model, 'catalog-model');
+  } finally {
+    await runtime.close();
+  }
+});
+
 test('workflow emits non-destructive heartbeats while running and stays off by default', async () => {
   const script = `export const meta = { name: "heartbeat-demo", description: "Slow run for heartbeat", phases: [{ title: "Work" }] };
 phase("Work");
@@ -399,6 +451,12 @@ test('built-in code-review high level skips sweep', async () => {
     assert.equal(snapshot.result.level, 'high');
     assert.equal(snapshot.result.stats.finders, 2);
     assert.equal(events.some((event) => event.type === 'workflow.agent.started' && event.label === 'code-review-sweep-finder'), false);
+    const effortsByHead = backend.requests.map((request) => ({
+      head: request.messages[0].content.split('\n')[0],
+      effort: request.reasoningEffort,
+    }));
+    assert.equal(effortsByHead.find((entry) => entry.head === 'Code-review Scope')?.effort, 'medium');
+    assert.ok(effortsByHead.filter((entry) => entry.head !== 'Code-review Scope').every((entry) => entry.effort === 'high'));
   } finally {
     await runtime.close();
   }
@@ -1258,7 +1316,10 @@ test('workflow runtime accepts cancelled runs as resume sources and surfaces the
 
 test('built-in task uses planner-selected single execution only when parallel work is wasteful', async () => {
   const backend = new FakeSubagentBackend();
-  const { runtime } = await createRuntime({ backend });
+  const { runtime } = await createRuntime({
+    backend,
+    runtimeOptions: { defaultReasoningEffort: 'high' },
+  });
   try {
     const launch = await runtime.launch({
       name: 'task',
@@ -1277,6 +1338,7 @@ test('built-in task uses planner-selected single execution only when parallel wo
       .filter((event) => event.type === 'workflow.agent.started')
       .map((event) => event.label);
     assert.deepEqual(labels, ['task-planner', 'task-single']);
+    assert.deepEqual(backend.requests.map((request) => request.reasoningEffort), ['medium', 'high']);
   } finally {
     await runtime.close();
   }
@@ -1493,6 +1555,7 @@ async function createRuntime({ backend, runtimeOptions = {} }) {
       cwd: root,
       stateDir: join(root, '.ultracode-for-codex'),
       requestTimeoutMs: runtimeOptions.requestTimeoutMs ?? 30_000,
+      defaultReasoningEffort: runtimeOptions.defaultReasoningEffort,
       agentStallTimeoutMs: runtimeOptions.agentStallTimeoutMs,
       agentStallRetryLimit: runtimeOptions.agentStallRetryLimit,
       heartbeatMs: runtimeOptions.heartbeatMs,
