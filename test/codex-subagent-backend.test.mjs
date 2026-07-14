@@ -57,6 +57,7 @@ test('CodexSubagentBackend can wait for a turn without a turn timeout', async ()
     command: fakeCodex,
     cwd: process.cwd(),
     timeoutMs: 0,
+    reasoningEffort: 'xhigh',
   });
 
   try {
@@ -150,6 +151,7 @@ test('CodexSubagentBackend uses an Ultracode-only app-server surface', async () 
     command: fakeCodex,
     cwd: process.cwd(),
     timeoutMs: 30_000,
+    reasoningEffort: 'xhigh',
   });
 
   try {

@@ -1,0 +1,1 @@
+Review the order-processing service in src/ for correctness bugs. It spans schema.js, store.js, pricing.js, cache.js, api.js, and verify.js. Requests enter through api.js and delegate to the store; pricing is memoized by cache.js; verify.js is the CI check. For each bug you find, name the file and function, describe the incorrect behavior, and give a one-line fix. Be thorough.

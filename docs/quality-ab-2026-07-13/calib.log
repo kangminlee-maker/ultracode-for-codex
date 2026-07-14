@@ -1,0 +1,4 @@
+[ab +209s] medium#0: completed agents=7 tokens=55123 dur=208s chars=7289  [1/3]
+[ab +501s] high#0: completed agents=8 tokens=66938 dur=291s chars=5773  [2/3]
+[ab +705s] xhigh#0: completed agents=2 tokens=18939 dur=203s chars=3773  [3/3]
+[ab +705s] DONE. records at /Users/kangmin/Documents/ultracode-for-codex/docs/quality-ab-2026-07-13/calib.jsonl. total 705s

@@ -8,6 +8,21 @@ the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Lowered the packaged default reasoning effort (`settings.json`
+  `codex.reasoningEffort`) from `xhigh` to `medium`. A live two-arm effort A/B on
+  `gpt-5.6-sol` (2026-07-14) found review/analysis quality is tier-independent —
+  medium, high, and xhigh all reach ~96–100% bug detection with 0 false positives
+  and equal fix quality on both single-module and hard cross-file review tasks —
+  while `xhigh` costs 1.7–2.4× the latency and can miss a fixed deadline that
+  `medium` meets. Scope caveat: the measurement covers the read-only
+  review/analysis path only; code-writing/generation was not measured, so revisit
+  this default if/when that workload becomes primary. The value is fully
+  overridable with `--reasoning-effort`, and the `code-review` built-in's own
+  `level` (which sets its own effort) is unchanged. See
+  `docs/20260714-effort-quality-ab.md`.
+
 ## [0.4.5] - 2026-07-12
 
 ### Added
