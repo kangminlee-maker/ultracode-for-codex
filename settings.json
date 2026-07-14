@@ -15,7 +15,7 @@
     }
   },
   "codex": {
-    "reasoningEffort": "xhigh",
+    "reasoningEffort": "medium",
     "verbosity": "medium"
   }
 }

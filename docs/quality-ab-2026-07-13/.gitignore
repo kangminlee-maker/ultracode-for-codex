@@ -1,0 +1,14 @@
+# Regenerable via make-fixture.mjs / make-depth-fixture.mjs (nested git repos).
+fixtures/
+# Transient blind-judge working files (inputs/shards are regenerable; verdicts
+# are concatenated into judge-verdicts-*.jsonl which is kept).
+shard-shallow-*.json
+shard-depth-*.json
+verdicts-shallow-*.jsonl
+verdicts-depth-*.jsonl
+judge-*-inputs.jsonl
+depth-early.jsonl
+# Mined from OTHER projects' private .onto review records — must not be published.
+# Regenerable locally via onto-mining/harvest.py.
+onto-mining/ledger-paths.txt
+onto-mining/findings.jsonl

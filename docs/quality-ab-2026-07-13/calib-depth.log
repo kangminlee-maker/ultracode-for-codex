@@ -1,0 +1,7 @@
+[ab +462s] medium#0: completed agents=8 tokens=95781 dur=461s chars=16780  [1/6]
+[ab +942s] high#0: stalled agents=4 tokens=49589 dur=480s chars=0  [2/6]
+[ab +1430s] xhigh#0: stalled agents=5 tokens=73267 dur=480s chars=0  [3/6]
+[ab +1863s] medium#1: completed agents=8 tokens=92037 dur=423s chars=14022  [4/6]
+[ab +2343s] high#1: stalled agents=5 tokens=56014 dur=480s chars=0  [5/6]
+[ab +2831s] xhigh#1: stalled agents=5 tokens=72338 dur=480s chars=0  [6/6]
+[ab +2839s] DONE. records at /Users/kangmin/Documents/ultracode-for-codex/docs/quality-ab-2026-07-13/calib-depth.jsonl. total 2839s

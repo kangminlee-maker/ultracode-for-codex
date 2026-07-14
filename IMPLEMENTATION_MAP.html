@@ -161,7 +161,7 @@
       <div class="tile"><strong>Current goal</strong><span>Release 0.4.5 with live Codex model capabilities authoritative and gpt-5.6-sol medium/high/max available without unjournaled native descendants</span></div>
       <div class="tile"><strong>Runtime health</strong><span>Model/effort boundary and Sol profiles implemented; full test suite, packaged E2E, no-token prompt inspection, and live Sol medium/high N=1 paths green</span></div>
       <div class="tile"><strong>Main risk</strong><span>Live N=1 proves dispatch, file read, schema submission, and POSIX clean shutdown—not comparative quality on representative repository tasks; Windows terminates only the direct child</span></div>
-      <div class="tile"><strong>Next decision</strong><span>After 0.4.5, run a representative medium/high quality-cost A/B before changing the default effort</span></div>
+      <div class="tile"><strong>Recent decision</strong><span>Effort quality A/B done (2026-07-14, REVIEW/ANALYSIS scope): quality tier-independent, xhigh costs 1.7&ndash;2.4&times; latency for no gain. Owner lowered the global default <code>codex.reasoningEffort</code> xhigh&rarr;medium (overridable; code-writing unmeasured &mdash; revisit if it becomes primary).</span></div>
     </section>
 
     <h2>Service Blueprint</h2>
@@ -263,9 +263,9 @@
     <table>
       <tr><th>Decision or risk</th><th>Current state</th></tr>
       <tr><td>Native versus durable orchestration</td><td>Native Ultra is the lightweight route; Ultracode is selected when schema, journal, cache, background, or reproducibility guarantees matter.</td></tr>
-      <tr><td>Effort boundary</td><td><code>medium</code>/<code>high</code> are the balanced Sol path; <code>max</code> stays single-agent; <code>ultra</code> cannot enter a workflow agent request.</td></tr>
+      <tr><td>Effort boundary</td><td>Packaged default is <code>medium</code> (lowered from <code>xhigh</code> 2026-07-14 after the review-quality A/B); <code>medium</code>/<code>high</code> are the balanced Sol path; <code>max</code> stays single-agent; <code>ultra</code> cannot enter a workflow agent request.</td></tr>
       <tr><td>Implementation ownership</td><td>The built-in task analyzes but does not edit. Main-context edits are canonical; custom worktree writes remain isolated and require explicit integration.</td></tr>
-      <tr><td>Residual quality risk</td><td>Fixture and fake-provider checks prove wiring and contracts only. Live medium/high N=1 probes verify provider routing; comparative quality still needs representative A/B tasks.</td></tr>
+      <tr><td>Residual quality risk</td><td>Closed for review workloads: the two-arm live effort A/B (2026-07-14) shows review quality saturates at <code>medium</code> (100% detection, 0 FP, judge quality 3/3 across medium/high/xhigh) on both single-module and hard cross-file tasks; only latency scales with effort. See <code>docs/20260714-effort-quality-ab.md</code>.</td></tr>
     </table>
 
     <h2>Current Roadmap</h2>
@@ -293,7 +293,7 @@
       <tr><td><code>npm run publish:dry-run</code></td><td>Pass: 0.4.5 ran the complete prepublish test/E2E/prepack chain and produced the public npm publish projection without publishing.</td></tr>
       <tr><td><code>codex debug prompt-input</code></td><td>Pass: medium/high both receive the no-native-delegation hint and one total concurrency slot.</td></tr>
       <tr><td>Live Sol N=1</td><td>Pass: medium and high each read <code>package.json</code> and submitted the required schema; high also confirmed clean POSIX process-group shutdown after the lifecycle fix.</td></tr>
-      <tr><td>Comparative quality A/B</td><td>Open: required before changing the packaged default effort from <code>xhigh</code>.</td></tr>
+      <tr><td>Comparative quality A/B</td><td>Done (2026-07-14): 2 live arms (shallow N=15/cell, depth N=6/cell) on <code>gpt-5.6-sol</code>. Review/analysis scope only (<code>task</code>). Quality tier-independent (medium=high=xhigh: ~96&ndash;100% detection, 0 FP, quality 3/3); xhigh 1.7&times; (shallow) / 2.4&times; (depth) medium latency and times out under an 8-min deadline on hard tasks. Supports lowering the review-path effort; global default left at <code>xhigh</code> (code-gen batch/custom agents unmeasured). <code>docs/20260714-effort-quality-ab.md</code>.</td></tr>
     </table>
   </main>
 </body>

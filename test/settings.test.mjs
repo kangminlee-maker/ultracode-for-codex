@@ -37,7 +37,7 @@ test('settings.json provides Codex workflow runtime defaults', () => {
       },
     },
     codex: {
-      reasoningEffort: 'xhigh',
+      reasoningEffort: 'medium',
       verbosity: 'medium',
     },
   });
@@ -54,7 +54,7 @@ test('settings.json provides Codex workflow runtime defaults', () => {
     metadataFile: 'metadata.json',
     pidFile: 'pid',
   });
-  assert.equal(codexDefaultReasoningEffort(), 'xhigh');
+  assert.equal(codexDefaultReasoningEffort(), 'medium');
   assert.equal(codexDefaultVerbosity(), 'medium');
   assert.match(
     defaultWorkflowStateDir('/tmp/example-workspace'),
