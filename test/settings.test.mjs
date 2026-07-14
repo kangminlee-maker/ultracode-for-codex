@@ -29,6 +29,7 @@ test('settings.json provides Codex workflow runtime defaults', () => {
       retryBackoffMs: 0,
       timeoutMs: 0,
       heartbeatMs: 120000,
+      worktreeRetention: 'preserve-all',
       background: {
         runDir: '{stateRoot}/background/{jobId}',
         resultFile: 'result.json',

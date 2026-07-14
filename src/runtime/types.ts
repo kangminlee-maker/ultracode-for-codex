@@ -6,6 +6,15 @@ export type Verbosity = 'low' | 'medium' | 'high';
 
 export const REASONING_EFFORTS: readonly ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
+// How isolated agent worktrees are retained after a run. `preserve-all` keeps every
+// worktree (the safe default); `remove-clean` reclaims completed worktrees with no real
+// changes (native "unchanged" semantics), preserving changed/stalled/aborted ones.
+export type WorktreeRetention = 'preserve-all' | 'remove-clean';
+export const WORKTREE_RETENTIONS: readonly WorktreeRetention[] = ['preserve-all', 'remove-clean'];
+export function isWorktreeRetention(value: unknown): value is WorktreeRetention {
+  return typeof value === 'string' && (WORKTREE_RETENTIONS as readonly string[]).includes(value);
+}
+
 // Backend model name used when no run-level model is configured. It is a
 // projection placeholder, never a real Codex model id.
 export const SUBAGENT_MODEL_PLACEHOLDER = 'codex-subagent';

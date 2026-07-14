@@ -10,7 +10,7 @@ import { createInterface } from 'node:readline/promises';
 import { CodexSubagentBackend } from './codex/subagent-backend.js';
 import { probeCodexSetup } from './codex/setup-probe.js';
 import { WorkflowTaskRegistry, isRetryableFailureReason } from './runtime/workflow-runtime.js';
-import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError } from './runtime/types.js';
+import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, isWorktreeRetention } from './runtime/types.js';
 import { ultracodePackageVersion } from './runtime/package-info.js';
 import { defaultUltracodeStateRoot, resolveUltracodeStatePath } from './runtime/state-root.js';
 import { renderUltracodeInstallGuideNotice } from './ultracode-install-guide.js';
@@ -30,8 +30,9 @@ import {
   workflowDefaultRetryBackoffMs,
   workflowDefaultTimeoutMs,
   workflowDefaultHeartbeatMs,
+  workflowDefaultWorktreeRetention,
 } from './settings.js';
-import type { ReasoningEffort, Verbosity } from './runtime/types.js';
+import type { ReasoningEffort, Verbosity, WorktreeRetention } from './runtime/types.js';
 import type { WorkflowExecutionMode, WorkflowPermissionPolicy, WorkflowProgressMode } from './settings.js';
 import type {
   WorkflowEvent,
@@ -113,6 +114,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   const heartbeatMs = parseNonNegativeIntOption(options.heartbeatMs, workflowDefaultHeartbeatMs(), 'heartbeat-ms');
   const retryLimit = parseRetryLimit(options.retryLimit);
   const retryBackoffMs = parseNonNegativeIntOption(options.retryBackoffMs, workflowDefaultRetryBackoffMs(), 'retry-backoff-ms');
+  const worktreeRetention = parseWorktreeRetention(options.worktreeRetention);
   const permissionPolicy = parsePermissionPolicy(options.permission);
   const progressMode = parseProgressMode(options.progress);
   const input = await inputPromise;
@@ -134,6 +136,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
     requestTimeoutMs: timeoutMs,
     defaultReasoningEffort: reasoningEffort,
     heartbeatMs,
+    worktreeRetention,
   });
 
   try {
@@ -262,6 +265,7 @@ interface ParsedOptions {
   readonly permission?: string;
   readonly retryLimit?: string;
   readonly retryBackoffMs?: string;
+  readonly worktreeRetention?: string;
   readonly jobId?: string;
   readonly metadataPath?: string;
   readonly resultPath?: string;
@@ -2048,6 +2052,12 @@ async function interruptibleBackoff(ms: number): Promise<'elapsed' | 'interrupte
   });
 }
 
+function parseWorktreeRetention(value: string | undefined): WorktreeRetention {
+  if (value === undefined) return workflowDefaultWorktreeRetention();
+  if (isWorktreeRetention(value)) return value;
+  throw new Error('worktree-retention must be one of preserve-all, remove-clean.');
+}
+
 function parsePermissionPolicy(value: string | undefined): PermissionPolicy {
   if (value === undefined) return workflowDefaultPermissionPolicy();
   if (isWorkflowPermissionPolicy(value)) return value;
@@ -2115,6 +2125,7 @@ Options:
   --permission <ask|allow|deny>      Permission review behavior. Default: settings.json (${workflowDefaultPermissionPolicy()}).
   --retry-limit <number>             Retry failed workflows in the same process. Default: settings.json (${workflowDefaultRetryLimit()}).
   --retry-backoff-ms <number>        Exponential backoff before each retry (doubles per attempt, capped, cancellable); 0 disables. Default: settings.json (${workflowDefaultRetryBackoffMs()}).
+  --worktree-retention <preserve-all|remove-clean>  Reclaim unchanged completed isolated worktrees. Default: settings.json (${workflowDefaultWorktreeRetention()}).
   --progress <jsonl|plain>           Progress format on stderr. Default: settings.json (${workflowDefaultProgressMode()}).
   --execution <background|attached>  Execution mode. Default: settings.json (${workflowDefaultExecutionMode()}).
   --command <path>                   Override Codex CLI binary path.

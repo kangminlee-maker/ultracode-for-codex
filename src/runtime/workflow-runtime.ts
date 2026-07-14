@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { createContext, runInContext } from 'node:vm';
-import type { ReasoningEffort, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage } from './types.js';
+import type { ReasoningEffort, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
 import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort } from './types.js';
 import {
   WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
@@ -380,6 +380,9 @@ interface WorkflowTaskRegistryOptions {
   // Emit a non-destructive workflow.heartbeat every heartbeatMs while running.
   // 0 (or omitted) disables it, preserving the pre-heartbeat event stream.
   readonly heartbeatMs?: number;
+  // Retention policy for isolated agent worktrees. Omitted defaults to 'preserve-all'
+  // (current behavior); 'remove-clean' reclaims unchanged completed worktrees.
+  readonly worktreeRetention?: WorktreeRetention;
   readonly userWorkflowDirs?: readonly string[];
   readonly pluginWorkflows?: readonly WorkflowPluginRegistry[];
   readonly builtinWorkflows?: readonly BuiltinWorkflow[];
@@ -1664,6 +1667,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   private readonly agentStallTimeoutMs: number;
   private readonly agentStallRetryLimit: number;
   private readonly heartbeatMs: number;
+  private readonly worktreeRetention: WorktreeRetention;
 
   constructor(private readonly options: WorkflowTaskRegistryOptions) {
     this.stateDir = options.stateDir ?? defaultWorkflowStateDir(options.cwd ?? process.cwd());
@@ -1673,6 +1677,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       options.requestTimeoutMs,
     );
     this.heartbeatMs = normalizeHeartbeatMs(options.heartbeatMs);
+    this.worktreeRetention = options.worktreeRetention ?? 'preserve-all';
   }
 
   async launch(input: WorkflowLaunchInput): Promise<WorkflowLaunchResult> {
@@ -3070,26 +3075,40 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     }
   }
 
-  private async finalizeAgentWorktree(worktree: WorkflowAgentWorktree): Promise<WorkflowAgentWorktreeFinalization> {
-    let status: string;
-    try {
-      status = await gitOutput(worktree.path, ['status', '--porcelain=v1', '--untracked-files=all', '--ignored=matching']);
-    } catch {
-      return {
-        preserved: true,
-        preservedWorktree: preservedWorktree(worktree, 'status_unavailable'),
-      };
-    }
-    if (status.trim()) {
-      return {
-        preserved: true,
-        preservedWorktree: preservedWorktree(worktree, 'changed'),
-      };
+  private async finalizeAgentWorktree(
+    worktree: WorkflowAgentWorktree,
+    completed: boolean,
+  ): Promise<WorkflowAgentWorktreeFinalization> {
+    if (completed && this.worktreeRetention === 'remove-clean') {
+      try {
+        // Reclaim an unchanged completed worktree by delegating the cleanliness decision to
+        // git: `worktree remove` (no --force) deletes a clean or ignored-only tree (matching
+        // native "unchanged") and refuses one with real changes, so it is both the removal
+        // gate and TOCTOU-safe. A cleanup failure must never fail a completed agent, so on
+        // any error we fall through and preserve the worktree for review.
+        await gitOutput(worktree.gitRoot, ['worktree', 'remove', worktree.path]);
+        return { preserved: false };
+      } catch {
+        // Real changes (git refused) or a transient failure: preserve below.
+      }
     }
     return {
       preserved: true,
-      preservedWorktree: preservedWorktree(worktree, 'clean'),
+      preservedWorktree: preservedWorktree(worktree, await this.worktreePreservationReason(worktree)),
     };
+  }
+
+  // Provenance status for preservation telemetry only (never the removal gate): includes
+  // ignored artifacts via --ignored=matching, which git's own removal treats as removable.
+  private async worktreePreservationReason(
+    worktree: WorkflowAgentWorktree,
+  ): Promise<'clean' | 'changed' | 'status_unavailable'> {
+    try {
+      const status = await gitOutput(worktree.path, ['status', '--porcelain=v1', '--untracked-files=all', '--ignored=matching']);
+      return status.trim() ? 'changed' : 'clean';
+    } catch {
+      return 'status_unavailable';
+    }
   }
 
   private async runAgentWithStallRetries(
@@ -3120,7 +3139,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
           worktreePath: worktree?.path,
         }));
         const worktreeFinalization = worktree
-          ? await this.finalizeAgentWorktree(worktree)
+          ? await this.finalizeAgentWorktree(worktree, true)
           : undefined;
         if (worktreeFinalization) input.onWorktreeFinalized(worktreeFinalization);
         return {
@@ -3137,7 +3156,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
                   ctx.controller.signal.aborted ? 'aborted' : 'stalled',
                 ),
               } satisfies WorkflowAgentWorktreeFinalization
-            : await this.finalizeAgentWorktree(worktree);
+            : await this.finalizeAgentWorktree(worktree, false);
           input.onWorktreeFinalized(worktreeFinalization);
         }
         if (

@@ -1572,6 +1572,81 @@ test('workflow runtime preserves clean worktree-isolated agents for review', asy
   }
 });
 
+test('workflow runtime remove-clean reclaims a clean completed worktree', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { worktreeRetention: 'remove-clean' } });
+  try {
+    await initializeGitRepo(root);
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "worktree-remove-clean" };\nreturn await agent("READ_ONLY_WORKTREE", { isolation: "worktree" });',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    // Isolation actually ran (subject cardinality > 0), so the removal assertion is non-vacuous.
+    const worktreePath = backend.requests[0].worktreePath;
+    assert.equal(typeof worktreePath, 'string');
+    assert.equal(await fileExists(worktreePath), false);
+    const completed = snapshot.events.find((event) => event.type === 'workflow.agent.completed');
+    assert.notEqual(completed.worktreePreserved, true);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow runtime remove-clean preserves a changed worktree', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { worktreeRetention: 'remove-clean' } });
+  let preservedPath;
+  try {
+    await initializeGitRepo(root);
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "worktree-remove-clean-changed" };\nreturn await agent("WRITE_WORKTREE", { isolation: "worktree" });',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    const completed = snapshot.events.find((event) => event.type === 'workflow.agent.completed');
+    assert.equal(completed.worktreePreserved, true);
+    preservedPath = completed.worktreePath;
+    assert.equal(await fileExists(join(preservedPath, 'agent-change.txt')), true);
+    assert.equal(completed.preservedWorktrees[0].reason, 'changed');
+  } finally {
+    if (preservedPath) {
+      await gitLines(root, ['worktree', 'remove', '--force', preservedPath]).catch(async () => {
+        await rm(preservedPath, { recursive: true, force: true });
+      });
+    }
+    await runtime.close();
+  }
+});
+
+test('workflow runtime remove-clean reclaims an ignored-only worktree (native unchanged parity)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { worktreeRetention: 'remove-clean' } });
+  try {
+    await initializeGitRepo(root);
+    // Commit a .gitignore so the isolated worktree (checked out from HEAD) treats build/ as ignored.
+    await writeFile(join(root, '.gitignore'), 'build/\n');
+    await gitLines(root, ['add', '.gitignore']);
+    await gitLines(root, ['commit', '-m', 'ignore build']);
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "worktree-remove-ignored" };\nreturn await agent("WRITE_IGNORED_WORKTREE", { isolation: "worktree" });',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    const worktreePath = backend.requests[0].worktreePath;
+    assert.equal(typeof worktreePath, 'string');
+    // Ignored-only content is "unchanged" to `git worktree remove`, so it is reclaimed.
+    assert.equal(await fileExists(worktreePath), false);
+    const completed = snapshot.events.find((event) => event.type === 'workflow.agent.completed');
+    assert.notEqual(completed.worktreePreserved, true);
+  } finally {
+    await runtime.close();
+  }
+});
+
 async function createRuntime({ backend, runtimeOptions = {} }) {
   const root = await mkdtemp(join(tmpdir(), 'workflow-runtime-'));
   tempDirs.push(root);
@@ -1586,6 +1661,7 @@ async function createRuntime({ backend, runtimeOptions = {} }) {
       agentStallTimeoutMs: runtimeOptions.agentStallTimeoutMs,
       agentStallRetryLimit: runtimeOptions.agentStallRetryLimit,
       heartbeatMs: runtimeOptions.heartbeatMs,
+      worktreeRetention: runtimeOptions.worktreeRetention,
       journalDurability: runtimeOptions.journalDurability,
     }),
   };
@@ -1627,7 +1703,11 @@ class FakeSubagentBackend {
       this.#stallCounts.set(workflowPrompt, count + 1);
       if (count === 0) return await neverUntilAbort(signal);
     }
-    if (workflowPrompt.includes('WRITE_WORKTREE')) {
+    if (workflowPrompt.includes('WRITE_IGNORED_WORKTREE')) {
+      assert.equal(typeof request.worktreePath, 'string');
+      await mkdir(join(request.worktreePath, 'build'), { recursive: true });
+      await writeFile(join(request.worktreePath, 'build', 'artifact.txt'), 'ignored build output\n');
+    } else if (workflowPrompt.includes('WRITE_WORKTREE')) {
       assert.equal(typeof request.worktreePath, 'string');
       await writeFile(join(request.worktreePath, 'agent-change.txt'), 'changed\n');
     }
