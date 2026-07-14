@@ -561,6 +561,17 @@ const WORKFLOW_STABLE_FAILURE_CODES = new Set([
   'workflow_script_nondeterministic',
   'workflow_structured_output_failed',
 ]);
+// Failure reasons worth re-running: transient/backend/stochastic classes. Every other
+// reason — deterministic config/validation/control failures and any unrecognized code —
+// is non-retryable so a stable failure is not retried to exhaustion. Invariant: this set
+// stays a subset of WORKFLOW_STABLE_FAILURE_CODES ∪ {'workflow_failed'} (the backend
+// catch-all), and a newly introduced failure code defaults to non-retryable until listed.
+const WORKFLOW_RETRYABLE_FAILURE_CODES = new Set([
+  'workflow_failed',
+  'workflow_agent_stalled',
+  WORKFLOW_JOURNAL_WRITE_FAILED_REASON,
+  'workflow_structured_output_failed',
+]);
 const FORBIDDEN_HOST_PROPERTY_NAMES = new Set(['constructor', 'prototype', '__proto__', 'process', 'require', 'globalThis', 'global', 'module', 'exports']);
 const JSON_SCHEMA_TYPES = new Set(['object', 'array', 'string', 'number', 'integer', 'boolean', 'null']);
 const JSON_SCHEMA_KEYS = new Set([
@@ -3357,7 +3368,6 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         kind: 'workflow.run.failed',
         reason,
         message: error,
-        recovery: { retryable: true, reason },
         durationMs: Date.now() - task.startedAt,
       });
       task.error = error;
@@ -3367,7 +3377,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         taskId: task.taskId,
         runId: task.runId,
         error,
-        recovery: { retryable: true, reason },
+        recovery: { retryable: isRetryableFailureReason(reason), reason },
       });
       task.status = 'failed';
     });
@@ -3395,13 +3405,14 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   private async failTaskFromCallback(
     ctx: WorkflowRunContext,
     err: unknown,
-    reason = 'workflow_timer_callback_failed',
     excludeFinalizer?: Promise<void>,
   ): Promise<void> {
     if (ctx.controller.signal.aborted || ctx.task.status !== 'running') return;
+    // Classify by the underlying error's canonical code (e.g. a stall surfacing through a
+    // tracked promise stays `workflow_agent_stalled`), not a fixed timer/promise wrapper.
     ctx.task.abortFailure = {
       message: workflowErrorMessage(err),
-      reason,
+      reason: workflowFailureReason(err),
     };
     ctx.controller.abort();
     await this.drainWorkflowFinalizers(ctx, excludeFinalizer);
@@ -3433,7 +3444,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       async (reason) => {
         await sleep(0);
         if (!tracking.handled) {
-          await this.failTaskFromCallback(ctx, reason, 'workflow_promise_rejected', finalizer);
+          await this.failTaskFromCallback(ctx, reason, finalizer);
         }
       },
     );
@@ -6552,6 +6563,12 @@ function workflowFailureReason(err: unknown): string {
   const record = asRecord(err);
   if (typeof record?.code === 'string' && WORKFLOW_STABLE_FAILURE_CODES.has(record.code)) return record.code;
   return 'workflow_failed';
+}
+
+// Single source of retryability: it is a pure property of the failure reason, derived
+// wherever needed (CLI retry gate, streamed failure event) and stored nowhere durable.
+export function isRetryableFailureReason(reason: string | undefined): boolean {
+  return reason !== undefined && WORKFLOW_RETRYABLE_FAILURE_CODES.has(reason);
 }
 
 function workflowInputError(message: string): UltracodeRequestError {

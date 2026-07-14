@@ -9,7 +9,7 @@ import { pathToFileURL } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { CodexSubagentBackend } from './codex/subagent-backend.js';
 import { probeCodexSetup } from './codex/setup-probe.js';
-import { WorkflowTaskRegistry } from './runtime/workflow-runtime.js';
+import { WorkflowTaskRegistry, isRetryableFailureReason } from './runtime/workflow-runtime.js';
 import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError } from './runtime/types.js';
 import { ultracodePackageVersion } from './runtime/package-info.js';
 import { defaultUltracodeStateRoot, resolveUltracodeStatePath } from './runtime/state-root.js';
@@ -27,6 +27,7 @@ import {
   workflowDefaultPermissionPolicy,
   workflowDefaultProgressMode,
   workflowDefaultRetryLimit,
+  workflowDefaultRetryBackoffMs,
   workflowDefaultTimeoutMs,
   workflowDefaultHeartbeatMs,
 } from './settings.js';
@@ -111,6 +112,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   const timeoutMs = parseIntOption(options.timeoutMs, workflowDefaultTimeoutMs());
   const heartbeatMs = parseNonNegativeIntOption(options.heartbeatMs, workflowDefaultHeartbeatMs(), 'heartbeat-ms');
   const retryLimit = parseRetryLimit(options.retryLimit);
+  const retryBackoffMs = parseNonNegativeIntOption(options.retryBackoffMs, workflowDefaultRetryBackoffMs(), 'retry-backoff-ms');
   const permissionPolicy = parsePermissionPolicy(options.permission);
   const progressMode = parseProgressMode(options.progress);
   const input = await inputPromise;
@@ -145,7 +147,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
         return 0;
       }
       renderFailedSnapshot(snapshot, progressMode);
-      if (snapshot.failureReason === 'workflow_aborted' || retries >= retryLimit) {
+      if (!isRetryableFailureReason(snapshot.failureReason) || retries >= retryLimit) {
         // The result channel must stay total: in background mode this stdout
         // is result.json, so a terminal failure writes a machine-readable
         // record where consumers otherwise find a 0-byte file.
@@ -153,15 +155,24 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
         return snapshot.failureReason === 'workflow_aborted' ? 130 : 1;
       }
       retries += 1;
+      const backoffMs = computeRetryBackoffMs(retryBackoffMs, retries);
+      const backoffSuffix = backoffMs > 0 ? ` after ${backoffMs}ms` : '';
       renderControlProgress('workflow.retrying', progressMode, {
         status: 'retrying',
-        summary: `Retrying workflow ${retries}/${retryLimit}`,
+        summary: `Retrying workflow ${retries}/${retryLimit}${backoffSuffix}`,
         taskId: snapshot.taskId,
         runId: snapshot.runId,
         workflowName: snapshot.workflowName,
         retryIndex: retries,
         retryLimit,
-      }, `[workflow] retrying ${retries}/${retryLimit}\n`);
+        backoffMs,
+      }, `[workflow] retrying ${retries}/${retryLimit}${backoffSuffix}\n`);
+      // A retry backoff must stay cancellable: without its own signal handler the wait
+      // sits between streamCommandWorkflow's handler scope, so Ctrl-C would hard-kill.
+      if (backoffMs > 0 && (await interruptibleBackoff(backoffMs)) === 'interrupted') {
+        process.stdout.write(`${JSON.stringify(workflowFailureRecord(snapshot), null, 2)}\n`);
+        return 130;
+      }
       launch = await requireRunnableLaunch(runtime, await runtime.retry(snapshot.taskId), permissionPolicy, progressMode);
     }
   } finally {
@@ -250,6 +261,7 @@ interface ParsedOptions {
   readonly install?: string;
   readonly permission?: string;
   readonly retryLimit?: string;
+  readonly retryBackoffMs?: string;
   readonly jobId?: string;
   readonly metadataPath?: string;
   readonly resultPath?: string;
@@ -1783,6 +1795,7 @@ interface ProgressPayload {
   readonly signal?: string;
   readonly retryIndex?: number;
   readonly retryLimit?: number;
+  readonly backoffMs?: number;
   readonly phasesSummary?: readonly WorkflowPhaseExecutionSummary[];
   readonly totalPhaseCount?: number;
   readonly totalPlannedAgentCount?: number;
@@ -2006,6 +2019,35 @@ function parseRetryLimit(value: string | undefined): number {
   return parsed;
 }
 
+const MAX_RETRY_BACKOFF_MS = 60_000;
+
+// Exponential backoff between whole-workflow retries: base doubles each attempt, capped.
+// base 0 (default) disables the wait entirely, preserving immediate-retry behavior.
+function computeRetryBackoffMs(base: number, retryIndex: number): number {
+  if (base <= 0) return 0;
+  return Math.min(base * 2 ** (retryIndex - 1), MAX_RETRY_BACKOFF_MS);
+}
+
+// A backoff wait that resolves early on SIGINT/SIGTERM so the retry loop can cancel
+// cleanly instead of the default hard-kill during the pause between attempts.
+async function interruptibleBackoff(ms: number): Promise<'elapsed' | 'interrupted'> {
+  return await new Promise((resolve) => {
+    let settled = false;
+    const finish = (outcome: 'elapsed' | 'interrupted'): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      process.off('SIGINT', onSignal);
+      process.off('SIGTERM', onSignal);
+      resolve(outcome);
+    };
+    const onSignal = (): void => finish('interrupted');
+    const timer = setTimeout(() => finish('elapsed'), ms);
+    process.once('SIGINT', onSignal);
+    process.once('SIGTERM', onSignal);
+  });
+}
+
 function parsePermissionPolicy(value: string | undefined): PermissionPolicy {
   if (value === undefined) return workflowDefaultPermissionPolicy();
   if (isWorkflowPermissionPolicy(value)) return value;
@@ -2072,6 +2114,7 @@ Options:
   --args-file <path>                 Read workflow args JSON from a file.
   --permission <ask|allow|deny>      Permission review behavior. Default: settings.json (${workflowDefaultPermissionPolicy()}).
   --retry-limit <number>             Retry failed workflows in the same process. Default: settings.json (${workflowDefaultRetryLimit()}).
+  --retry-backoff-ms <number>        Exponential backoff before each retry (doubles per attempt, capped, cancellable); 0 disables. Default: settings.json (${workflowDefaultRetryBackoffMs()}).
   --progress <jsonl|plain>           Progress format on stderr. Default: settings.json (${workflowDefaultProgressMode()}).
   --execution <background|attached>  Execution mode. Default: settings.json (${workflowDefaultExecutionMode()}).
   --command <path>                   Override Codex CLI binary path.

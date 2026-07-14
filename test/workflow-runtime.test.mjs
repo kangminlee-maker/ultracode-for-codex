@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import { afterEach, test } from 'node:test';
 import { promisify } from 'node:util';
-import { WorkflowTaskRegistry } from '../dist/runtime/workflow-runtime.js';
+import { WorkflowTaskRegistry, isRetryableFailureReason } from '../dist/runtime/workflow-runtime.js';
 import {
   WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
   computeWorkflowAgentCallKey,
@@ -225,6 +225,30 @@ return "done";`;
   }
 });
 
+test('isRetryableFailureReason classifies transient reasons retryable and deterministic reasons non-retryable', () => {
+  for (const reason of [
+    'workflow_failed',
+    'workflow_agent_stalled',
+    'workflow_journal_write_failed',
+    'workflow_structured_output_failed',
+  ]) {
+    assert.equal(isRetryableFailureReason(reason), true, `${reason} should be retryable`);
+  }
+  for (const reason of [
+    'workflow_meta_invalid',
+    'workflow_input_invalid',
+    'workflow_script_nondeterministic',
+    'workflow_permission_denied',
+    'workflow_resume_running',
+    'runtime_closed',
+    'workflow_aborted',
+    'workflow_unrecognized_future_code',
+    undefined,
+  ]) {
+    assert.equal(isRetryableFailureReason(reason), false, `${String(reason)} should be non-retryable`);
+  }
+});
+
 test('workflow agents reject invalid effort and model values before spending tokens', async () => {
   const backend = new FakeSubagentBackend();
   const { runtime } = await createRuntime({ backend });
@@ -235,6 +259,9 @@ test('workflow agents reject invalid effort and model values before spending tok
     let events = await collectEvents(runtime, invalidEffort.taskId);
     assert.equal(events.at(-1).type, 'workflow.failed');
     assert.equal(events.at(-1).recovery.reason, 'workflow_input_invalid');
+    // Deterministic input failures are non-retryable; the event's retryable is now derived
+    // from the reason (a hardcoded `true` here would fail this assertion).
+    assert.equal(events.at(-1).recovery.retryable, false);
 
     const invalidModel = await runtime.launch({
       script: 'export const meta = { name: "bad-model", description: "Reject blank model" };\nreturn await agent("never runs", { model: "  " });',
