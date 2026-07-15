@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
-import type { AgentConcurrency, AgentWebSearch, NestedWorkflows, ReasoningEffort, Verbosity, WorktreeRetention } from './runtime/types.js';
-import { AGENT_WEB_SEARCH_VALUES, NESTED_WORKFLOWS_VALUES, REASONING_EFFORTS, WORKTREE_RETENTIONS, isAgentConcurrencyKeyword, isAgentWebSearch, isNestedWorkflows, isReasoningEffort, isWorktreeRetention } from './runtime/types.js';
+import type { AgentConcurrency, AgentFileWrite, AgentWebSearch, NestedWorkflows, ReasoningEffort, Verbosity, WorktreeRetention } from './runtime/types.js';
+import { AGENT_FILE_WRITE_VALUES, AGENT_WEB_SEARCH_VALUES, NESTED_WORKFLOWS_VALUES, REASONING_EFFORTS, WORKTREE_RETENTIONS, isAgentConcurrencyKeyword, isAgentFileWrite, isAgentWebSearch, isNestedWorkflows, isReasoningEffort, isWorktreeRetention } from './runtime/types.js';
 
 export { isReasoningEffort };
 
@@ -20,6 +20,7 @@ export interface UltracodeSettings {
     readonly agentConcurrency: AgentConcurrency;
     readonly nestedWorkflows: NestedWorkflows;
     readonly agentWebSearch: AgentWebSearch;
+    readonly agentFileWrite: AgentFileWrite;
     readonly background: {
       readonly runDir: string;
       readonly resultFile: string;
@@ -101,6 +102,10 @@ export function loadSettings(): UltracodeSettings {
         workflow?.agentWebSearch,
         'workflow.agentWebSearch',
       ),
+      agentFileWrite: readAgentFileWriteSetting(
+        workflow?.agentFileWrite,
+        'workflow.agentFileWrite',
+      ),
       background: {
         runDir: readTemplateSetting(
           background?.runDir,
@@ -177,6 +182,10 @@ export function workflowDefaultNestedWorkflows(): NestedWorkflows {
 
 export function workflowDefaultAgentWebSearch(): AgentWebSearch {
   return loadSettings().workflow.agentWebSearch;
+}
+
+export function workflowDefaultAgentFileWrite(): AgentFileWrite {
+  return loadSettings().workflow.agentFileWrite;
 }
 
 export function workflowBackgroundDefaults(): UltracodeSettings['workflow']['background'] {
@@ -257,6 +266,15 @@ function readAgentWebSearchSetting(
   if (value === undefined) return 'disabled';
   if (isAgentWebSearch(value)) return value;
   throw new Error(`${key} must be one of ${AGENT_WEB_SEARCH_VALUES.join(', ')}.`);
+}
+
+function readAgentFileWriteSetting(
+  value: unknown,
+  key: string,
+): AgentFileWrite {
+  if (value === undefined) return 'disabled';
+  if (isAgentFileWrite(value)) return value;
+  throw new Error(`${key} must be one of ${AGENT_FILE_WRITE_VALUES.join(', ')}.`);
 }
 
 function readAgentConcurrencySetting(

@@ -45,6 +45,16 @@ export function isAgentWebSearch(value: unknown): value is AgentWebSearch {
   return typeof value === 'string' && (AGENT_WEB_SEARCH_VALUES as readonly string[]).includes(value);
 }
 
+// Gate for subagent workspace file writes. `disabled` (the current default) offers only the
+// read-only workspace tools, byte-identical to today; `enabled` additionally offers write_file
+// and str_replace tools to a **worktree-isolated** agent (never a read-only thread), path-confined
+// to that worktree. Run-level: applies to every isolated agent in the run, not in the call key.
+export type AgentFileWrite = 'disabled' | 'enabled';
+export const AGENT_FILE_WRITE_VALUES: readonly AgentFileWrite[] = ['disabled', 'enabled'];
+export function isAgentFileWrite(value: unknown): value is AgentFileWrite {
+  return typeof value === 'string' && (AGENT_FILE_WRITE_VALUES as readonly string[]).includes(value);
+}
+
 // Backend model name used when no run-level model is configured. It is a
 // projection placeholder, never a real Codex model id.
 export const SUBAGENT_MODEL_PLACEHOLDER = 'codex-subagent';

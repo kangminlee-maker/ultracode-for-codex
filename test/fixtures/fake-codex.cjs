@@ -82,6 +82,10 @@ function emitWorkspaceToolTurn(threadId, turnId, tool, args) {
 function requestWorkspaceTool(threadId, turnId, tool, args) {
   const id = serverRequestSeq;
   serverRequestSeq += 1;
+  return requestWorkspaceToolWithId(id, threadId, turnId, tool, args);
+}
+
+function requestWorkspaceToolWithId(id, threadId, turnId, tool, args) {
   write({
     id,
     method: 'item/tool/call',
@@ -205,6 +209,36 @@ rl.on('line', (line) => {
     if (input.includes('READ_OUTSIDE_WORKSPACE_TOOL')) {
       result(payload.id, { turn: { id: turnId } });
       setTimeout(() => emitWorkspaceToolTurn(threadId, turnId, 'read_file', { path: '/etc/passwd' }), 0);
+      return;
+    }
+    if (input.includes('COLLIDE_ID_TOOL')) {
+      // Send a server-initiated tool call reusing THIS turn/start's (client) request id, BEFORE
+      // answering turn/start, so the id collides with an outstanding client request. A correct
+      // client classifies by method presence and still services the tool call; then we answer
+      // turn/start. A pending-first client misroutes the tool call as the turn/start response.
+      const collidedId = payload.id;
+      void requestWorkspaceToolWithId(collidedId, threadId, turnId, 'read_file', { path: 'collide-note.txt' }).then((response) => {
+        const text = response.error
+          ? JSON.stringify(response.error)
+          : response.result?.contentItems?.map((item) => item.text).join('\n') ?? '';
+        result(collidedId, { turn: { id: turnId } });
+        emitTurn(threadId, turnId, text);
+      });
+      return;
+    }
+    // Args are base64(JSON) so the payload survives inputText's JSON.stringify escaping.
+    const writeMatch = input.match(/WRITE_TOOL_B64 ([A-Za-z0-9+/=]+)/);
+    if (writeMatch) {
+      result(payload.id, { turn: { id: turnId } });
+      const args = JSON.parse(Buffer.from(writeMatch[1], 'base64').toString('utf8'));
+      setTimeout(() => emitWorkspaceToolTurn(threadId, turnId, 'write_file', args), 0);
+      return;
+    }
+    const replaceMatch = input.match(/STR_REPLACE_TOOL_B64 ([A-Za-z0-9+/=]+)/);
+    if (replaceMatch) {
+      result(payload.id, { turn: { id: turnId } });
+      const args = JSON.parse(Buffer.from(replaceMatch[1], 'base64').toString('utf8'));
+      setTimeout(() => emitWorkspaceToolTurn(threadId, turnId, 'str_replace', args), 0);
       return;
     }
     const effort = payload.params?.effort;

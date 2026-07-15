@@ -10,6 +10,7 @@
     "agentConcurrency": "unbounded",
     "nestedWorkflows": "disabled",
     "agentWebSearch": "disabled",
+    "agentFileWrite": "disabled",
     "background": {
       "runDir": "{stateRoot}/background/{jobId}",
       "resultFile": "result.json",

@@ -19,6 +19,7 @@ import {
   workflowDefaultAgentConcurrency,
   workflowDefaultNestedWorkflows,
   workflowDefaultAgentWebSearch,
+  workflowDefaultAgentFileWrite,
 } from '../dist/settings.js';
 import { defaultWorkflowStateDir } from '../dist/runtime/state-root.js';
 
@@ -35,6 +36,7 @@ test('settings.json provides Codex workflow runtime defaults', () => {
       agentConcurrency: 'unbounded',
       nestedWorkflows: 'disabled',
       agentWebSearch: 'disabled',
+      agentFileWrite: 'disabled',
       background: {
         runDir: '{stateRoot}/background/{jobId}',
         resultFile: 'result.json',
@@ -66,6 +68,7 @@ test('settings.json provides Codex workflow runtime defaults', () => {
   assert.equal(workflowDefaultAgentConcurrency(), 'unbounded');
   assert.equal(workflowDefaultNestedWorkflows(), 'disabled');
   assert.equal(workflowDefaultAgentWebSearch(), 'disabled');
+  assert.equal(workflowDefaultAgentFileWrite(), 'disabled');
   assert.match(
     defaultWorkflowStateDir('/tmp/example-workspace'),
     /\/\.ultracode-for-codex\/workspaces\/example-workspace-[0-9a-f]{16}$/,
