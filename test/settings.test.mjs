@@ -31,6 +31,7 @@ test('settings.json provides Codex workflow runtime defaults', () => {
       heartbeatMs: 120000,
       worktreeRetention: 'remove-clean',
       agentConcurrency: 'unbounded',
+      nestedWorkflows: 'disabled',
       background: {
         runDir: '{stateRoot}/background/{jobId}',
         resultFile: 'result.json',

@@ -5,7 +5,7 @@ import { availableParallelism, homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { createContext, runInContext } from 'node:vm';
-import type { AgentConcurrency, ReasoningEffort, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
+import type { AgentConcurrency, NestedWorkflows, ReasoningEffort, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
 import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort, isSubagentFailure } from './types.js';
 import { AgentConcurrencyPool } from './agent-concurrency-pool.js';
 import {
@@ -349,6 +349,11 @@ interface WorkflowRunContext {
   announcedPlan?: WorkflowExecutionPlan;
   pendingPhasePlan?: WorkflowPlanPhase;
   toVmValue?: (value: unknown) => unknown;
+  // True while a nested workflow() child is executing. v1 runs nested children
+  // SEQUENTIALLY: the shared VM projector (toVmValue) is a single ctx slot, so two
+  // concurrent siblings would clobber each other's realm. Set/reset synchronously in
+  // runNestedWorkflow so a second concurrent workflow() is rejected before it can start.
+  nestedInFlight?: boolean;
 }
 
 interface WorkflowVmGlobals {
@@ -359,6 +364,18 @@ interface WorkflowVmGlobals {
   readonly budgetTotalLiteral: string;
   readonly host: Record<string, unknown>;
   readonly setVmValueProjector: (projector: (value: unknown) => unknown) => void;
+}
+
+// Per-child execution state for a nested workflow() call. It carries the state that must
+// differ from the parent WITHOUT mutating the shared ctx (so concurrent workflow() calls
+// never corrupt each other): the child's own args, its progress group, its phase (set by the
+// child's phase()), and its parsed script for phase-detail lookup. Correctness-critical run
+// state (counters, budget, abort, journal, logical keys, agentPool) stays shared on ctx.
+interface WorkflowChildFrame {
+  readonly args: unknown;
+  readonly group: string;
+  currentPhase?: string;
+  readonly metaSource: ParsedWorkflowScript;
 }
 
 type HandledWorkflowPromise<T> = PromiseLike<T> & {
@@ -397,6 +414,9 @@ interface WorkflowTaskRegistryOptions {
   readonly agentConcurrency?: AgentConcurrency;
   // Per-run output-token ceiling. Omitted or null = inert (no ceiling, remaining() Infinity).
   readonly budgetTotal?: number | null;
+  // Gate for nested workflow() calls. Omitted or 'disabled' keeps the throwing stub
+  // (current behavior); 'enabled' lets a workflow run built-in/inline children inline.
+  readonly nestedWorkflows?: NestedWorkflows;
   readonly userWorkflowDirs?: readonly string[];
   readonly pluginWorkflows?: readonly WorkflowPluginRegistry[];
   readonly builtinWorkflows?: readonly BuiltinWorkflow[];
@@ -1693,6 +1713,10 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   private readonly agentConcurrency: number | null;
   // Per-run output-token ceiling, or null when unset (inert). Parsed by the CLI/caller.
   private readonly budgetTotal: number | null;
+  // Default-off gate for nested workflow() calls. When disabled, host.workflow throws the
+  // "not supported" stub (byte-identical to before this feature). v1 nests built-in/inline
+  // children only; project/user/plugin/{scriptPath} sources are deferred behind the permission gate.
+  private readonly nestedWorkflows: boolean;
 
   constructor(private readonly options: WorkflowTaskRegistryOptions) {
     this.stateDir = options.stateDir ?? defaultWorkflowStateDir(options.cwd ?? process.cwd());
@@ -1705,6 +1729,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     this.worktreeRetention = options.worktreeRetention ?? 'remove-clean';
     this.agentConcurrency = resolveAgentConcurrency(options.agentConcurrency);
     this.budgetTotal = resolveBudgetTotal(options.budgetTotal);
+    this.nestedWorkflows = options.nestedWorkflows === 'enabled';
   }
 
   async launch(input: WorkflowLaunchInput): Promise<WorkflowLaunchResult> {
@@ -2756,7 +2781,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     }
   }
 
-  private createVmGlobals(ctx: WorkflowRunContext): WorkflowVmGlobals {
+  private createVmGlobals(ctx: WorkflowRunContext, frame?: WorkflowChildFrame): WorkflowVmGlobals {
     const log = (message: unknown): void => {
       if (ctx.controller.signal.aborted || ctx.task.status !== 'running') return;
       this.emit(ctx.task, {
@@ -2797,7 +2822,13 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     });
     const host = Object.create(null) as Record<string, unknown>;
     host.trackPromise = hardenCallable((value: unknown): HandledWorkflowPromise<unknown> => this.trackWorkflowPromise(ctx, value));
-    host.agent = hardenCallable((prompt: unknown, options?: AgentOptions): HandledWorkflowPromise<unknown> => this.runAgent(ctx, prompt, options));
+    host.agent = frame
+      ? hardenCallable((prompt: unknown, options?: AgentOptions): HandledWorkflowPromise<unknown> =>
+          // A child agent always carries an explicit phase (its composed "▸ name › phase"),
+          // so runAgentInner never falls back to the shared parent ctx.currentPhase and the
+          // child's agents stay grouped under the child even when the child calls phase().
+          this.runAgent(ctx, prompt, this.withChildPhase(frame, options)))
+      : hardenCallable((prompt: unknown, options?: AgentOptions): HandledWorkflowPromise<unknown> => this.runAgent(ctx, prompt, options));
     host.parallel = hardenCallable((items: unknown): HandledWorkflowPromise<unknown[]> => {
       return this.trackWorkflowPromise(ctx, this.parallel(ctx, items));
     });
@@ -2808,16 +2839,37 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     host.workspaceContext = hardenCallable((options?: unknown): HandledWorkflowPromise<string> => {
       return this.trackWorkflowPromise(ctx, this.workspaceContext(ctx, options));
     });
-    host.announcePlan = hardenCallable((plan: unknown): void => this.announcePlan(ctx, plan));
-    host.announcePhasePlan = hardenCallable((phasePlan: unknown): void => this.announcePhasePlan(ctx, phasePlan));
-    host.phase = hardenCallable((title: unknown): void => this.phase(ctx, title));
+    // A nested child does NOT announce plans in v1: announcePlan/announcePhasePlan mutate
+    // parent-only ctx state (announcedPlan/pendingPhasePlan), which a child sharing ctx would
+    // corrupt and which would not correlate with the child's composed "▸ name › phase" tags.
+    // They are inert no-ops for a child; the child's agents still group under "▸ name".
+    host.announcePlan = frame
+      ? hardenCallable((): void => {})
+      : hardenCallable((plan: unknown): void => this.announcePlan(ctx, plan));
+    host.announcePhasePlan = frame
+      ? hardenCallable((): void => {})
+      : hardenCallable((phasePlan: unknown): void => this.announcePhasePlan(ctx, phasePlan));
+    host.phase = frame
+      ? hardenCallable((title: unknown): void => this.childPhase(ctx, frame, title))
+      : hardenCallable((title: unknown): void => this.phase(ctx, title));
     host.log = hardenCallable(log);
     host.consoleLog = hardenCallable((...values: unknown[]): void => {
       log(values.map((value) => String(value)).join(' '));
     });
-    host.workflow = hardenCallable((): never => {
-      throw workflowInputError('Nested workflow calls are not supported by this runtime yet.');
-    });
+    host.workflow = frame
+      // C5e: one level only — a child cannot itself nest. Enforced by which hook the child's
+      // frame binds (not a shared counter), so concurrent children are safe.
+      ? hardenCallable((): never => {
+          throw workflowInputError('workflow() cannot be nested more than one level deep.');
+        })
+      : this.nestedWorkflows
+        ? hardenCallable((nameOrRef: unknown, childArgs?: unknown): HandledWorkflowPromise<unknown> =>
+            // runNestedWorkflow already projects the child result into the parent realm, so the
+            // wrapper must not re-project (projectResult = false); it only tracks the promise.
+            this.trackWorkflowPromise(ctx, this.runNestedWorkflow(ctx, nameOrRef, childArgs), false))
+        : hardenCallable((): never => {
+            throw workflowInputError('Nested workflow calls are not supported by this runtime yet.');
+          });
     // Per-run output spend gauge. spent() = this run's fresh successful-agent output tokens
     // (cached agents contribute 0, matching the journaled per-run cost); remaining() is
     // Infinity when no ceiling is set, so an unset budget is inert.
@@ -2827,7 +2879,9 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     host.setTimeout = workflowSetTimeout;
     host.clearTimeout = workflowClearTimeout;
     return {
-      argsLiteral: vmDataLiteral(ctx.input.args, 'args'),
+      // A child gets its OWN args by frame presence (native: an argless child sees undefined,
+      // not the parent's args) — never `frame?.args ?? ctx.input.args`, which would leak them.
+      argsLiteral: frame ? vmDataLiteral(frame.args, 'args') : vmDataLiteral(ctx.input.args, 'args'),
       budgetLiteral: vmDataLiteral({
         maxAgentCalls: MAX_AGENT_CALLS,
         maxParallelism: MAX_PARALLELISM,
@@ -3448,6 +3502,102 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     });
   }
 
+  // The child's effective phase: "▸ name › <child phase>" once the child calls phase(),
+  // otherwise just "▸ name". Injected as an explicit opts.phase so runAgentInner never reads
+  // the shared parent ctx.currentPhase. `phase` is not part of the agent call key, so this
+  // never affects resume identity.
+  private composedChildPhase(frame: WorkflowChildFrame): string {
+    return frame.currentPhase ? `${frame.group} › ${frame.currentPhase}` : frame.group;
+  }
+
+  private withChildPhase(frame: WorkflowChildFrame, options?: AgentOptions): AgentOptions {
+    // An explicit child opts.phase still nests UNDER the child group ("▸ name › <phase>")
+    // rather than replacing it, so a child agent stays attributable to its workflow.
+    const explicit = options?.phase;
+    const phase = explicit === undefined || explicit === null
+      ? this.composedChildPhase(frame)
+      : `${frame.group} › ${String(explicit)}`;
+    return { ...(options ?? {}), phase };
+  }
+
+  // A child's phase() updates the per-child frame (never the shared ctx.currentPhase/parsed),
+  // and announces the composed phase so the progress display matches the child's agent tags.
+  private childPhase(ctx: WorkflowRunContext, frame: WorkflowChildFrame, title: unknown): void {
+    if (typeof title !== 'string' || title.trim() === '') {
+      throw workflowInputError('phase() requires a non-empty string title.');
+    }
+    const normalizedTitle = title.trim();
+    frame.currentPhase = normalizedTitle;
+    const phaseIndex = ctx.task.events
+      .filter((event) => event.type === 'workflow.phase.started')
+      .length;
+    const detail = frame.metaSource.meta.phases?.find((item) => item.title === normalizedTitle)?.detail;
+    this.emit(ctx.task, {
+      type: 'workflow.phase.started',
+      taskId: ctx.task.taskId,
+      runId: ctx.task.runId,
+      phaseIndex,
+      title: this.composedChildPhase(frame),
+      ...(detail ? { detail } : {}),
+    });
+  }
+
+  // Resolve a nested workflow() reference to a parsed child script. v1 supports a built-in
+  // name and an inline { script } object — both permission-free sources (built-ins are trusted;
+  // an inline child's text is part of the already-approved parent script). project/user/plugin
+  // and { scriptPath } (arbitrary file exec) are deferred behind the permission gate (backlog).
+  // Throws (catchably) on an unknown name, a bad reference, or a child parse/meta error (C5f).
+  private resolveNestedChild(nameOrRef: unknown): ParsedWorkflowScript {
+    if (typeof nameOrRef === 'string') {
+      const resolved = this.findBuiltinWorkflow(nameOrRef, new Set());
+      if (!resolved) {
+        throw workflowInputError(`workflow('${nameOrRef}') did not match a built-in workflow; v1 nesting supports built-in names and { script }.`);
+      }
+      return parseInlineWorkflowScript(resolved.script);
+    }
+    if (nameOrRef && typeof nameOrRef === 'object') {
+      const ref = nameOrRef as Record<string, unknown>;
+      if (typeof ref.script === 'string') return parseInlineWorkflowScript(ref.script);
+      if (typeof ref.scriptPath === 'string') {
+        throw workflowInputError('workflow({ scriptPath }) is not supported yet; v1 nesting supports built-in names and { script }.');
+      }
+    }
+    throw workflowInputError('workflow() requires a built-in workflow name or { script }.');
+  }
+
+  // Run a nested child inline on the SHARED parent ctx (so it shares the concurrency pool,
+  // agent counter, token budget, abort signal, journal writer, and the agent call-key chain).
+  // It bypasses launch/runTask, so no child run.started is journaled — the child appears only
+  // as agent.* entries on the parent's single chain, keeping the journal single-run and resume
+  // intact (the call key is script-agnostic). Returns the child's result as a PARENT-realm value.
+  private async runNestedWorkflow(ctx: WorkflowRunContext, nameOrRef: unknown, childArgs: unknown): Promise<unknown> {
+    // Reject a concurrent second child (v1 runs nested children sequentially — see the field
+    // comment). This check + set is synchronous (before the first await below), so under
+    // parallel([() => workflow('a'), () => workflow('b')]) the second call rejects deterministically.
+    if (ctx.nestedInFlight) {
+      throw workflowInputError('workflow() cannot run a nested child while another is in flight; run nested workflows sequentially.');
+    }
+    const childParsed = this.resolveNestedChild(nameOrRef);
+    ctx.nestedInFlight = true;
+    const parentProjector = ctx.toVmValue;
+    const frame: WorkflowChildFrame = {
+      args: childArgs,
+      group: `▸ ${childParsed.meta.name}`,
+      metaSource: childParsed,
+    };
+    const childGlobals = this.createVmGlobals(ctx, frame);
+    let childResult: unknown;
+    try {
+      childResult = await executeInlineWorkflow(childParsed, childGlobals, ctx.controller.signal);
+    } finally {
+      // Restore the parent's projector so parent agents created after the child marshal into
+      // the parent realm; child agents already captured the child projector at their creation.
+      ctx.toVmValue = parentProjector;
+      ctx.nestedInFlight = false;
+    }
+    return parentProjector ? parentProjector(childResult) : childResult;
+  }
+
   private async completeTask(
     ctx: WorkflowRunContext,
     result: JsonValue,
@@ -3548,12 +3698,26 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     }
   }
 
-  private trackWorkflowPromise<T>(ctx: WorkflowRunContext, value: T | PromiseLike<T>): HandledWorkflowPromise<T> {
+  private trackWorkflowPromise<T>(
+    ctx: WorkflowRunContext,
+    value: T | PromiseLike<T>,
+    projectResult = true,
+  ): HandledWorkflowPromise<T> {
     const promise = Promise.resolve(value);
+    // Capture the value projector at promise-CREATION time, not live at settle. A nested
+    // workflow() runs a child in its own VM context and reassigns ctx.toVmValue for the
+    // child's duration; capturing here binds every promise to the projector of the execution
+    // that created it, so a parent agent that settles while the child projector is installed
+    // still marshals into the parent realm. For a non-nested run ctx.toVmValue never changes,
+    // so this is byte-identical to reading it live. `projectResult` is false only for the
+    // workflow() wrapper: runNestedWorkflow already projects the child result into the parent
+    // realm, and at wrap time ctx.toVmValue is the child's projector, so re-projecting here
+    // would push the parent-realm value back into the child realm.
+    const capturedProjector = projectResult ? ctx.toVmValue : undefined;
     const tracking: WorkflowPromiseTracking = {
       handled: false,
-      projectValue: (nextValue) => ctx.toVmValue ? ctx.toVmValue(nextValue) : nextValue,
-      trackPromise: <U>(nextPromise: Promise<U>) => this.trackWorkflowPromise(ctx, nextPromise),
+      projectValue: (nextValue) => capturedProjector ? capturedProjector(nextValue) : nextValue,
+      trackPromise: <U>(nextPromise: Promise<U>) => this.trackWorkflowPromise(ctx, nextPromise, projectResult),
     };
     let finalizer: Promise<void>;
     const settled = promise.then(

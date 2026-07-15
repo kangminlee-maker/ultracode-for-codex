@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
-import type { AgentConcurrency, ReasoningEffort, Verbosity, WorktreeRetention } from './runtime/types.js';
-import { REASONING_EFFORTS, WORKTREE_RETENTIONS, isAgentConcurrencyKeyword, isReasoningEffort, isWorktreeRetention } from './runtime/types.js';
+import type { AgentConcurrency, NestedWorkflows, ReasoningEffort, Verbosity, WorktreeRetention } from './runtime/types.js';
+import { NESTED_WORKFLOWS_VALUES, REASONING_EFFORTS, WORKTREE_RETENTIONS, isAgentConcurrencyKeyword, isNestedWorkflows, isReasoningEffort, isWorktreeRetention } from './runtime/types.js';
 
 export { isReasoningEffort };
 
@@ -18,6 +18,7 @@ export interface UltracodeSettings {
     readonly heartbeatMs: number;
     readonly worktreeRetention: WorktreeRetention;
     readonly agentConcurrency: AgentConcurrency;
+    readonly nestedWorkflows: NestedWorkflows;
     readonly background: {
       readonly runDir: string;
       readonly resultFile: string;
@@ -91,6 +92,10 @@ export function loadSettings(): UltracodeSettings {
         workflow?.agentConcurrency,
         'workflow.agentConcurrency',
       ),
+      nestedWorkflows: readNestedWorkflowsSetting(
+        workflow?.nestedWorkflows,
+        'workflow.nestedWorkflows',
+      ),
       background: {
         runDir: readTemplateSetting(
           background?.runDir,
@@ -161,6 +166,10 @@ export function workflowDefaultAgentConcurrency(): AgentConcurrency {
   return loadSettings().workflow.agentConcurrency;
 }
 
+export function workflowDefaultNestedWorkflows(): NestedWorkflows {
+  return loadSettings().workflow.nestedWorkflows;
+}
+
 export function workflowBackgroundDefaults(): UltracodeSettings['workflow']['background'] {
   return loadSettings().workflow.background;
 }
@@ -219,6 +228,17 @@ function readWorktreeRetentionSetting(
 ): WorktreeRetention {
   if (isWorktreeRetention(value)) return value;
   throw new Error(`${key} must be one of ${WORKTREE_RETENTIONS.join(', ')}.`);
+}
+
+// Omitted defaults to 'disabled' so an existing settings.json without this key keeps nested
+// workflow() off (byte-identical to before the feature) rather than failing to load.
+function readNestedWorkflowsSetting(
+  value: unknown,
+  key: string,
+): NestedWorkflows {
+  if (value === undefined) return 'disabled';
+  if (isNestedWorkflows(value)) return value;
+  throw new Error(`${key} must be one of ${NESTED_WORKFLOWS_VALUES.join(', ')}.`);
 }
 
 function readAgentConcurrencySetting(

@@ -852,6 +852,255 @@ test('parallel() and pipeline() reject more than 4096 items with an explicit err
   }
 });
 
+test('workflow() runs an inline child and returns its result (N1)', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { nestedWorkflows: 'enabled' } });
+  try {
+    const childScript = 'export const meta = { name: "child" };\nreturn await agent("from child");';
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "parent" };
+const childResult = await workflow({ script: ${JSON.stringify(childScript)} });
+const own = await agent("from parent");
+return { childResult, own };`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    assert.deepEqual(jsonValue(runtime.get(launch.taskId).result), {
+      childResult: 'RAW:from child',
+      own: 'RAW:from parent',
+    });
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow() rejects an unknown name and a bad ref, catchably (N1 negative, C5f)', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { nestedWorkflows: 'enabled' } });
+  try {
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "parent" };
+const outcomes = [];
+try { await workflow("no-such-builtin"); outcomes.push("no-throw"); } catch (e) { outcomes.push("unknown-threw"); }
+try { await workflow(42); outcomes.push("no-throw"); } catch (e) { outcomes.push("badref-threw"); }
+try { await workflow({ script: "this is ) not valid js" }); outcomes.push("no-throw"); } catch (e) { outcomes.push("syntax-threw"); }
+return outcomes;`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    // All three reject, and the parent catches each — the run still completes (C5f catchable).
+    assert.deepEqual(jsonValue(runtime.get(launch.taskId).result), ['unknown-threw', 'badref-threw', 'syntax-threw']);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a nested child shares the parent token budget (N2, C5d)', async () => {
+  // Each fake agent spends outputTokens=2. spent() reads the shared ctx.outputTokens, so the
+  // child's agent must advance it — if the child had a fresh budget, s2 would equal s1.
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { nestedWorkflows: 'enabled' } });
+  try {
+    const childScript = 'export const meta = { name: "child" };\nreturn await agent("c0");';
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "parent" };
+await agent("p0");
+const s1 = budget.spent();
+await workflow({ script: ${JSON.stringify(childScript)} });
+const s2 = budget.spent();
+return { s1, s2 };`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    assert.deepEqual(jsonValue(runtime.get(launch.taskId).result), { s1: 2, s2: 4 });
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow() cannot be nested more than one level (N3, C5e)', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { nestedWorkflows: 'enabled' } });
+  try {
+    const grandchild = 'export const meta = { name: "gc" };\nreturn 1;';
+    const child = `export const meta = { name: "child" };\nreturn await workflow({ script: ${JSON.stringify(grandchild)} });`;
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "parent" };
+let outcome = "no-throw";
+try { await workflow({ script: ${JSON.stringify(child)} }); }
+catch (e) { outcome = "threw:" + String(e && e.message ? e.message : e); }
+return outcome;`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    const result = jsonValue(runtime.get(launch.taskId).result);
+    assert.match(result, /nested more than one level/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a nested run journals exactly one run.started with child agents on the parent chain (N5)', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { nestedWorkflows: 'enabled' } });
+  try {
+    const childScript = 'export const meta = { name: "child" };\nawait agent("c0");\nreturn await agent("c1");';
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "parent" };
+await agent("p0");
+await workflow({ script: ${JSON.stringify(childScript)} });
+return "done";`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    const journal = await readWorkflowJournal(workflowJournalPath(snapshot.transcriptDir));
+    const kinds = journal.entries.map((entry) => entry.kind);
+    assert.equal(kinds.filter((k) => k === 'workflow.run.started').length, 1);
+    assert.equal(kinds.filter((k) => k === 'workflow.run.completed').length, 1);
+    // 3 agents total (p0 + child c0 + child c1) all on the single chain; validateWorkflowJournal
+    // ran inside readWorkflowJournal without throwing, proving the chain is intact single-run.
+    assert.equal(kinds.filter((k) => k === 'workflow.agent.completed').length, 3);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('logical agent keys share one run-global namespace across parent and child (N6)', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { nestedWorkflows: 'enabled' } });
+  try {
+    const childScript = 'export const meta = { name: "child" };\nreturn await agent("c", { key: "x" });';
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "parent" };
+await agent("p", { key: "x" });
+await workflow({ script: ${JSON.stringify(childScript)} });
+return "done";`,
+    });
+    const events = await collectEvents(runtime, launch.taskId);
+    // The child reusing the parent's logical key throws (shared namespace) → child fails →
+    // the un-caught workflow() rejection fails the run.
+    assert.equal(events.at(-1).type, 'workflow.failed');
+    assert.match(runtime.get(launch.taskId).error, /key "x" was already used/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('nested workflow() is default-off and throws the unsupported stub (N7)', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend() });
+  try {
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "parent" };
+let outcome = "no-throw";
+try { await workflow({ script: "export const meta = { name: 'c' };\\nreturn 1;" }); }
+catch (e) { outcome = "threw:" + String(e && e.message ? e.message : e); }
+return outcome;`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    assert.match(jsonValue(runtime.get(launch.taskId).result), /not supported/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('resume replays a nested run from the shared chain and re-runs only the diverged tail (N4)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend, runtimeOptions: { nestedWorkflows: 'enabled' } });
+  try {
+    // The child's second agent prompt depends on the child's args, which the parent derives
+    // from ITS args — so changing the parent's args on resume changes exactly that one child
+    // agent's call key. p0 and c0 are args-independent and must replay from cache.
+    const childScript = 'export const meta = { name: "child" };\nawait agent("c0");\nreturn await agent("c1:" + args.tag);';
+    const script = `export const meta = { name: "nested-resume" };
+await agent("p0");
+const c = await workflow({ script: ${JSON.stringify(childScript)} }, { tag: args.tag });
+return c;`;
+
+    const first = await runtime.launch({ script, args: { tag: 'v1' } });
+    await collectEvents(runtime, first.taskId);
+    assert.equal(jsonValue(runtime.get(first.taskId).result), 'RAW:c1:v1');
+    assert.equal(backend.requests.length, 3); // p0, c0, c1:v1
+
+    // Identical resume → 100% cache hit, zero new backend calls.
+    const resumedSame = await runtime.launch({ resumeFromRunId: first.runId, args: { tag: 'v1' } });
+    const sameEvents = await collectEvents(runtime, resumedSame.taskId);
+    assert.equal(jsonValue(runtime.get(resumedSame.taskId).result), 'RAW:c1:v1');
+    const sameCompletions = sameEvents.filter((e) => e.type === 'workflow.agent.completed');
+    assert.equal(sameCompletions.length, 3);
+    assert.equal(sameCompletions.every((e) => e.cached === true), true);
+    assert.equal(backend.requests.length, 3);
+
+    // Change the parent's args → only the child's c1 diverges; p0 and c0 stay cached, exactly
+    // one new backend call runs (the diverged tail).
+    const resumedDiverged = await runtime.launch({ resumeFromRunId: first.runId, args: { tag: 'v2' } });
+    const divergedEvents = await collectEvents(runtime, resumedDiverged.taskId);
+    assert.equal(jsonValue(runtime.get(resumedDiverged.taskId).result), 'RAW:c1:v2');
+    const divergedCompletions = divergedEvents.filter((e) => e.type === 'workflow.agent.completed');
+    assert.equal(divergedCompletions.filter((e) => e.cached === true).length, 2); // p0, c0
+    assert.equal(divergedCompletions.filter((e) => e.cached !== true).length, 1); // c1:v2
+    assert.equal(backend.requests.length, 4);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a parent structured agent after a nested child returns a usable object (toVmValue restore)', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { nestedWorkflows: 'enabled' } });
+  try {
+    const childScript = 'export const meta = { name: "child" };\nreturn await agent("c0");';
+    const schema = {
+      type: 'object',
+      additionalProperties: false,
+      required: ['detail', 'count'],
+      properties: { detail: { type: 'string' }, count: { type: 'number' } },
+    };
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "parent" };
+await workflow({ script: ${JSON.stringify(childScript)} });
+const r = await agent("structured please", { schema: ${JSON.stringify(schema)} });
+// The projector is restored to the parent after the child, so this structured object is a
+// parent-realm value: property access + arithmetic must work on it.
+return { detail: r.detail, doubled: r.count * 2 };`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    assert.deepEqual(jsonValue(runtime.get(launch.taskId).result), { detail: 'structured', doubled: 4 });
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow(name) resolves a built-in child by name (C5a)', async () => {
+  const greet = { name: 'greet', script: 'export const meta = { name: "greet" };\nreturn await agent("hi from greet");' };
+  const { runtime } = await createRuntime({
+    backend: new FakeSubagentBackend(),
+    runtimeOptions: { nestedWorkflows: 'enabled', builtinWorkflows: [greet] },
+  });
+  try {
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "parent" };
+return await workflow("greet");`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    assert.equal(jsonValue(runtime.get(launch.taskId).result), 'RAW:hi from greet');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('concurrent nested workflow() rejects the second child (N9, sequential-only v1 limit)', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { nestedWorkflows: 'enabled' } });
+  try {
+    const a = 'export const meta = { name: "a" };\nreturn "A";';
+    const b = 'export const meta = { name: "b" };\nreturn "B";';
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "parent" };
+return await parallel([
+  () => workflow({ script: ${JSON.stringify(a)} }),
+  () => workflow({ script: ${JSON.stringify(b)} }),
+]);`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    // One child runs; the concurrent sibling hits the in-flight guard, throws, and parallel()
+    // converts the rejection to null. Without the guard both would run (no null).
+    const result = jsonValue(runtime.get(launch.taskId).result);
+    assert.equal(result.filter((x) => x !== null).length, 1);
+    assert.equal(result.filter((x) => x === null).length, 1);
+  } finally {
+    await runtime.close();
+  }
+});
+
 test('workspaceContext includeDiff returns deterministic change evidence refs', async () => {
   const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend() });
   try {
@@ -2184,6 +2433,8 @@ async function createRuntime({ backend, runtimeOptions = {} }) {
       worktreeRetention: runtimeOptions.worktreeRetention,
       agentConcurrency: runtimeOptions.agentConcurrency,
       budgetTotal: runtimeOptions.budgetTotal,
+      nestedWorkflows: runtimeOptions.nestedWorkflows,
+      builtinWorkflows: runtimeOptions.builtinWorkflows,
       journalDurability: runtimeOptions.journalDurability,
     }),
   };

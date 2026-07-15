@@ -10,6 +10,22 @@ the project uses [semantic versioning](https://semver.org/).
 
 ### Added
 
+- `workflow.nestedWorkflows` (`--nested-workflows`): opt-in support for a workflow
+  script calling `workflow(nameOrRef, args?)` to run another workflow inline as a
+  child. `disabled` (the default) keeps the previous throwing stub, so existing
+  behavior is byte-identical. When `enabled`, a workflow may nest a **built-in**
+  workflow by name or an **inline** child via `{ script }`; the child shares the
+  parent run's concurrency pool, agent counter, token budget, abort signal, and
+  journal, its agents render under a `▸ name` group, and it returns its result to
+  the caller. `workflow()` inside a child throws (one level only). Nesting is
+  resumable: the child's agents journal onto the parent's single call-key chain, so
+  an unchanged resume is a full cache hit and a changed child re-runs only from the
+  diverged call. v1 limits: nested children run **sequentially** (a second `workflow()`
+  started while another child is in flight is rejected), a nested child does not announce
+  a progress plan, and — like `--budget` — the flag is **not inherited on resume**, so
+  re-pass `--nested-workflows` when resuming a nested run. Project/user/plugin and
+  `{ scriptPath }` children are deferred behind the permission gate. See
+  `docs/ultracode-p5-nested-workflow.md`.
 - `workflow.agentConcurrency` (`--agent-concurrency`): bound the number of agent
   dispatches running concurrently within a single workflow run. `unbounded` (the
   default) applies no pool and preserves current behavior; `auto` derives a size
