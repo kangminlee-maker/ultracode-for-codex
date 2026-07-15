@@ -8,6 +8,8 @@ the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-15
+
 ### Added
 
 - Edit-and-iterate DX (PG-ITER). **(a)** Every run now surfaces where its script was
