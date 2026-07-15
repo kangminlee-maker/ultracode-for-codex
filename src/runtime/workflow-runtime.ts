@@ -6,7 +6,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { promisify } from 'node:util';
 import { createContext, runInContext } from 'node:vm';
 import type { AgentConcurrency, ReasoningEffort, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
-import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort } from './types.js';
+import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort, isSubagentFailure } from './types.js';
 import { AgentConcurrencyPool } from './agent-concurrency-pool.js';
 import {
   WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
@@ -563,6 +563,7 @@ const WORKFLOW_STABLE_FAILURE_CODES = new Set([
   'runtime_closed',
   'workflow_aborted',
   'workflow_agent_failed',
+  'workflow_agent_terminal',
   'workflow_agent_stalled',
   'workflow_input_invalid',
   'workflow_meta_invalid',
@@ -3278,6 +3279,16 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       // uncoded throw in workflow script code -- so any downstream classifier has to guess
       // transient-vs-deterministic from the shape of the error, and guesses wrong. Code the
       // failure here, at the boundary it crosses, so classification never has to infer it.
+      if (isSubagentFailure(outcome.error) && !outcome.error.recognized) {
+        // A failure the taxonomy did not recognize defaults to retryable; surface it so a
+        // codex variant renamed upstream cannot degrade into "retry forever" unseen.
+        this.emit(ctx.task, {
+          type: 'workflow.log',
+          taskId: ctx.task.taskId,
+          runId: ctx.task.runId,
+          message: `unclassified backend failure (variant: ${outcome.error.variant ?? 'none'}); treated as ${outcome.error.kind} and retryable.`,
+        });
+      }
       throw codedAgentFailure(outcome.error);
     } finally {
       if (timer) clearTimeout(timer);
@@ -6668,9 +6679,23 @@ function workflowAgentStalledError(message: string): UltracodeRequestError {
   return new UltracodeRequestError(message, 408, 'invalid_request_error', WORKFLOW_INPUT_PARAM, 'workflow_agent_stalled');
 }
 
-// Give an uncoded backend failure its canonical, retryable code. An error that already
-// carries one (a stall, an aborted workflow) keeps it.
+// Give a backend failure its canonical workflow code. A classified SubagentFailure maps
+// by kind: `terminal` becomes the non-retryable `workflow_agent_terminal` so a failure
+// retrying cannot fix (auth, bad request, config) is not retried to exhaustion; every
+// other kind becomes the retryable `workflow_agent_failed`, preserving today's behavior.
+// An uncoded backend Error also becomes `workflow_agent_failed`; an error already
+// carrying a stable code (a stall, an aborted workflow) keeps it.
 function codedAgentFailure(err: unknown): unknown {
+  if (isSubagentFailure(err)) {
+    const terminal = err.kind === 'terminal';
+    return new UltracodeRequestError(
+      err.message,
+      terminal ? 403 : 502,
+      'invalid_request_error',
+      WORKFLOW_INPUT_PARAM,
+      terminal ? 'workflow_agent_terminal' : 'workflow_agent_failed',
+    );
+  }
   if (workflowFailureReason(err) !== 'workflow_failed') return err;
   return new UltracodeRequestError(
     workflowErrorMessage(err),

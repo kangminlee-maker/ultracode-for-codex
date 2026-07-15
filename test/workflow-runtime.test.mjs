@@ -6,6 +6,7 @@ import { delimiter, dirname, join } from 'node:path';
 import { afterEach, test } from 'node:test';
 import { promisify } from 'node:util';
 import { WorkflowTaskRegistry, isRetryableFailureReason } from '../dist/runtime/workflow-runtime.js';
+import { SubagentFailure } from '../dist/runtime/types.js';
 import {
   WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
   computeWorkflowAgentCallKey,
@@ -1765,6 +1766,69 @@ test('agentConcurrency holds the permit until the real dispatch settles, not the
     assert.equal(snapshot.result, 'ok-2', 'the stall retry should have produced the second dispatch');
     assert.equal(backend.calls, 2, 'attempt 1 stalled and attempt 2 retried');
     assert.equal(backend.maxLive, 1, 'permit must be held until the real dispatch settles; releasing on the abort race would allow 2');
+  } finally {
+    await runtime.close();
+  }
+});
+
+class ClassifiedFailureBackend {
+  name = 'classified-failure';
+  model = 'fake-model';
+  constructor(failure) { this.failure = failure; }
+  async generate() { throw this.failure; }
+  async close() {}
+}
+
+test('a terminal backend failure fails the workflow non-retryably (DW-C2)', async () => {
+  const backend = new ClassifiedFailureBackend(new SubagentFailure('you are not authorized', 'terminal', 'unauthorized', true));
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "terminal-failure" };\nreturn await agent("go");',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.equal(snapshot.failureReason, 'workflow_agent_terminal');
+    assert.equal(isRetryableFailureReason(snapshot.failureReason), false, 'a terminal backend failure must not be retryable');
+    // The provider message survives classification (no JSON.stringify flattening).
+    assert.match(snapshot.error, /you are not authorized/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a transient backend failure stays retryable, preserving current behavior (DW-C2 contrast)', async () => {
+  const backend = new ClassifiedFailureBackend(new SubagentFailure('server overloaded', 'transient', 'serverOverloaded', true));
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "transient-failure" };\nreturn await agent("go");',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.equal(snapshot.failureReason, 'workflow_agent_failed');
+    assert.equal(isRetryableFailureReason(snapshot.failureReason), true, 'a transient backend failure stays retryable');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('an unclassified backend failure emits an observability log and stays retryable (DW-C6)', async () => {
+  const backend = new ClassifiedFailureBackend(new SubagentFailure('mystery', 'transient', 'someFutureVariant', false));
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "unclassified-failure" };\nreturn await agent("go");',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.equal(snapshot.failureReason, 'workflow_agent_failed');
+    const logged = snapshot.events.some((event) =>
+      event.type === 'workflow.log' && /unclassified backend failure \(variant: someFutureVariant\)/.test(event.message));
+    assert.ok(logged, 'an unrecognized failure variant must surface a distinguishable log');
   } finally {
     await runtime.close();
   }

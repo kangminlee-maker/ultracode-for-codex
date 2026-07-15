@@ -92,6 +92,34 @@ export interface SubagentBackend {
   close(): Promise<void>;
 }
 
+// Backend-neutral classification of a subagent dispatch failure. The codex backend
+// derives it from the provider's structured error at the boundary; the runtime maps it
+// to a stable workflow failure code without ever learning codex-specific vocabulary.
+// `terminal` retrying cannot fix (auth, bad request, config); `transient` and
+// `rate_limited` are retryable. `rate_limited` is distinguished for observability and
+// future backoff even though it currently shares `transient`'s retryable code.
+export type SubagentFailureKind = 'terminal' | 'transient' | 'rate_limited';
+
+export class SubagentFailure extends Error {
+  constructor(
+    message: string,
+    readonly kind: SubagentFailureKind,
+    // The provider wire variant that produced this kind, or undefined when the failure
+    // carried no structured error. `recognized` is false when the variant fell through
+    // to the default bucket (an unknown/other variant, or none) so the runtime can
+    // surface a silent-degradation signal instead of retrying forever in the dark.
+    readonly variant?: string,
+    readonly recognized: boolean = true,
+  ) {
+    super(message);
+    this.name = 'SubagentFailure';
+  }
+}
+
+export function isSubagentFailure(err: unknown): err is SubagentFailure {
+  return err instanceof SubagentFailure;
+}
+
 export class UltracodeRequestError extends Error {
   constructor(
     message: string,

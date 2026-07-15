@@ -10,6 +10,24 @@ the project uses [semantic versioning](https://semver.org/).
 
 ### Added
 
+- `workflow.agentConcurrency` (`--agent-concurrency`): bound the number of agent
+  dispatches running concurrently within a single workflow run. `unbounded` (the
+  default) applies no pool and preserves current behavior; `auto` derives a size
+  from available CPUs (`min(16, cores - 2)`); a positive integer pins it. Exposed
+  to workflow scripts as `budget.agentConcurrency` (`budget.maxParallelism` still
+  reports the `parallel()`/`pipeline()` item bound). The permit is held for the
+  real dispatch's full lifetime, so an aborted or stalled agent cannot let a retry
+  over-subscribe the pool.
+- Backend failures are now classified `terminal`, `transient`, or `rate_limited`
+  at the boundary from the codex turn error, instead of being flattened into an
+  opaque message. A `terminal` failure (auth, bad request, context-window, sandbox,
+  and similar) fails with the non-retryable `workflow_agent_terminal` reason and is
+  no longer retried; transient and rate-limited failures keep the retryable
+  `workflow_agent_failed` reason. A failure whose variant is not recognized defaults
+  to retryable and emits a distinguishable log, so a renamed provider variant cannot
+  degrade into silent infinite retry. A `turn/completed` with a non-`completed`
+  status (for example `interrupted`) is now treated as a failure rather than an
+  empty successful turn.
 - `workflow.worktreeRetention` (`--worktree-retention`): a completed
   `isolation: "worktree"` agent's worktree is now reclaimed when it holds no real
   changes, matching native `isolation` semantics. Cleanliness is decided by

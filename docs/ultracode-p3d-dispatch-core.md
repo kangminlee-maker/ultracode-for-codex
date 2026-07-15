@@ -18,6 +18,8 @@ Blocker 2 (permit release decoupled from real backend completion) is an **A** de
 
 The rest of this document keeps the full three-part analysis because A, B, and C were derived together and B's §4B is the input to p3e. Sections scoped out of implementation are marked **[→ p3e]**.
 
+**Landed 2026-07-15.** A shipped in `ced1971` (default-off pool). C shipped as classification only: backend maps the codex turn error → `SubagentFailureKind` (`src/codex/turn-failure.ts`, allowlist pinned to the fixture), throws a `SubagentFailure`; the runtime's `codedAgentFailure` maps the kind → stable code (`terminal` → new non-retryable `workflow_agent_terminal`; else the existing retryable `workflow_agent_failed`) and emits an observability log for an unrecognized variant; `turn/completed` status handling is now exhaustive. **Backoff and a backend-attempt retry loop are deliberately NOT in C** — the P0 (stop retrying terminal) needs no new loop (the existing CLI retry gate keys on the code), and adding backoff opens the retry-ownership/multiplication question the code/execution lens flagged; it is its own follow-up. Not adding backoff is not a regression: non-terminal failures keep today's immediate-retry behavior exactly. Other backend exits (RPC timeout, close, wait timeout) remain uncoded → `workflow_agent_failed` (retryable), which is the correct classification for those transient/operational failures; deterministic launch-time `prepare()`/model-validation classification is a tracked follow-up.
+
 ---
 
 ## 1. Measured background
