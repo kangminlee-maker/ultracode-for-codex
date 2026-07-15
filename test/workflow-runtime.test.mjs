@@ -1880,6 +1880,147 @@ test('an unclassified backend failure emits an observability log and stays retry
   }
 });
 
+test('budget is inert and enumeration-identical whether or not a ceiling is set (DW-B1)', async () => {
+  // The sandbox exposes no Object, so a script can only observe budget's keys via for-in
+  // (or spread) — both of which see own-enumerable properties, so this is the real test of
+  // whether total/spent/remaining stay hidden.
+  const script = `export const meta = { name: "budget-shape" };
+const keys = [];
+for (const key in budget) keys.push(key);
+return { keys, total: budget.total, remainingIsInfinity: budget.remaining() === Infinity, spent: budget.spent() };`;
+  const expectedKeys = ['maxAgentCalls', 'maxParallelism', 'agentConcurrency', 'agentStallTimeoutMs', 'agentStallRetryLimit'];
+
+  const off = await createRuntime({ backend: new FakeSubagentBackend() });
+  try {
+    const launch = await off.runtime.launch({ script });
+    await collectEvents(off.runtime, launch.taskId);
+    const result = jsonValue(off.runtime.get(launch.taskId).result);
+    assert.deepEqual(result.keys, expectedKeys);
+    assert.equal(result.total, null);
+    assert.equal(result.remainingIsInfinity, true);
+    assert.equal(result.spent, 0);
+  } finally {
+    await off.runtime.close();
+  }
+
+  const on = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { budgetTotal: 500 } });
+  try {
+    const launch = await on.runtime.launch({ script });
+    await collectEvents(on.runtime, launch.taskId);
+    const result = jsonValue(on.runtime.get(launch.taskId).result);
+    // total/spent/remaining are non-enumerable, so the key set is byte-identical when on.
+    assert.deepEqual(result.keys, expectedKeys);
+    assert.equal(result.total, 500);
+    assert.equal(result.remainingIsInfinity, false);
+    assert.equal(result.spent, 0);
+  } finally {
+    await on.runtime.close();
+  }
+});
+
+test('an output-token budget refuses further agent dispatch once exhausted (DW-B2)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend, runtimeOptions: { budgetTotal: 3 } });
+  try {
+    // Each fake agent spends outputTokens=2. total=3: agent0 (spent 0->2), agent1 (2->4),
+    // agent2 is refused pre-dispatch because spent 4 >= 3.
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "budget-ceiling" };
+const out = [];
+for (let i = 0; i < 5; i += 1) out.push(await agent("agent " + i));
+return out.length;`,
+    });
+    const events = await collectEvents(runtime, launch.taskId);
+    assert.equal(events.at(-1).type, 'workflow.failed');
+    assert.equal(events.at(-1).recovery.reason, 'workflow_input_invalid');
+    assert.equal(events.at(-1).recovery.retryable, false);
+    assert.equal(isRetryableFailureReason('workflow_input_invalid'), false);
+    assert.equal(backend.requests.length, 2, 'the exhausting agent is refused before it reaches the backend');
+    assert.match(runtime.get(launch.taskId).error, /budget exhausted/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a budget larger than the run never throws (DW-B2 negative control)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend, runtimeOptions: { budgetTotal: 1000 } });
+  try {
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "budget-headroom" };
+const out = [];
+for (let i = 0; i < 5; i += 1) out.push(await agent("agent " + i));
+return out.length;`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    assert.equal(jsonValue(snapshot.result), 5);
+    assert.equal(backend.requests.length, 5);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('spent() counts this run only; cached agents contribute 0 on resume (DW-B3)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const script = `export const meta = { name: "budget-per-run" };
+await agent("solo");
+return budget.spent();`;
+    const first = await runtime.launch({ script });
+    await collectEvents(runtime, first.taskId);
+    assert.equal(jsonValue(runtime.get(first.taskId).result), 2, 'fresh run: one agent spent 2 output tokens');
+    assert.equal(backend.requests.length, 1);
+
+    const resumed = await runtime.launch({ resumeFromRunId: first.runId });
+    const events = await collectEvents(runtime, resumed.taskId);
+    const completions = events.filter((event) => event.type === 'workflow.agent.completed');
+    assert.equal(completions.length, 1);
+    assert.equal(completions.every((event) => event.cached === true), true, 'the resumed agent must be a cache hit (cardinality > 0)');
+    assert.equal(jsonValue(runtime.get(resumed.taskId).result), 0, 'per-run semantics: a cached agent contributes 0 to spent()');
+    assert.equal(backend.requests.length, 1, 'no re-dispatch on resume');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('an exhausted budget inside parallel() becomes a per-item null, not a run failure (G-B2)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend, runtimeOptions: { budgetTotal: 3 } });
+  try {
+    // Two sequential agents spend to 4 >= 3; the parallel batch is then all refused, and
+    // parallel() converts each per-item throw to null instead of failing the run.
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "budget-parallel-null" };
+await agent("warm 0");
+await agent("warm 1");
+return await parallel([() => agent("p0"), () => agent("p1")]);`,
+    });
+    const events = await collectEvents(runtime, launch.taskId);
+    assert.equal(events.at(-1).type, 'workflow.completed');
+    assert.deepEqual(jsonValue(runtime.get(launch.taskId).result), [null, null]);
+    assert.equal(backend.requests.length, 2, 'only the two warm-up agents reach the backend');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('the registry rejects an invalid budgetTotal at its boundary, like agentConcurrency', () => {
+  const backend = new FakeSubagentBackend();
+  for (const bad of [-1, 0, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(
+      () => new WorkflowTaskRegistry({ backend, requestTimeoutMs: 30_000, budgetTotal: bad }),
+      /budgetTotal must be/,
+      `registry should reject budgetTotal ${String(bad)}`,
+    );
+  }
+  for (const ok of [null, undefined, 1, 500000]) {
+    assert.doesNotThrow(() => new WorkflowTaskRegistry({ backend, requestTimeoutMs: 30_000, budgetTotal: ok }));
+  }
+});
+
 
 
 
@@ -1903,6 +2044,7 @@ async function createRuntime({ backend, runtimeOptions = {} }) {
       heartbeatMs: runtimeOptions.heartbeatMs,
       worktreeRetention: runtimeOptions.worktreeRetention,
       agentConcurrency: runtimeOptions.agentConcurrency,
+      budgetTotal: runtimeOptions.budgetTotal,
       journalDurability: runtimeOptions.journalDurability,
     }),
   };

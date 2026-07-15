@@ -18,6 +18,18 @@ the project uses [semantic versioning](https://semver.org/).
   reports the `parallel()`/`pipeline()` item bound). The permit is held for the
   real dispatch's full lifetime, so an aborted or stalled agent cannot let a retry
   over-subscribe the pool.
+- `--budget <N|Nk|Nm>`: an optional per-run output-token ceiling (with an optional
+  `+`, and `k`/`m` = ×1e3/×1e6). Once a run's successful-agent output tokens reach
+  it, `agent()` refuses to launch a further dispatch (a non-retryable
+  `workflow_input_invalid`; inside `parallel()`/`pipeline()` the refused item resolves
+  to `null`). Workflow scripts read `budget.total`, `budget.spent()`, and
+  `budget.remaining()` to self-pace (e.g. `while (budget.remaining() > N)`); these are
+  non-enumerable, so a run with no budget is byte-identical to before. Per-run and
+  best-effort by design: it counts successful-agent output tokens only
+  (stall/validation-failed spend is not counted), it is soft under concurrency (agents
+  admitted before a sibling exhausts the ceiling still dispatch), and it is **not
+  inherited on resume** — a `--resume-from-run-id` invocation that omits `--budget`
+  runs uncapped, so re-pass the flag. An output-token guardrail, not a hard cost cap.
 - Backend failures are now classified `terminal`, `transient`, or `rate_limited`
   at the boundary from the codex turn error, instead of being flattened into an
   opaque message. A `terminal` failure (auth, bad request, context-window, sandbox,

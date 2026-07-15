@@ -110,6 +110,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   // child would surface as an empty result record and an unknown early exit.
   const worktreeRetention = parseWorktreeRetention(options.worktreeRetention);
   const agentConcurrency = parseAgentConcurrency(options.agentConcurrency);
+  const budgetTotal = parseBudget(options.budget);
   if (executionMode === 'background') {
     const input = await inputPromise;
     if (input.resumeFromRunId) await assertBackgroundResumeSource(cwd, input.resumeFromRunId);
@@ -141,6 +142,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
     heartbeatMs,
     worktreeRetention,
     agentConcurrency,
+    budgetTotal,
   });
 
   try {
@@ -261,6 +263,7 @@ interface ParsedOptions {
   readonly retryLimit?: string;
   readonly worktreeRetention?: string;
   readonly agentConcurrency?: string;
+  readonly budget?: string;
   readonly jobId?: string;
   readonly metadataPath?: string;
   readonly resultPath?: string;
@@ -2037,6 +2040,21 @@ function parseAgentConcurrency(value: string | undefined): AgentConcurrency {
   throw new Error("agent-concurrency must be 'unbounded', 'auto', or a positive integer.");
 }
 
+export function parseBudget(value: string | undefined): number | null {
+  if (value === undefined) return null;
+  // Strict positive-integer parse with an optional +, and a k(×1e3)/m(×1e6) suffix:
+  // '500000', '500k', '+500k'. Reject '500kb', '5e2k', '0', '-1', '12x'. The safe-integer
+  // bound is load-bearing: without it a long digit string parses to Infinity and the ceiling
+  // silently never fires (spent >= Infinity is never true).
+  const match = /^\+?([0-9]+)([km])?$/.exec(value);
+  if (match) {
+    const mult = match[2] === 'k' ? 1_000 : match[2] === 'm' ? 1_000_000 : 1;
+    const total = Number(match[1]) * mult;
+    if (Number.isSafeInteger(total) && total >= 1) return total;
+  }
+  throw new Error('budget must be a positive integer of output tokens, optionally with a k or m suffix (e.g. 500000, 500k, +500k).');
+}
+
 function parsePermissionPolicy(value: string | undefined): PermissionPolicy {
   if (value === undefined) return workflowDefaultPermissionPolicy();
   if (isWorkflowPermissionPolicy(value)) return value;
@@ -2105,6 +2123,7 @@ Options:
   --retry-limit <number>             Retry failed workflows in the same process. Default: settings.json (${workflowDefaultRetryLimit()}).
   --worktree-retention <preserve-all|remove-clean>  Reclaim unchanged completed isolated worktrees. Default: settings.json (${workflowDefaultWorktreeRetention()}).
   --agent-concurrency <unbounded|auto|N>  Bound concurrent agent dispatches per run. 'auto' = min(16, cores-2). Default: settings.json (${String(workflowDefaultAgentConcurrency())}).
+  --budget <N|Nk|Nm>                 Per-run output-token ceiling (optional +, k=×1e3, m=×1e6); agent() refuses to launch once budget.spent() reaches it. Off by default. Not inherited on resume: re-pass --budget or the resumed run is uncapped. Counts successful-agent output tokens only; best-effort under concurrency.
   --progress <jsonl|plain>           Progress format on stderr. Default: settings.json (${workflowDefaultProgressMode()}).
   --execution <background|attached>  Execution mode. Default: settings.json (${workflowDefaultExecutionMode()}).
   --command <path>                   Override Codex CLI binary path.

@@ -342,6 +342,9 @@ interface WorkflowRunContext {
   readonly usedLogicalKeys: Set<string>;
   // One permit pool per run bounds concurrent agent dispatches. Undefined = unbounded.
   readonly agentPool?: AgentConcurrencyPool;
+  // Per-run output-token ceiling, or null when unset (inert). budget.spent()/remaining()
+  // and the pre-dispatch ceiling read it; counts this run's fresh spend only (cached = 0).
+  readonly budgetTotal: number | null;
   currentPhase?: string;
   announcedPlan?: WorkflowExecutionPlan;
   pendingPhasePlan?: WorkflowPlanPhase;
@@ -351,6 +354,9 @@ interface WorkflowRunContext {
 interface WorkflowVmGlobals {
   readonly argsLiteral: string;
   readonly budgetLiteral: string;
+  // The run's output-token ceiling as a JSON literal ('null' when unset). Defined as a
+  // non-enumerable budget.total so the budget key set is byte-identical whether set or not.
+  readonly budgetTotalLiteral: string;
   readonly host: Record<string, unknown>;
   readonly setVmValueProjector: (projector: (value: unknown) => unknown) => void;
 }
@@ -389,6 +395,8 @@ interface WorkflowTaskRegistryOptions {
   // Bound on concurrent agent dispatches per run. Omitted or 'unbounded' applies no
   // pool (current behavior). 'auto' derives a size from CPUs; a positive integer pins it.
   readonly agentConcurrency?: AgentConcurrency;
+  // Per-run output-token ceiling. Omitted or null = inert (no ceiling, remaining() Infinity).
+  readonly budgetTotal?: number | null;
   readonly userWorkflowDirs?: readonly string[];
   readonly pluginWorkflows?: readonly WorkflowPluginRegistry[];
   readonly builtinWorkflows?: readonly BuiltinWorkflow[];
@@ -1680,6 +1688,8 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   // Resolved agent-dispatch pool size, or null for unbounded (no pool). Computed once:
   // availableParallelism() is stable for the process lifetime.
   private readonly agentConcurrency: number | null;
+  // Per-run output-token ceiling, or null when unset (inert). Parsed by the CLI/caller.
+  private readonly budgetTotal: number | null;
 
   constructor(private readonly options: WorkflowTaskRegistryOptions) {
     this.stateDir = options.stateDir ?? defaultWorkflowStateDir(options.cwd ?? process.cwd());
@@ -1691,6 +1701,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     this.heartbeatMs = normalizeHeartbeatMs(options.heartbeatMs);
     this.worktreeRetention = options.worktreeRetention ?? 'remove-clean';
     this.agentConcurrency = resolveAgentConcurrency(options.agentConcurrency);
+    this.budgetTotal = resolveBudgetTotal(options.budgetTotal);
   }
 
   async launch(input: WorkflowLaunchInput): Promise<WorkflowLaunchResult> {
@@ -2662,6 +2673,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       nextTimerId: 1,
       previousAgentCallKey: WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
       usedLogicalKeys: new Set(),
+      budgetTotal: this.budgetTotal,
       ...(this.agentConcurrency != null ? { agentPool: new AgentConcurrencyPool(this.agentConcurrency) } : {}),
     };
     task.controller = controller;
@@ -2803,6 +2815,12 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     host.workflow = hardenCallable((): never => {
       throw workflowInputError('Nested workflow calls are not supported by this runtime yet.');
     });
+    // Per-run output spend gauge. spent() = this run's fresh successful-agent output tokens
+    // (cached agents contribute 0, matching the journaled per-run cost); remaining() is
+    // Infinity when no ceiling is set, so an unset budget is inert.
+    host.spent = hardenCallable((): number => ctx.outputTokens);
+    host.remaining = hardenCallable((): number =>
+      ctx.budgetTotal == null ? Infinity : Math.max(0, ctx.budgetTotal - ctx.outputTokens));
     host.setTimeout = workflowSetTimeout;
     host.clearTimeout = workflowClearTimeout;
     return {
@@ -2816,6 +2834,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         agentStallTimeoutMs: this.agentStallTimeoutMs,
         agentStallRetryLimit: this.agentStallRetryLimit,
       }, 'budget'),
+      budgetTotalLiteral: ctx.budgetTotal === null ? 'null' : String(ctx.budgetTotal),
       host: Object.freeze(host),
       setVmValueProjector: (projector) => {
         ctx.toVmValue = projector;
@@ -2866,6 +2885,12 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     }
     if (ctx.agentCount >= MAX_AGENT_CALLS) {
       throw workflowInputError(`Workflow agent call cap exceeded (${MAX_AGENT_CALLS}).`);
+    }
+    // Pre-dispatch output-token ceiling, beside the agent-call cap: refuse a new dispatch
+    // once this run's fresh spend reaches the budget. Non-retryable workflow_input_invalid,
+    // like the cap; inside parallel()/pipeline() it becomes a per-item null (native parity).
+    if (ctx.budgetTotal != null && ctx.outputTokens >= ctx.budgetTotal) {
+      throw workflowInputError(`Workflow output-token budget exhausted (spent ${ctx.outputTokens} of ${ctx.budgetTotal}).`);
     }
     const schema = normalizeStructuredOutputSchema(options?.schema);
     const isolation = normalizeAgentIsolation(options?.isolation);
@@ -5678,7 +5703,13 @@ function installWorkflowVmGlobals(
     '  try { Object.setPrototypeOf(WorkflowPromise, null); } catch {}',
     '  try { Object.setPrototypeOf(WorkflowPromise.prototype, null); } catch {}',
     `  define(globalThis, "args", { value: ${globals.argsLiteral}, writable: false, configurable: false });`,
-    `  define(globalThis, "budget", { value: freeze(${globals.budgetLiteral}), writable: false, configurable: false });`,
+    `  const __budget = ${globals.budgetLiteral};`,
+    // total/spent/remaining are NON-enumerable so Object.keys(budget)/for-in/spread are
+    // byte-identical whether or not a ceiling is set. Direct access still works.
+    `  define(__budget, "total", { value: ${globals.budgetTotalLiteral}, enumerable: false, writable: false, configurable: false });`,
+    '  define(__budget, "spent", { value: () => __host.spent(), enumerable: false, writable: false, configurable: false });',
+    '  define(__budget, "remaining", { value: () => __host.remaining(), enumerable: false, writable: false, configurable: false });',
+    '  define(globalThis, "budget", { value: freeze(__budget), writable: false, configurable: false });',
     '  define(globalThis, "Promise", { value: freeze(WorkflowPromise), writable: false, configurable: false });',
     '  define(globalThis, "agent", { value: (...values) => __host.agent(...values), writable: false, configurable: false });',
     '  define(globalThis, "parallel", { value: (...values) => __host.parallel(...values), writable: false, configurable: false });',
@@ -5934,6 +5965,15 @@ function resolveAgentConcurrency(value: AgentConcurrency | undefined): number | 
   if (value === 'auto') return Math.min(16, Math.max(1, availableParallelism() - 2));
   if (Number.isInteger(value) && value >= 1) return value;
   throw workflowInputError(`agentConcurrency must be 'unbounded', 'auto', or a positive integer; got ${String(value)}.`);
+}
+
+// The registry is the authority boundary for the ceiling, mirroring resolveAgentConcurrency:
+// the CLI parses --budget, but a programmatic caller reaches the registry directly, and the
+// ceiling check / remaining() rely on budgetTotal being null or a positive safe integer.
+function resolveBudgetTotal(value: number | null | undefined): number | null {
+  if (value === undefined || value === null) return null;
+  if (Number.isSafeInteger(value) && value >= 1) return value;
+  throw workflowInputError(`budgetTotal must be null or a positive safe integer; got ${String(value)}.`);
 }
 
 async function mapWithConcurrency<T, R>(
