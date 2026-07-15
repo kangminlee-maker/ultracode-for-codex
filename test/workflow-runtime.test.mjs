@@ -1686,7 +1686,89 @@ test('workflow runtime remove-clean reclaims an ignored-only worktree (native un
   }
 });
 
+test('agentConcurrency bounds concurrent dispatch across a parallel() burst (DW-A1)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend, runtimeOptions: { agentConcurrency: 1 } });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "pool-bound" };\n'
+        + 'return await parallel([() => agent("SILENT_75MS a"), () => agent("SILENT_75MS b"), () => agent("SILENT_75MS c")]);',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    // Cardinality guard: a pool that dispatched nothing would pass a bound check vacuously.
+    assert.equal(backend.requests.length, 3);
+    assert.equal(backend.maxActiveRequests, 1, 'pool size 1 must serialize agent dispatch');
+  } finally {
+    await runtime.close();
+  }
+});
 
+test('agentConcurrency unbounded (landing default) leaves parallel() dispatch concurrent (DW-A2 contrast)', async () => {
+  const backend = new FakeSubagentBackend();
+  // No agentConcurrency option => no pool => current behavior.
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "pool-off" };\n'
+        + 'return await parallel([() => agent("SILENT_75MS a"), () => agent("SILENT_75MS b"), () => agent("SILENT_75MS c")]);',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    assert.equal(backend.requests.length, 3);
+    // Negative control for DW-A1: without a pool the same burst runs concurrently.
+    assert.equal(backend.maxActiveRequests, 3, 'no pool must not serialize dispatch');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('agentConcurrency holds the permit until the real dispatch settles, not the abort race (DW-A6)', async () => {
+  // A backend whose first dispatch ignores its abort signal and stays live past the
+  // stall timeout. The pool must keep that permit held until generate() actually
+  // settles; releasing on the abort race would let the stall-retry's dispatch start
+  // while the first is still in flight -- pushing live dispatches to 2 on a size-1 pool.
+  class LingerBackend {
+    name = 'linger-backend';
+    model = 'fake-model';
+    live = 0;
+    maxLive = 0;
+    calls = 0;
+    async generate() {
+      this.calls += 1;
+      const call = this.calls;
+      this.live += 1;
+      this.maxLive = Math.max(this.maxLive, this.live);
+      try {
+        if (call === 1) await sleep(140); // ignore abort; linger well past the 40ms stall timeout
+        return subagentResult({ text: `ok-${call}` });
+      } finally {
+        this.live -= 1;
+      }
+    }
+    async close() {}
+  }
+  const backend = new LingerBackend();
+  const { runtime } = await createRuntime({
+    backend,
+    runtimeOptions: { agentConcurrency: 1, agentStallTimeoutMs: 40, agentStallRetryLimit: 1 },
+  });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "pool-honest-abort" };\nreturn await agent("linger please");',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    assert.equal(snapshot.result, 'ok-2', 'the stall retry should have produced the second dispatch');
+    assert.equal(backend.calls, 2, 'attempt 1 stalled and attempt 2 retried');
+    assert.equal(backend.maxLive, 1, 'permit must be held until the real dispatch settles; releasing on the abort race would allow 2');
+  } finally {
+    await runtime.close();
+  }
+});
 
 
 
@@ -1710,6 +1792,7 @@ async function createRuntime({ backend, runtimeOptions = {} }) {
       agentStallRetryLimit: runtimeOptions.agentStallRetryLimit,
       heartbeatMs: runtimeOptions.heartbeatMs,
       worktreeRetention: runtimeOptions.worktreeRetention,
+      agentConcurrency: runtimeOptions.agentConcurrency,
       journalDurability: runtimeOptions.journalDurability,
     }),
   };

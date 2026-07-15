@@ -16,6 +16,7 @@ import {
   workflowDefaultRetryLimit,
   workflowDefaultTimeoutMs,
   workflowDefaultHeartbeatMs,
+  workflowDefaultAgentConcurrency,
 } from '../dist/settings.js';
 import { defaultWorkflowStateDir } from '../dist/runtime/state-root.js';
 
@@ -29,6 +30,7 @@ test('settings.json provides Codex workflow runtime defaults', () => {
       timeoutMs: 0,
       heartbeatMs: 120000,
       worktreeRetention: 'remove-clean',
+      agentConcurrency: 'unbounded',
       background: {
         runDir: '{stateRoot}/background/{jobId}',
         resultFile: 'result.json',
@@ -57,6 +59,7 @@ test('settings.json provides Codex workflow runtime defaults', () => {
   });
   assert.equal(codexDefaultReasoningEffort(), 'medium');
   assert.equal(codexDefaultVerbosity(), 'medium');
+  assert.equal(workflowDefaultAgentConcurrency(), 'unbounded');
   assert.match(
     defaultWorkflowStateDir('/tmp/example-workspace'),
     /\/\.ultracode-for-codex\/workspaces\/example-workspace-[0-9a-f]{16}$/,

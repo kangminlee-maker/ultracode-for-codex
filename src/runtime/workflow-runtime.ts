@@ -1,12 +1,13 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { chmod, lstat, mkdir, readdir, readFile, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
+import { availableParallelism, homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { createContext, runInContext } from 'node:vm';
-import type { ReasoningEffort, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
+import type { AgentConcurrency, ReasoningEffort, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
 import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort } from './types.js';
+import { AgentConcurrencyPool } from './agent-concurrency-pool.js';
 import {
   WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
   WORKFLOW_JOURNAL_WRITE_FAILED_REASON,
@@ -339,6 +340,8 @@ interface WorkflowRunContext {
   nextTimerId: number;
   previousAgentCallKey: string;
   readonly usedLogicalKeys: Set<string>;
+  // One permit pool per run bounds concurrent agent dispatches. Undefined = unbounded.
+  readonly agentPool?: AgentConcurrencyPool;
   currentPhase?: string;
   announcedPlan?: WorkflowExecutionPlan;
   pendingPhasePlan?: WorkflowPlanPhase;
@@ -383,6 +386,9 @@ interface WorkflowTaskRegistryOptions {
   // Retention policy for isolated agent worktrees. Omitted defaults to 'preserve-all'
   // (current behavior); 'remove-clean' reclaims unchanged completed worktrees.
   readonly worktreeRetention?: WorktreeRetention;
+  // Bound on concurrent agent dispatches per run. Omitted or 'unbounded' applies no
+  // pool (current behavior). 'auto' derives a size from CPUs; a positive integer pins it.
+  readonly agentConcurrency?: AgentConcurrency;
   readonly userWorkflowDirs?: readonly string[];
   readonly pluginWorkflows?: readonly WorkflowPluginRegistry[];
   readonly builtinWorkflows?: readonly BuiltinWorkflow[];
@@ -1670,6 +1676,9 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   private readonly agentStallRetryLimit: number;
   private readonly heartbeatMs: number;
   private readonly worktreeRetention: WorktreeRetention;
+  // Resolved agent-dispatch pool size, or null for unbounded (no pool). Computed once:
+  // availableParallelism() is stable for the process lifetime.
+  private readonly agentConcurrency: number | null;
 
   constructor(private readonly options: WorkflowTaskRegistryOptions) {
     this.stateDir = options.stateDir ?? defaultWorkflowStateDir(options.cwd ?? process.cwd());
@@ -1680,6 +1689,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     );
     this.heartbeatMs = normalizeHeartbeatMs(options.heartbeatMs);
     this.worktreeRetention = options.worktreeRetention ?? 'remove-clean';
+    this.agentConcurrency = resolveAgentConcurrency(options.agentConcurrency);
   }
 
   async launch(input: WorkflowLaunchInput): Promise<WorkflowLaunchResult> {
@@ -2651,6 +2661,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       nextTimerId: 1,
       previousAgentCallKey: WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
       usedLogicalKeys: new Set(),
+      ...(this.agentConcurrency != null ? { agentPool: new AgentConcurrencyPool(this.agentConcurrency) } : {}),
     };
     task.controller = controller;
     if (task.abortRequested) controller.abort();
@@ -2798,6 +2809,9 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       budgetLiteral: vmDataLiteral({
         maxAgentCalls: MAX_AGENT_CALLS,
         maxParallelism: MAX_PARALLELISM,
+        // Effective agent-dispatch pool size, or null when unbounded. Distinct from
+        // maxParallelism, which stays the parallel()/pipeline() item fan-out bound.
+        agentConcurrency: ctx.agentPool?.size ?? null,
         agentStallTimeoutMs: this.agentStallTimeoutMs,
         agentStallRetryLimit: this.agentStallRetryLimit,
       }, 'budget'),
@@ -3206,6 +3220,23 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
       throw workflowInputError('Workflow is aborted.');
     }
+    // Acquire a dispatch permit BEFORE the stall timer starts: waiting for a permit
+    // must not count toward agentStallTimeoutMs, and an already-aborted run must not
+    // take a slot (acquire rejects if the signal is aborted). Ownership of the release
+    // transfers to `generated` below, so the permit is held for the real dispatch's
+    // true lifetime -- releasing on the abort race would free the slot while the
+    // dispatch is still in flight and let the next attempt over-subscribe the pool.
+    let releaseAgentPermit: (() => void) | undefined;
+    if (ctx.agentPool) {
+      try {
+        releaseAgentPermit = await ctx.agentPool.acquire(ctx.controller.signal);
+      } catch (err) {
+        if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
+          throw workflowInputError('Workflow is aborted.');
+        }
+        throw err;
+      }
+    }
     ctx.controller.signal.addEventListener('abort', abortFromWorkflow, { once: true });
     const timer = this.agentStallTimeoutMs > 0
       ? setTimeout(() => {
@@ -3218,10 +3249,14 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         | { readonly type: 'result'; readonly result: SubagentResult }
         | { readonly type: 'error'; readonly error: unknown }
         | { readonly type: 'aborted' };
-      const generated: Promise<AgentAttemptOutcome> = this.options.backend.generate(request, attemptController.signal).then(
+      const dispatched: Promise<AgentAttemptOutcome> = this.options.backend.generate(request, attemptController.signal).then(
         (result) => ({ type: 'result', result }),
         (err) => ({ type: 'error', error: err }),
       );
+      // Release when the real dispatch settles, not when the abort race resolves.
+      const generated = releaseAgentPermit
+        ? dispatched.finally(releaseAgentPermit)
+        : dispatched;
       const aborted = new Promise<AgentAttemptOutcome>((resolve) => {
         attemptController.signal.addEventListener('abort', () => {
           resolve({ type: 'aborted' });
@@ -5870,6 +5905,15 @@ async function waitForWorkflowTaskEvent(task: WorkflowTaskMutable, signal?: Abor
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
   });
+}
+
+// Resolve the agent-concurrency setting to a pool size, or null for unbounded (no
+// pool). 'auto' matches native's CPU-based bound: min(16, cores - 2), floored at 1.
+function resolveAgentConcurrency(value: AgentConcurrency | undefined): number | null {
+  if (value === undefined || value === 'unbounded') return null;
+  if (value === 'auto') return Math.min(16, Math.max(1, availableParallelism() - 2));
+  if (Number.isInteger(value) && value >= 1) return value;
+  throw workflowInputError(`agentConcurrency must be 'unbounded', 'auto', or a positive integer; got ${String(value)}.`);
 }
 
 async function mapWithConcurrency<T, R>(

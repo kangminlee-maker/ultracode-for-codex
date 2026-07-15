@@ -10,7 +10,7 @@ import { createInterface } from 'node:readline/promises';
 import { CodexSubagentBackend } from './codex/subagent-backend.js';
 import { probeCodexSetup } from './codex/setup-probe.js';
 import { WorkflowTaskRegistry, isRetryableFailureReason } from './runtime/workflow-runtime.js';
-import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, isWorktreeRetention } from './runtime/types.js';
+import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, isAgentConcurrencyKeyword, isWorktreeRetention } from './runtime/types.js';
 import { ultracodePackageVersion } from './runtime/package-info.js';
 import { defaultUltracodeStateRoot, resolveUltracodeStatePath } from './runtime/state-root.js';
 import { renderUltracodeInstallGuideNotice } from './ultracode-install-guide.js';
@@ -30,8 +30,9 @@ import {
   workflowDefaultTimeoutMs,
   workflowDefaultHeartbeatMs,
   workflowDefaultWorktreeRetention,
+  workflowDefaultAgentConcurrency,
 } from './settings.js';
-import type { ReasoningEffort, Verbosity, WorktreeRetention } from './runtime/types.js';
+import type { AgentConcurrency, ReasoningEffort, Verbosity, WorktreeRetention } from './runtime/types.js';
 import type { WorkflowExecutionMode, WorkflowPermissionPolicy, WorkflowProgressMode } from './settings.js';
 import type {
   WorkflowEvent,
@@ -108,6 +109,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   // launch reports success immediately, so an invalid value rejected only in the detached
   // child would surface as an empty result record and an unknown early exit.
   const worktreeRetention = parseWorktreeRetention(options.worktreeRetention);
+  const agentConcurrency = parseAgentConcurrency(options.agentConcurrency);
   if (executionMode === 'background') {
     const input = await inputPromise;
     if (input.resumeFromRunId) await assertBackgroundResumeSource(cwd, input.resumeFromRunId);
@@ -138,6 +140,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
     defaultReasoningEffort: reasoningEffort,
     heartbeatMs,
     worktreeRetention,
+    agentConcurrency,
   });
 
   try {
@@ -257,6 +260,7 @@ interface ParsedOptions {
   readonly permission?: string;
   readonly retryLimit?: string;
   readonly worktreeRetention?: string;
+  readonly agentConcurrency?: string;
   readonly jobId?: string;
   readonly metadataPath?: string;
   readonly resultPath?: string;
@@ -2021,6 +2025,18 @@ function parseWorktreeRetention(value: string | undefined): WorktreeRetention {
   throw new Error('worktree-retention must be one of preserve-all, remove-clean.');
 }
 
+function parseAgentConcurrency(value: string | undefined): AgentConcurrency {
+  if (value === undefined) return workflowDefaultAgentConcurrency();
+  if (isAgentConcurrencyKeyword(value)) return value;
+  // Strict positive-integer parse: reject '2x', '2.5', '', and '+2' so a typo cannot
+  // silently narrow the pool. parseInt would accept a prefix and hide the mistake.
+  if (/^[0-9]+$/.test(value)) {
+    const size = Number(value);
+    if (size >= 1) return size;
+  }
+  throw new Error("agent-concurrency must be 'unbounded', 'auto', or a positive integer.");
+}
+
 function parsePermissionPolicy(value: string | undefined): PermissionPolicy {
   if (value === undefined) return workflowDefaultPermissionPolicy();
   if (isWorkflowPermissionPolicy(value)) return value;
@@ -2088,6 +2104,7 @@ Options:
   --permission <ask|allow|deny>      Permission review behavior. Default: settings.json (${workflowDefaultPermissionPolicy()}).
   --retry-limit <number>             Retry failed workflows in the same process. Default: settings.json (${workflowDefaultRetryLimit()}).
   --worktree-retention <preserve-all|remove-clean>  Reclaim unchanged completed isolated worktrees. Default: settings.json (${workflowDefaultWorktreeRetention()}).
+  --agent-concurrency <unbounded|auto|N>  Bound concurrent agent dispatches per run. 'auto' = min(16, cores-2). Default: settings.json (${String(workflowDefaultAgentConcurrency())}).
   --progress <jsonl|plain>           Progress format on stderr. Default: settings.json (${workflowDefaultProgressMode()}).
   --execution <background|attached>  Execution mode. Default: settings.json (${workflowDefaultExecutionMode()}).
   --command <path>                   Override Codex CLI binary path.

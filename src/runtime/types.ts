@@ -16,6 +16,16 @@ export function isWorktreeRetention(value: unknown): value is WorktreeRetention 
   return typeof value === 'string' && (WORKTREE_RETENTIONS as readonly string[]).includes(value);
 }
 
+// Bound on concurrent agent dispatches within one workflow run. `unbounded` (the
+// current default) applies no pool -- every launch dispatches immediately, matching
+// pre-pool behavior. `auto` derives a pool size from available CPUs. A positive
+// integer pins the size. Distinct from `maxParallelism`, which bounds parallel()/
+// pipeline() item fan-out and is unaffected by this setting.
+export type AgentConcurrency = 'unbounded' | 'auto' | number;
+export function isAgentConcurrencyKeyword(value: unknown): value is 'unbounded' | 'auto' {
+  return value === 'unbounded' || value === 'auto';
+}
+
 // Backend model name used when no run-level model is configured. It is a
 // projection placeholder, never a real Codex model id.
 export const SUBAGENT_MODEL_PLACEHOLDER = 'codex-subagent';

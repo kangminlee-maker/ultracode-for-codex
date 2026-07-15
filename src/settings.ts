@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
-import type { ReasoningEffort, Verbosity, WorktreeRetention } from './runtime/types.js';
-import { REASONING_EFFORTS, WORKTREE_RETENTIONS, isReasoningEffort, isWorktreeRetention } from './runtime/types.js';
+import type { AgentConcurrency, ReasoningEffort, Verbosity, WorktreeRetention } from './runtime/types.js';
+import { REASONING_EFFORTS, WORKTREE_RETENTIONS, isAgentConcurrencyKeyword, isReasoningEffort, isWorktreeRetention } from './runtime/types.js';
 
 export { isReasoningEffort };
 
@@ -17,6 +17,7 @@ export interface UltracodeSettings {
     readonly timeoutMs: number;
     readonly heartbeatMs: number;
     readonly worktreeRetention: WorktreeRetention;
+    readonly agentConcurrency: AgentConcurrency;
     readonly background: {
       readonly runDir: string;
       readonly resultFile: string;
@@ -86,6 +87,10 @@ export function loadSettings(): UltracodeSettings {
         workflow?.worktreeRetention,
         'workflow.worktreeRetention',
       ),
+      agentConcurrency: readAgentConcurrencySetting(
+        workflow?.agentConcurrency,
+        'workflow.agentConcurrency',
+      ),
       background: {
         runDir: readTemplateSetting(
           background?.runDir,
@@ -152,6 +157,10 @@ export function workflowDefaultWorktreeRetention(): WorktreeRetention {
   return loadSettings().workflow.worktreeRetention;
 }
 
+export function workflowDefaultAgentConcurrency(): AgentConcurrency {
+  return loadSettings().workflow.agentConcurrency;
+}
+
 export function workflowBackgroundDefaults(): UltracodeSettings['workflow']['background'] {
   return loadSettings().workflow.background;
 }
@@ -210,6 +219,15 @@ function readWorktreeRetentionSetting(
 ): WorktreeRetention {
   if (isWorktreeRetention(value)) return value;
   throw new Error(`${key} must be one of ${WORKTREE_RETENTIONS.join(', ')}.`);
+}
+
+function readAgentConcurrencySetting(
+  value: unknown,
+  key: string,
+): AgentConcurrency {
+  if (isAgentConcurrencyKeyword(value)) return value;
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 1) return value;
+  throw new Error(`${key} must be 'unbounded', 'auto', or a positive integer.`);
 }
 
 function readReasoningEffortSetting(
