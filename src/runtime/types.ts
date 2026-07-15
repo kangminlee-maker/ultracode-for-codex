@@ -26,6 +26,15 @@ export function isAgentConcurrencyKeyword(value: unknown): value is 'unbounded' 
   return value === 'unbounded' || value === 'auto';
 }
 
+// Gate for nested workflow() calls. `disabled` (the current default) keeps the throwing
+// stub so existing behavior is byte-identical; `enabled` lets a workflow run a built-in or
+// inline child workflow inline, sharing the parent run's pool/counter/budget/abort/journal.
+export type NestedWorkflows = 'disabled' | 'enabled';
+export const NESTED_WORKFLOWS_VALUES: readonly NestedWorkflows[] = ['disabled', 'enabled'];
+export function isNestedWorkflows(value: unknown): value is NestedWorkflows {
+  return typeof value === 'string' && (NESTED_WORKFLOWS_VALUES as readonly string[]).includes(value);
+}
+
 // Backend model name used when no run-level model is configured. It is a
 // projection placeholder, never a real Codex model id.
 export const SUBAGENT_MODEL_PLACEHOLDER = 'codex-subagent';
