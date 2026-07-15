@@ -2,10 +2,10 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { delimiter, dirname, join } from 'node:path';
+import { basename, delimiter, dirname, join } from 'node:path';
 import { afterEach, test } from 'node:test';
 import { promisify } from 'node:util';
-import { WorkflowTaskRegistry, isRetryableFailureReason } from '../dist/runtime/workflow-runtime.js';
+import { WorkflowTaskRegistry, isRetryableFailureReason, cleanWorkflowWorktrees } from '../dist/runtime/workflow-runtime.js';
 import {
   WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
   computeWorkflowAgentCallKey,
@@ -1643,6 +1643,97 @@ test('workflow runtime remove-clean reclaims an ignored-only worktree (native un
     const completed = snapshot.events.find((event) => event.type === 'workflow.agent.completed');
     assert.notEqual(completed.worktreePreserved, true);
   } finally {
+    await runtime.close();
+  }
+});
+
+async function launchPreservedWorktree(runtime, prompt) {
+  const launch = await runtime.launch({
+    script: `export const meta = { name: "wt-clean-fixture" };\nreturn await agent(${JSON.stringify(prompt)}, { isolation: "worktree" });`,
+  });
+  await collectEvents(runtime, launch.taskId);
+  const snapshot = runtime.get(launch.taskId);
+  assert.equal(snapshot.status, 'completed');
+  const completed = snapshot.events.find((event) => event.type === 'workflow.agent.completed');
+  assert.equal(completed.worktreePreserved, true);
+  return completed.worktreePath;
+}
+
+test('worktree clean removes a clean orphaned worktree and reclaims its run dir', async () => {
+  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { worktreeRetention: 'preserve-all' } });
+  try {
+    await initializeGitRepo(root);
+    const worktreePath = await launchPreservedWorktree(runtime, 'READ_ONLY_WORKTREE');
+    const runDir = dirname(worktreePath);
+    // Simulate a finished run: drop the liveness marker so the worktree is reclaimable.
+    await rm(join(runDir, 'run.pid'), { force: true });
+    const result = await cleanWorkflowWorktrees({ cwd: root, includeChanged: false, force: false, dryRun: false });
+    assert.equal(await fileExists(worktreePath), false);
+    assert.equal(await fileExists(runDir), false);
+    assert.equal(result.entries.some((entry) => entry.path === worktreePath && entry.action === 'removed'), true);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('worktree clean keeps a changed worktree unless --all --force', async () => {
+  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { worktreeRetention: 'preserve-all' } });
+  try {
+    await initializeGitRepo(root);
+    const worktreePath = await launchPreservedWorktree(runtime, 'WRITE_WORKTREE');
+    await rm(join(dirname(worktreePath), 'run.pid'), { force: true });
+    const kept = await cleanWorkflowWorktrees({ cwd: root, includeChanged: false, force: false, dryRun: false });
+    assert.equal(await fileExists(worktreePath), true);
+    assert.equal(kept.entries.some((entry) => entry.path === worktreePath && entry.action === 'kept-changed'), true);
+    const removed = await cleanWorkflowWorktrees({ cwd: root, includeChanged: true, force: true, dryRun: false });
+    assert.equal(await fileExists(worktreePath), false);
+    assert.equal(removed.entries.some((entry) => entry.path === worktreePath && entry.action === 'removed'), true);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('worktree clean skips worktrees of a live run even with --all --force', async () => {
+  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { worktreeRetention: 'preserve-all' } });
+  try {
+    await initializeGitRepo(root);
+    // Leave the liveness marker in place; it holds this (live) test process's pid.
+    const worktreePath = await launchPreservedWorktree(runtime, 'READ_ONLY_WORKTREE');
+    const result = await cleanWorkflowWorktrees({ cwd: root, includeChanged: true, force: true, dryRun: false });
+    assert.equal(await fileExists(worktreePath), true);
+    assert.equal(result.entries.some((entry) => entry.path === worktreePath && entry.action === 'kept-live'), true);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('worktree clean --dry-run removes nothing', async () => {
+  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { worktreeRetention: 'preserve-all' } });
+  try {
+    await initializeGitRepo(root);
+    const worktreePath = await launchPreservedWorktree(runtime, 'READ_ONLY_WORKTREE');
+    await rm(join(dirname(worktreePath), 'run.pid'), { force: true });
+    const result = await cleanWorkflowWorktrees({ cwd: root, includeChanged: false, force: false, dryRun: true });
+    assert.equal(await fileExists(worktreePath), true);
+    assert.equal(result.entries.some((entry) => entry.path === worktreePath && entry.action === 'would-remove'), true);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('worktree clean never touches worktrees outside the runtime store', async () => {
+  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { worktreeRetention: 'preserve-all' } });
+  const externalWorktree = join(dirname(root), `external-worktree-${basename(root)}`);
+  tempDirs.push(externalWorktree);
+  try {
+    await initializeGitRepo(root);
+    // A user-created worktree that merely lives near, but not inside, the runtime store.
+    await gitLines(root, ['worktree', 'add', '--detach', externalWorktree, 'HEAD']);
+    const result = await cleanWorkflowWorktrees({ cwd: root, includeChanged: true, force: true, dryRun: false });
+    assert.equal(await fileExists(externalWorktree), true);
+    assert.equal(result.entries.some((entry) => entry.path.includes('external-worktree')), false);
+  } finally {
+    await gitLines(root, ['worktree', 'remove', '--force', externalWorktree]).catch(() => undefined);
     await runtime.close();
   }
 });

@@ -9,7 +9,7 @@ import { pathToFileURL } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { CodexSubagentBackend } from './codex/subagent-backend.js';
 import { probeCodexSetup } from './codex/setup-probe.js';
-import { WorkflowTaskRegistry, isRetryableFailureReason } from './runtime/workflow-runtime.js';
+import { WorkflowTaskRegistry, isRetryableFailureReason, cleanWorkflowWorktrees } from './runtime/workflow-runtime.js';
 import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, isWorktreeRetention } from './runtime/types.js';
 import { ultracodePackageVersion } from './runtime/package-info.js';
 import { defaultUltracodeStateRoot, resolveUltracodeStatePath } from './runtime/state-root.js';
@@ -83,6 +83,7 @@ async function main(argv: readonly string[]): Promise<number> {
   if (command === 'cancel') return cancelBackgroundJob(args);
   if (command === 'jobs' || command === 'list') return listBackgroundJobs(args);
   if (command === 'archive' || command === 'export') return archiveBackgroundJob(args);
+  if (command === 'worktree') return manageWorktrees(args);
   if (command === 'skills') return manageCodexSkills(args);
   if (command === 'setup' || command === 'doctor') return runCodexSetup(args);
   process.stderr.write(`Unknown command: ${command}\n\n${helpText()}`);
@@ -262,6 +263,10 @@ interface ParsedOptions {
   readonly resumeFromRunId?: string;
   readonly validate?: string;
   readonly install?: string;
+  readonly all?: string;
+  readonly force?: string;
+  readonly dryRun?: string;
+  readonly cleanOnly?: string;
   readonly permission?: string;
   readonly retryLimit?: string;
   readonly retryBackoffMs?: string;
@@ -283,7 +288,7 @@ interface ParsedOptions {
   readonly outputPath?: string;
 }
 
-const VALUELESS_FLAGS = new Set(['install', 'plain', 'result', 'wait', 'validate']);
+const VALUELESS_FLAGS = new Set(['install', 'plain', 'result', 'wait', 'validate', 'dryRun', 'all', 'force', 'cleanOnly']);
 
 export function parseOptions(args: readonly string[]): ParsedOptions {
   const out: Record<string, string | string[]> = { _: [] };
@@ -1203,6 +1208,30 @@ const CODEX_SKILL_NAMES = ['ultracode-for-codex', 'ultracode-for-codex-cli'] as 
 
 export type CodexSkillState = 'current' | 'stale' | 'missing' | 'unmanaged';
 
+async function manageWorktrees(args: readonly string[]): Promise<number> {
+  const options = parseOptions(args);
+  const subcommand = options._[0];
+  if (subcommand !== 'clean') {
+    throw new Error('worktree supports one subcommand: clean.');
+  }
+  if (options._.length > 1) {
+    throw new Error('worktree clean does not accept positional arguments.');
+  }
+  const includeChanged = options.all !== undefined;
+  const force = options.force !== undefined;
+  if (includeChanged && !force) {
+    throw new Error('worktree clean --all requires --force to remove changed worktrees.');
+  }
+  const result = await cleanWorkflowWorktrees({
+    cwd: options.cwd ?? process.cwd(),
+    includeChanged,
+    force,
+    dryRun: options.dryRun !== undefined,
+  });
+  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  return 0;
+}
+
 async function manageCodexSkills(args: readonly string[]): Promise<number> {
   const options = parseOptions(args);
   if (options._.length > 0) throw new Error('skills does not accept positional arguments.');
@@ -2107,6 +2136,7 @@ Commands:
   list       Alias for jobs.
   archive    Export one background workflow job state to an archive JSON file.
   export     Alias for archive.
+  worktree   Manage isolated agent worktrees. Subcommand: clean [--clean-only|--all --force] [--dry-run].
   skills     Report whether the installed Codex skill commands match this package; --install updates them.
   setup      Check readiness: package, Codex CLI, app-server, authentication, selected model/effort, and installed skill commands (alias: doctor).
 

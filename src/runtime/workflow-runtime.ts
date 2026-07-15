@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readdir, readFile, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { createContext, runInContext } from 'node:vm';
 import type { ReasoningEffort, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
@@ -3055,13 +3055,12 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     } catch (err) {
       throw workflowInputError(`worktree isolation requires a git repository with at least one commit: ${workflowErrorMessage(err)}`);
     }
-    const worktreeRoot = join(
-      dirname(gitRoot),
-      '.ultracode-for-codex-worktrees',
-      `${workflowScriptSlug(basename(gitRoot))}-${shortHash(gitRoot)}`,
-      ctx.task.runId,
-    );
+    const worktreeRoot = join(workflowWorktreeStoreRoot(gitRoot), ctx.task.runId);
     await ensureWorkflowStateDirectory(worktreeRoot);
+    // Colocate a run-liveness marker in the worktree store so `worktree clean` can tell a
+    // live run's worktrees from reclaimable ones. The transcript-dir run.pid lives under a
+    // cwd-partitioned state dir and is not locatable from a gitRoot-partitioned worktree.
+    await writeWorkflowStateFile(workflowRunPidPath(worktreeRoot), `${process.pid}\n`).catch(() => undefined);
     const worktreePath = join(worktreeRoot, attemptIndex === 0 ? agentId : `${agentId}-attempt-${attemptIndex + 1}`);
     try {
       await gitOutput(gitRoot, ['worktree', 'add', '--detach', worktreePath, 'HEAD']);
@@ -6552,6 +6551,134 @@ function isWorkflowProcessAlive(pid: number): boolean {
     return true;
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+// Sibling-of-repo store that holds every run's isolated worktrees, keyed by repo slug and
+// hash. createAgentWorktree and `worktree clean` share this convention so cleanup only ever
+// touches runtime-owned paths.
+function workflowWorktreeStoreRoot(gitRoot: string): string {
+  return join(
+    dirname(gitRoot),
+    '.ultracode-for-codex-worktrees',
+    `${workflowScriptSlug(basename(gitRoot))}-${shortHash(gitRoot)}`,
+  );
+}
+
+export interface WorktreeCleanOptions {
+  readonly cwd: string;
+  readonly includeChanged: boolean;
+  readonly force: boolean;
+  readonly dryRun: boolean;
+}
+
+export interface WorktreeCleanEntry {
+  readonly path: string;
+  readonly runId: string | null;
+  readonly action: 'removed' | 'kept-changed' | 'kept-live' | 'would-remove' | 'failed';
+  readonly detail?: string;
+}
+
+export interface WorktreeCleanResult {
+  readonly storeRoot: string;
+  readonly entries: readonly WorktreeCleanEntry[];
+}
+
+// Offline reclaim of leaked isolated worktrees. Enumerates only worktrees under this repo's
+// runtime-owned store (canonical path containment, never a substring match), never touches a
+// live run's worktrees (colocated run.pid liveness), removes clean ones by delegating the
+// cleanliness gate to `git worktree remove` (no --force), and only removes changed ones under
+// an explicit --all --force. prune + empty-run-dir reclaim run afterwards.
+export async function cleanWorkflowWorktrees(options: WorktreeCleanOptions): Promise<WorktreeCleanResult> {
+  let gitRoot: string;
+  try {
+    gitRoot = await gitOutput(options.cwd, ['rev-parse', '--show-toplevel']);
+  } catch (err) {
+    throw workflowInputError(`worktree clean requires a git repository: ${workflowErrorMessage(err)}`);
+  }
+  const storeRoot = workflowWorktreeStoreRoot(gitRoot);
+  const canonicalStore = await realpath(storeRoot).catch(() => null);
+  if (!canonicalStore) return { storeRoot, entries: [] };
+
+  const entries: WorktreeCleanEntry[] = [];
+  const runIdsWithKeptWorktree = new Set<string>();
+  for (const rawPath of await listGitWorktreePaths(gitRoot)) {
+    const canonical = await realpath(rawPath).catch(() => null);
+    if (!canonical || !pathInsideOrEqual(canonicalStore, canonical) || canonical === canonicalStore) continue;
+    const runId = worktreeStoreRunId(canonicalStore, canonical);
+    if (runId && await isWorktreeRunLive(canonicalStore, runId)) {
+      entries.push({ path: canonical, runId, action: 'kept-live' });
+      runIdsWithKeptWorktree.add(runId);
+      continue;
+    }
+    const changed = await isWorktreeChangedForRemoval(canonical);
+    if (changed && !(options.includeChanged && options.force)) {
+      entries.push({ path: canonical, runId, action: 'kept-changed' });
+      if (runId) runIdsWithKeptWorktree.add(runId);
+      continue;
+    }
+    if (options.dryRun) {
+      entries.push({ path: canonical, runId, action: 'would-remove', detail: changed ? 'changed' : 'clean' });
+      continue;
+    }
+    try {
+      await gitOutput(gitRoot, changed
+        ? ['worktree', 'remove', '--force', canonical]
+        : ['worktree', 'remove', canonical]);
+      entries.push({ path: canonical, runId, action: 'removed', detail: changed ? 'changed' : 'clean' });
+    } catch (err) {
+      entries.push({ path: canonical, runId, action: 'failed', detail: workflowErrorMessage(err) });
+      if (runId) runIdsWithKeptWorktree.add(runId);
+    }
+  }
+
+  if (!options.dryRun) {
+    await gitOutput(gitRoot, ['worktree', 'prune']).catch(() => undefined);
+    await reclaimEmptyWorktreeRunDirs(canonicalStore, runIdsWithKeptWorktree);
+  }
+  return { storeRoot, entries };
+}
+
+async function listGitWorktreePaths(gitRoot: string): Promise<readonly string[]> {
+  const out = await gitOutput(gitRoot, ['worktree', 'list', '--porcelain']).catch(() => '');
+  const paths: string[] = [];
+  for (const line of out.split('\n')) {
+    if (line.startsWith('worktree ')) paths.push(line.slice('worktree '.length));
+  }
+  return paths;
+}
+
+function worktreeStoreRunId(canonicalStore: string, canonicalWorktree: string): string | null {
+  const rel = relative(canonicalStore, canonicalWorktree);
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null;
+  return rel.split(sep)[0] ?? null;
+}
+
+async function isWorktreeRunLive(canonicalStore: string, runId: string): Promise<boolean> {
+  const pidText = await readFile(workflowRunPidPath(join(canonicalStore, runId)), 'utf8').catch(() => '');
+  const pid = Number.parseInt(pidText.trim(), 10);
+  return Number.isInteger(pid) && pid > 0 && isWorkflowProcessAlive(pid);
+}
+
+async function isWorktreeChangedForRemoval(worktreePath: string): Promise<boolean> {
+  // Match `git worktree remove`'s own criterion: modified or untracked files count as
+  // changed, while ignored artifacts do not, so an ignored-only worktree reads as removable.
+  // A status failure is treated as changed so an unassessable worktree is preserved.
+  const status = await gitOutput(worktreePath, ['status', '--porcelain=v1', '--untracked-files=all']).catch(() => 'status-unavailable');
+  return status.trim().length > 0;
+}
+
+async function reclaimEmptyWorktreeRunDirs(canonicalStore: string, keep: ReadonlySet<string>): Promise<void> {
+  for (const runId of await readdir(canonicalStore).catch(() => [] as string[])) {
+    if (keep.has(runId)) continue;
+    const runDir = join(canonicalStore, runId);
+    if (!pathInsideOrEqual(canonicalStore, runDir) || runDir === canonicalStore) continue;
+    const stats = await stat(runDir).catch(() => null);
+    if (!stats?.isDirectory() || await isWorktreeRunLive(canonicalStore, runId)) continue;
+    const remaining = (await readdir(runDir).catch(() => [] as string[])).filter((entry) => entry !== 'run.pid');
+    if (remaining.length > 0) continue;
+    await rm(join(runDir, 'run.pid'), { force: true }).catch(() => undefined);
+    await rmdir(runDir).catch(() => undefined);
   }
 }
 
