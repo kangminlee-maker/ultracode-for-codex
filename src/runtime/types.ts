@@ -35,6 +35,16 @@ export function isNestedWorkflows(value: unknown): value is NestedWorkflows {
   return typeof value === 'string' && (NESTED_WORKFLOWS_VALUES as readonly string[]).includes(value);
 }
 
+// Gate for the subagent web_search tool. `disabled` (the current default) keeps
+// `web_search="disabled"` at every Codex config site, byte-identical to today; `enabled`
+// flips it to `"live"` so workflow subagents can use the native Responses web_search tool.
+// Run-level: it applies to every agent in the run and is not part of the agent call key.
+export type AgentWebSearch = 'disabled' | 'enabled';
+export const AGENT_WEB_SEARCH_VALUES: readonly AgentWebSearch[] = ['disabled', 'enabled'];
+export function isAgentWebSearch(value: unknown): value is AgentWebSearch {
+  return typeof value === 'string' && (AGENT_WEB_SEARCH_VALUES as readonly string[]).includes(value);
+}
+
 // Backend model name used when no run-level model is configured. It is a
 // projection placeholder, never a real Codex model id.
 export const SUBAGENT_MODEL_PLACEHOLDER = 'codex-subagent';

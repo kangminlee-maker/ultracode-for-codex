@@ -8,6 +8,22 @@ the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `workflow.agentWebSearch` (`--agent-web-search`): opt-in support for workflow
+  subagents to use the native Codex `web_search` tool. `disabled` (the default) keeps
+  `web_search="disabled"` at every Codex config site, so existing behavior is
+  byte-identical. When `enabled`, every agent in the run may search the web. This is
+  **run-level** (applies to all agents in the run), and, like `--budget` and
+  `--nested-workflows`, is **not inherited on resume** — re-pass it. Caveats: a
+  re-executed (non-cached) web-search agent is not bit-reproducible across runs (its
+  output depends on live web state; the resume cache still replays run-time snapshots by
+  key, so identical-script resume is a 100% cache hit); `--budget` counts output tokens
+  only and does **not** bound web-search cost, which lands on input tokens; and enabling
+  it opens the worker's first outbound content channel (an egress/prompt-injection
+  surface), which is why it is default-off and explicit. See
+  `docs/ultracode-p7-agent-web-search.md`.
+
 ## [0.5.0] - 2026-07-15
 
 ### Added
