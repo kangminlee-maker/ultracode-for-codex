@@ -1,8 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { copyFile, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import readline from 'node:readline';
 import {
   codexDefaultReasoningEffort,
@@ -41,6 +41,10 @@ interface CodexSubagentBackendOptions {
   // web_search="disabled" at every config site (byte-identical to a no-web-search run);
   // true flips every site to "live". See docs/ultracode-p7-agent-web-search.md.
   readonly webSearch?: boolean;
+  // Run-level gate for workspace file writes. Omitted/false offers only the read-only
+  // workspace tools (byte-identical). True additionally offers write_file/str_replace to a
+  // worktree-isolated agent, path-confined to that worktree. See docs/ultracode-p8-agent-file-write.md.
+  readonly fileWrite?: boolean;
 }
 
 interface PendingRequest {
@@ -99,6 +103,7 @@ const BUFFERED_TURN_STATE_TTL_MS = 30_000;
 const DEFAULT_CODEX_RPC_TIMEOUT_MS = 30_000;
 const WORKSPACE_DYNAMIC_TOOL_NAMESPACE = 'workspace';
 const MAX_WORKSPACE_TOOL_READ_BYTES = 200_000;
+const MAX_WORKSPACE_TOOL_WRITE_BYTES = 200_000;
 const MAX_WORKSPACE_TOOL_DIRECTORY_ENTRIES = 200;
 const CODEX_MODEL_CATALOG_PAGE_LIMIT = 100;
 const CODEX_MODEL_CATALOG_MAX_PAGES = 20;
@@ -115,46 +120,108 @@ const DISABLED_CODEX_CONTEXT_FEATURES = [
   'shell_tool',
   'workspace_dependencies',
 ] as const;
-const WORKSPACE_DYNAMIC_TOOLS = [
+const WORKSPACE_READ_TOOLS = [
   {
-    type: 'namespace',
-    name: WORKSPACE_DYNAMIC_TOOL_NAMESPACE,
-    description: 'Read-only access to files in the active workflow workspace.',
-    tools: [
-      {
-        type: 'function',
-        name: 'read_file',
-        description: 'Read a UTF-8 text file inside the active workflow workspace.',
-        inputSchema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            path: {
-              type: 'string',
-              description: 'Relative path inside the active workspace.',
-            },
-          },
-          required: ['path'],
+    type: 'function',
+    name: 'read_file',
+    description: 'Read a UTF-8 text file inside the active workflow workspace.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Relative path inside the active workspace.',
         },
       },
-      {
-        type: 'function',
-        name: 'list_directory',
-        description: 'List direct entries in a directory inside the active workflow workspace.',
-        inputSchema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            path: {
-              type: 'string',
-              description: 'Relative directory path inside the active workspace. Defaults to the workspace root.',
-            },
-          },
+      required: ['path'],
+    },
+  },
+  {
+    type: 'function',
+    name: 'list_directory',
+    description: 'List direct entries in a directory inside the active workflow workspace.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Relative directory path inside the active workspace. Defaults to the workspace root.',
         },
       },
-    ],
+    },
   },
 ] as const;
+const WORKSPACE_WRITE_TOOLS = [
+  {
+    type: 'function',
+    name: 'write_file',
+    description: 'Create or overwrite a UTF-8 text file inside the active workflow worktree (overwrites if it exists).',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Relative path inside the active worktree.',
+        },
+        content: {
+          type: 'string',
+          description: 'Full UTF-8 text content to write.',
+        },
+      },
+      required: ['path', 'content'],
+    },
+  },
+  {
+    type: 'function',
+    name: 'str_replace',
+    description: 'Replace the single unique occurrence of old_str with new_str in a UTF-8 text file inside the active worktree. old_str must occur exactly once.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Relative path inside the active worktree.',
+        },
+        old_str: {
+          type: 'string',
+          description: 'Exact text to find; it must occur exactly once in the file.',
+        },
+        new_str: {
+          type: 'string',
+          description: 'Replacement text.',
+        },
+      },
+      required: ['path', 'old_str', 'new_str'],
+    },
+  },
+] as const;
+
+// Bare (namespace-less) tool names the app-server may send without the `workspace.` prefix — the
+// full read+write set, so a bare write name resolves the same as a bare read name.
+const WORKSPACE_BARE_TOOL_NAMES = new Set<string>(
+  [...WORKSPACE_READ_TOOLS, ...WORKSPACE_WRITE_TOOLS].map((tool) => tool.name),
+);
+
+// Read-only when `writable` is false (byte-identical to the pre-write tool set); read+write when
+// true. Writes are only ever offered to a worktree-isolated thread whose write root is recorded.
+function workspaceDynamicTools(writable: boolean): readonly unknown[] {
+  return [
+    {
+      type: 'namespace',
+      name: WORKSPACE_DYNAMIC_TOOL_NAMESPACE,
+      description: writable
+        ? 'Read and write files in the active workflow worktree.'
+        : 'Read-only access to files in the active workflow workspace.',
+      tools: writable
+        ? [...WORKSPACE_READ_TOOLS, ...WORKSPACE_WRITE_TOOLS]
+        : [...WORKSPACE_READ_TOOLS],
+    },
+  ];
+}
 
 export class CodexSubagentBackend implements SubagentBackend {
   readonly name = 'codex-subagent';
@@ -167,6 +234,7 @@ export class CodexSubagentBackend implements SubagentBackend {
   private readonly reasoningEffort: ReasoningEffort;
   private readonly verbosity: Verbosity;
   private readonly webSearch: boolean;
+  private readonly fileWrite: boolean;
   private child: ChildProcessWithoutNullStreams | null = null;
   private lineReader: readline.Interface | null = null;
   private nextId = 1;
@@ -176,6 +244,10 @@ export class CodexSubagentBackend implements SubagentBackend {
   private readonly turnWaiters = new Map<string, TurnWaiter>();
   private readonly bufferedTurnStates = new Map<string, BufferedTurnState>();
   private readonly threadReadRoots = new Map<string, string>();
+  // Write root per thread, recorded ONLY for a worktree-isolated thread when file writes are
+  // enabled. A thread absent from this map has no write capability; the write handlers reject
+  // on a missing entry (defense in depth beyond omitting the tools from the tool list).
+  private readonly threadWriteRoots = new Map<string, string>();
   private isolation: CodexIsolation | null = null;
   private resolvedModel?: string;
   private modelCatalog: readonly CodexModelCapability[] = [];
@@ -193,6 +265,7 @@ export class CodexSubagentBackend implements SubagentBackend {
     this.reasoningEffort = options.reasoningEffort ?? codexDefaultReasoningEffort();
     this.verbosity = options.verbosity ?? codexDefaultVerbosity();
     this.webSearch = options.webSearch ?? false;
+    this.fileWrite = options.fileWrite ?? false;
   }
 
   async generate(request: SubagentRequest, signal?: AbortSignal): Promise<SubagentResult> {
@@ -274,6 +347,7 @@ export class CodexSubagentBackend implements SubagentBackend {
     this.turnWaiters.clear();
     this.clearBufferedTurnStates();
     this.threadReadRoots.clear();
+    this.threadWriteRoots.clear();
     this.lineReader?.close();
     if (child) {
       child.stdin.destroy();
@@ -372,6 +446,10 @@ export class CodexSubagentBackend implements SubagentBackend {
     cwd: string,
     workspaceWrite: boolean,
   ): Promise<string> {
+    // Writes are offered ONLY to a worktree-isolated thread (workspaceWrite) and only when the
+    // gate is on. Because our dynamic-tool handlers run unsandboxed in this process, a read-only
+    // thread must never receive write tools or a write root.
+    const writable = workspaceWrite && this.fileWrite;
     const thread = await this.send('thread/start', {
       cwd,
       model,
@@ -379,7 +457,7 @@ export class CodexSubagentBackend implements SubagentBackend {
       approvalPolicy: 'never',
       sandbox: workspaceWrite ? 'workspace-write' : 'read-only',
       environments: [],
-      dynamicTools: WORKSPACE_DYNAMIC_TOOLS,
+      dynamicTools: workspaceDynamicTools(writable),
       ephemeral: true,
       baseInstructions: 'Ultracode workflow subagent. Produce only the workflow agent return value.',
       developerInstructions: structured
@@ -397,7 +475,9 @@ export class CodexSubagentBackend implements SubagentBackend {
     });
     const threadId = readPath<string>(thread, ['result', 'thread', 'id']);
     if (!threadId) throw new Error('codex app-server did not return a thread id');
-    this.threadReadRoots.set(threadId, await realpath(cwd).catch(() => resolve(cwd)));
+    const canonicalRoot = await realpath(cwd).catch(() => resolve(cwd));
+    this.threadReadRoots.set(threadId, canonicalRoot);
+    if (writable) this.threadWriteRoots.set(threadId, canonicalRoot);
     return threadId;
   }
 
@@ -425,6 +505,7 @@ export class CodexSubagentBackend implements SubagentBackend {
 
   private archiveThread(threadId: string): void {
     this.threadReadRoots.delete(threadId);
+    this.threadWriteRoots.delete(threadId);
     void this.send('thread/archive', { threadId }).catch(() => undefined);
   }
 
@@ -467,6 +548,16 @@ export class CodexSubagentBackend implements SubagentBackend {
       return;
     }
     const id = typeof message.id === 'number' ? message.id : null;
+    // Classify by `method` presence FIRST, per JSON-RPC 2.0: a response never carries `method`,
+    // a request/notification always does. Keying on `pending.has(id)` first would misroute a
+    // server-initiated request (e.g. item/tool/call) as a response whenever its id happens to
+    // collide with an outstanding client request id, resolving the wrong promise and dropping the
+    // tool call. Method-first makes the two id spaces independent.
+    if (typeof message.method === 'string') {
+      if (id !== null) this.respondToServerRequest(id, message.method, message.params);
+      else this.handleNotification(message.method, message.params);
+      return;
+    }
     if (id !== null && this.pending.has(id)) {
       const pending = this.pending.get(id);
       if (!pending) return;
@@ -474,13 +565,7 @@ export class CodexSubagentBackend implements SubagentBackend {
       clearTimeout(pending.timer);
       if (message.error) pending.reject(new Error(`${pending.method} failed: ${JSON.stringify(message.error)}`));
       else pending.resolve(message);
-      return;
     }
-    if (id !== null && typeof message.method === 'string') {
-      this.respondToServerRequest(id, message.method, message.params);
-      return;
-    }
-    if (typeof message.method === 'string') this.handleNotification(message.method, message.params);
   }
 
   private respondToServerRequest(id: number, method: string, params: unknown): void {
@@ -518,7 +603,7 @@ export class CodexSubagentBackend implements SubagentBackend {
     const rawTool = typeof data?.tool === 'string' ? data.tool : '';
     const tool = namespace === WORKSPACE_DYNAMIC_TOOL_NAMESPACE
       ? rawTool
-      : namespace === null && (rawTool === 'read_file' || rawTool === 'list_directory')
+      : namespace === null && WORKSPACE_BARE_TOOL_NAMES.has(rawTool)
         ? rawTool
       : rawTool.startsWith(`${WORKSPACE_DYNAMIC_TOOL_NAMESPACE}.`)
         ? rawTool.slice(WORKSPACE_DYNAMIC_TOOL_NAMESPACE.length + 1)
@@ -529,6 +614,17 @@ export class CodexSubagentBackend implements SubagentBackend {
     }
     if (tool === 'list_directory') {
       return await this.listWorkspaceDirectory(root, args).catch((err) => dynamicToolFailure(workflowToolErrorMessage(err)));
+    }
+    if (tool === 'write_file' || tool === 'str_replace') {
+      // Writes require a recorded write root: present only for a worktree-isolated thread with the
+      // gate on. A read-only thread has none, so a stray write call fails closed here even if the
+      // tool were somehow offered. The write root, not the read root, confines every write path.
+      const writeRoot = this.threadWriteRoots.get(threadId);
+      if (!writeRoot) return dynamicToolFailure('File writes are not enabled for this agent.');
+      const handler = tool === 'write_file'
+        ? this.writeWorkspaceFile(writeRoot, args)
+        : this.strReplaceWorkspaceFile(writeRoot, args);
+      return await handler.catch((err) => dynamicToolFailure(workflowToolErrorMessage(err)));
     }
     return dynamicToolFailure(`Unsupported workspace tool: ${namespace ? `${namespace}.` : ''}${rawTool}`);
   }
@@ -575,6 +671,69 @@ export class CodexSubagentBackend implements SubagentBackend {
       '',
       ...visible,
     ].join('\n') + truncated);
+  }
+
+  private async writeWorkspaceFile(root: string, args: Record<string, unknown>): Promise<DynamicToolCallResponse> {
+    const requestedPath = typeof args.path === 'string' ? args.path : '';
+    if (!requestedPath.trim()) return dynamicToolFailure('write_file requires a non-empty path string.');
+    if (typeof args.content !== 'string') return dynamicToolFailure('write_file requires a string content.');
+    const bytes = Buffer.byteLength(args.content, 'utf8');
+    if (bytes > MAX_WORKSPACE_TOOL_WRITE_BYTES) {
+      return dynamicToolFailure(`content is ${bytes} bytes; write limit is ${MAX_WORKSPACE_TOOL_WRITE_BYTES} bytes.`);
+    }
+    const target = await resolveWorkspaceWritePath(root, requestedPath);
+    if (isGitInternalPath(target.relativePath)) return dynamicToolFailure(`refusing to write git metadata path ${target.relativePath}.`);
+    await mkdir(dirname(target.path), { recursive: true }).catch((err) => {
+      throw new Error(`Cannot create parent directory for ${target.relativePath}: ${workflowToolErrorMessage(err)}`);
+    });
+    await atomicWriteFile(target.path, args.content).catch((err) => {
+      throw new Error(`Cannot write ${target.relativePath}: ${workflowToolErrorMessage(err)}`);
+    });
+    return dynamicToolSuccess(`wrote ${target.relativePath} (${bytes} bytes)`);
+  }
+
+  private async strReplaceWorkspaceFile(root: string, args: Record<string, unknown>): Promise<DynamicToolCallResponse> {
+    const requestedPath = typeof args.path === 'string' ? args.path : '';
+    if (!requestedPath.trim()) return dynamicToolFailure('str_replace requires a non-empty path string.');
+    if (typeof args.old_str !== 'string' || args.old_str === '') return dynamicToolFailure('str_replace requires a non-empty old_str string.');
+    if (typeof args.new_str !== 'string') return dynamicToolFailure('str_replace requires a string new_str.');
+    // Existing-file resolver: realpaths the target and re-verifies it is inside root (symlink-safe),
+    // so the read-then-write-back lands on the same in-root canonical path.
+    const target = await resolveWorkspaceToolPath(root, requestedPath);
+    if (isGitInternalPath(target.relativePath)) return dynamicToolFailure(`refusing to edit git metadata path ${target.relativePath}.`);
+    const fileStat = await stat(target.path).catch((err) => {
+      throw new Error(`Cannot stat ${target.relativePath}: ${workflowToolErrorMessage(err)}`);
+    });
+    if (!fileStat.isFile()) return dynamicToolFailure(`${target.relativePath} is not a file.`);
+    if (fileStat.size > MAX_WORKSPACE_TOOL_READ_BYTES) {
+      return dynamicToolFailure(`${target.relativePath} is ${fileStat.size} bytes; limit is ${MAX_WORKSPACE_TOOL_READ_BYTES} bytes.`);
+    }
+    // Read as bytes and require a lossless UTF-8 round-trip: rejects binary AND invalid-UTF-8 text
+    // (not just NUL bytes), so a write-back cannot silently corrupt non-UTF-8 content.
+    const raw = await readFile(target.path).catch((err) => {
+      throw new Error(`Cannot read ${target.relativePath}: ${workflowToolErrorMessage(err)}`);
+    });
+    const text = raw.toString('utf8');
+    if (!Buffer.from(text, 'utf8').equals(raw)) {
+      return dynamicToolFailure(`${target.relativePath} is not valid UTF-8 text; str_replace only edits UTF-8 files.`);
+    }
+    const occurrences = countOccurrences(text, args.old_str);
+    if (occurrences === 0) return dynamicToolFailure(`old_str was not found in ${target.relativePath}.`);
+    if (occurrences > 1) {
+      return dynamicToolFailure(`old_str appears ${occurrences} times in ${target.relativePath}; add surrounding context so it matches exactly once.`);
+    }
+    // Function replacement so `$&`/`$1`/`$$` in new_str are inserted literally, not treated as
+    // String.prototype.replace substitution patterns. Exactly one occurrence, verified above.
+    const newStr = args.new_str;
+    const next = text.replace(args.old_str, () => newStr);
+    const bytes = Buffer.byteLength(next, 'utf8');
+    if (bytes > MAX_WORKSPACE_TOOL_WRITE_BYTES) {
+      return dynamicToolFailure(`result is ${bytes} bytes; write limit is ${MAX_WORKSPACE_TOOL_WRITE_BYTES} bytes.`);
+    }
+    await atomicWriteFile(target.path, next).catch((err) => {
+      throw new Error(`Cannot write ${target.relativePath}: ${workflowToolErrorMessage(err)}`);
+    });
+    return dynamicToolSuccess(`edited ${target.relativePath} (${bytes} bytes)`);
   }
 
   private handleNotification(method: string, params: unknown): void {
@@ -862,6 +1021,79 @@ async function resolveWorkspaceToolPath(
 function pathInsideOrEqual(parent: string, child: string): boolean {
   const candidate = relative(parent, child);
   return candidate === '' || (!candidate.startsWith('..') && !isAbsolute(candidate));
+}
+
+// Write-path resolver that permits a not-yet-existing target (create) while staying symlink-safe.
+// `root` is already canonical (realpath at thread start). It rejects any path outside root, then
+// canonicalizes the NEAREST EXISTING ancestor and re-verifies it is inside root: an existing target
+// or ancestor that is a symlink pointing outside is caught by realpath; not-yet-existing tail
+// segments cannot be symlinks, so they append lexically under the canonical ancestor.
+async function resolveWorkspaceWritePath(
+  root: string,
+  requestedPath: string,
+): Promise<{ readonly path: string; readonly relativePath: string }> {
+  const requested = requestedPath.trim();
+  const candidate = isAbsolute(requested) ? resolve(requested) : resolve(root, requested);
+  if (!pathInsideOrEqual(root, candidate)) {
+    throw new Error(`Path escapes workspace: ${requestedPath}`);
+  }
+  let existing = candidate;
+  const tail: string[] = [];
+  for (;;) {
+    const canonical = await realpath(existing).catch(() => null);
+    if (canonical !== null) {
+      if (!pathInsideOrEqual(root, canonical)) {
+        throw new Error(`Path escapes workspace: ${requestedPath}`);
+      }
+      const resolved = tail.length ? join(canonical, ...tail.slice().reverse()) : canonical;
+      if (!pathInsideOrEqual(root, resolved)) {
+        throw new Error(`Path escapes workspace: ${requestedPath}`);
+      }
+      return { path: resolved, relativePath: relative(root, resolved) || '.' };
+    }
+    const parent = dirname(existing);
+    if (parent === existing) {
+      throw new Error(`Path escapes workspace: ${requestedPath}`);
+    }
+    tail.push(basename(existing));
+    existing = parent;
+  }
+}
+
+// A path is git-internal if any segment is `.git` (the linked-worktree pointer file or, in a normal
+// checkout, the repo metadata dir). Writing it can corrupt worktree linkage or plant hooks, so it is
+// refused even though it stays inside the workspace root.
+function isGitInternalPath(relativePath: string): boolean {
+  return relativePath.split('/').some((segment) => segment === '.git');
+}
+
+// Write via a temp sibling + rename so a crash mid-write can never truncate/partially overwrite the
+// target (important for str_replace, which would otherwise destroy the original). rename replaces the
+// destination name atomically and does not follow a destination symlink. The temp file shares the
+// target's directory (same filesystem, already confined inside root) so the rename is atomic.
+async function atomicWriteFile(targetPath: string, content: string): Promise<void> {
+  const tmpPath = `${targetPath}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tmpPath, content, 'utf8');
+    await rename(tmpPath, targetPath);
+  } catch (err) {
+    await rm(tmpPath, { force: true }).catch(() => undefined);
+    throw err;
+  }
+}
+
+// Counts OVERLAPPING occurrences (advance by 1, not needle.length) so a self-overlapping old_str
+// (e.g. "aa" in "aaa") is reported as ambiguous (>1) and rejected, rather than silently editing the
+// first non-overlapping match — the uniqueness guard must treat overlapping matches as non-unique.
+function countOccurrences(haystack: string, needle: string): number {
+  if (needle === '') return 0;
+  let count = 0;
+  let index = haystack.indexOf(needle);
+  while (index !== -1) {
+    count += 1;
+    index = haystack.indexOf(needle, index + 1);
+  }
+  return count;
 }
 
 function dynamicToolSuccess(text: string): DynamicToolCallResponse {

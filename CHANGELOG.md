@@ -10,6 +10,20 @@ the project uses [semantic versioning](https://semver.org/).
 
 ### Added
 
+- `workflow.agentFileWrite` (`--agent-file-write`): opt-in file writes for **worktree-isolated**
+  subagents. `disabled` (the default) offers only the read-only workspace tools, so existing
+  behavior is byte-identical. When `enabled`, an agent running under `isolation: "worktree"`
+  additionally gets `write_file` (create/overwrite) and `str_replace` (edit the single unique
+  occurrence) tools, **confined to that worktree** by a symlink-safe path guard; a read-only
+  (non-isolated) agent never gets them. This makes worktree isolation's writes — previously a
+  write-permitted sandbox with no write tool — actually functional. Writes are run-level
+  (re-pass on resume) and execute in the runtime process, so the path guard is the containment.
+  Known limits: writes to gitignored paths may be reclaimed under `remove-clean` retention (use
+  tracked paths or `--worktree-retention preserve-all`); writes are per-agent-private (a sibling
+  agent does not see them) and are surfaced for human review, not fed to downstream agents; a
+  resumed run replays cached results without re-writing. See
+  `docs/ultracode-p8-agent-file-write.md`.
+
 - `workflow.agentWebSearch` (`--agent-web-search`): opt-in support for workflow
   subagents to use the native Codex `web_search` tool. `disabled` (the default) keeps
   `web_search="disabled"` at every Codex config site, so existing behavior is
