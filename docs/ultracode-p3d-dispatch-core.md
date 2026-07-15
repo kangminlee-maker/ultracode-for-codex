@@ -177,6 +177,8 @@ Both lenses (authority + code/execution) converged on these; recorded as settled
 - **O-3** — `src/runtime/async-queue.ts` is pre-existing dead code (B14). Out of scope for this change; flagged for separate removal.
 - **O-4** — worktree-add burst is not gated by the pool (§4A). Accepted (git serializes add safely); a lighter git-I/O gate is possible if contention ever appears.
 - **O-5** — pool releases on `generated` settle, which precedes app-server `turn/completed` confirmation, so an aborted dispatch's provider turn can briefly outlive its permit. Accepted as native-parity (any client-side pool has this); a full quiescence contract (hold until authoritative `turn/completed` + bounded interrupt grace) is deferred backend work.
+- **O-6 (impl-review finding 1, confirmed: 136ms→473ms with pool on)** — the honest-bound fix (O-5/DW-A6: hold the permit until the abandoned dispatch settles) is in direct tension with the stall mechanism: when an attempt stalls, its permit is held until the orphaned dispatch unwinds, and the *retry's* `acquire()` blocks on it with no clock of its own, so stall-retry serializes behind the orphan rather than behind `agentStallTimeoutMs`. For the real backend this bites when a turn is stuck in the pre-`waitForTurn` RPC phase (before its abort listener exists), bounded by `rpcTimeoutMs`. **This is a genuine tradeoff between two reviewer-flagged concerns (design-review blocker 2 wants the honest bound; impl-review finding 1 wants stall responsiveness); they are contradictory when the orphan lingers.** Not fixed here: A is default-off, and resolving it (bound the retry's acquire by the stall clock, or release on abandon and accept teardown overlap) is a design decision, not a mechanical fix. Must be settled before the pool is enabled by default. Surfaced to owner with the flip decision.
+- **O-7 (impl-review finding 2)** — `agentConcurrency: 'auto'` calls `availableParallelism()` fresh each process start, so `budget.agentConcurrency` can differ between a run's launch and its resume if host CPU count changes. Unlike the other (constant) budget fields it is environment-dependent. Low practical odds (same-host resume is the norm) but unguarded. Mitigation for determinism-critical runs: pin a fixed integer instead of `'auto'`. A durable pin (resolve once at launch, reuse on resume) would touch genesis/journal state — deferred with p3e's journal work.
 
 ## 7. Gates
 
@@ -216,6 +218,16 @@ Kind diversity survived (authority + code/execution, cross-family), so this is a
 - **B13 narrowed.** "Every backend failure is retryable" holds for in-attempt uncoded failures, but `prepare()` failures run before the task/CLI-retry machinery exists — so prepare-time classification is a separate path (folded into C's scope above).
 
 **Deferred to p3e (all B-related):** budget exhaustion swallowed by `parallel()`/`pipeline()` `null`-catch; `remaining() === Infinity` cannot cross the journal boundary (use comparison-only or `null`); failed/retried-turn spend invisible (O-2 becomes blocking for a spend authority); `budget` API extension is not byte-identical if scripts enumerate keys.
+
+### Implementation review (round 2, after A+C landed — 2026-07-15)
+
+Independent adversarial review (Sonnet) of the committed diff `98a0fb8..HEAD`, re-verified by me against real code. Outcome:
+- **Finding 1 [HIGH, confirmed] — pool + stall-retry latency.** Real; measured. Recorded as O-6; not fixed (default-off; needs an owner decision). This is the impl-review's counterpoint to the design-review's blocker 2 — the two are in tension.
+- **Finding 2 [MEDIUM] — `'auto'` not resume-safe.** Recorded as O-7.
+- **Finding 3 [MEDIUM] — DW-A3/A4 lacked tests.** Fixed: added `permit waiting does not count toward the agent stall timeout (DW-A3)` and `cancelling a workflow settles queued permit waiters without hanging (DW-A4)`.
+- **Finding 4 [MEDIUM→LOW after re-verification] — SubagentFailure classification lost under concurrent abort.** The reviewer traced `runAgentAttempt` but not `runAgentInner`: the abort catch (`workflow-runtime.ts:3036-3037, 3057`) journals `workflow_aborted` and returns `null`, so the failure reason is **not** flipped to `workflow_input_invalid` — the run's reason is `workflow_aborted` either way. Only the diagnostic log is skipped while aborting, which is acceptable. No code change; over-claim corrected.
+- **Latent contract gap (area 2) — a synchronously-throwing backend would leak a permit forever.** Fixed defensively: `backend.generate()` is now wrapped so a sync throw releases the permit before rethrowing.
+- Confirmed-correct by the reviewer: pool permit accounting (no leak/double-release), `workflow_agent_terminal` set membership, exhaustive `turn/completed` status, `classifyCodexErrorInfo` hybrid-shape handling.
 
 ## 9. Superseded claims
 

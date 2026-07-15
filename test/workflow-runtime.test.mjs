@@ -1771,6 +1771,52 @@ test('agentConcurrency holds the permit until the real dispatch settles, not the
   }
 });
 
+test('permit waiting does not count toward the agent stall timeout (DW-A3)', async () => {
+  const backend = new FakeSubagentBackend();
+  // Pool size 1 serializes 3 agents that each work ~75ms. Total serialized time (~225ms)
+  // exceeds the 150ms stall timeout, but no single agent's WORK does. If permit waiting
+  // counted toward the stall clock the later agents would stall; acquiring before the
+  // timer starts means each agent's clock covers only its own dispatch.
+  const { runtime } = await createRuntime({
+    backend,
+    runtimeOptions: { agentConcurrency: 1, agentStallTimeoutMs: 150 },
+  });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "pool-stall-isolation" };\n'
+        + 'return await parallel([() => agent("SILENT_75MS a"), () => agent("SILENT_75MS b"), () => agent("SILENT_75MS c")]);',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed', 'serialized agents must not stall while waiting for a permit');
+    assert.equal(backend.requests.length, 3);
+    assert.equal(backend.maxActiveRequests, 1);
+    assert.equal(snapshot.events.some((event) => event.type === 'workflow.log' && /stalled/.test(event.message)), false);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('cancelling a workflow settles queued permit waiters without hanging (DW-A4)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend, runtimeOptions: { agentConcurrency: 1 } });
+  try {
+    // Pool size 1: the first WAIT agent holds the permit (it never resolves until abort);
+    // the other two queue on it. Cancelling must settle the queued waiters and terminate --
+    // a leaked/unsettled waiter would hang this await forever.
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "pool-cancel" };\n'
+        + 'return await parallel([() => agent("WAIT a"), () => agent("WAIT b"), () => agent("WAIT c")]);',
+    });
+    await waitForEvent(runtime, launch.taskId, 'workflow.agent.started');
+    const cancelled = await runtime.cancel(launch.taskId);
+    assert.equal(cancelled.status, 'failed');
+    assert.equal(cancelled.failureReason, 'workflow_aborted');
+  } finally {
+    await runtime.close();
+  }
+});
+
 class ClassifiedFailureBackend {
   name = 'classified-failure';
   model = 'fake-model';

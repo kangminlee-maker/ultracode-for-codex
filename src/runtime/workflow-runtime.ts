@@ -3250,10 +3250,19 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         | { readonly type: 'result'; readonly result: SubagentResult }
         | { readonly type: 'error'; readonly error: unknown }
         | { readonly type: 'aborted' };
-      const dispatched: Promise<AgentAttemptOutcome> = this.options.backend.generate(request, attemptController.signal).then(
-        (result) => ({ type: 'result', result }),
-        (err) => ({ type: 'error', error: err }),
-      );
+      let dispatched: Promise<AgentAttemptOutcome>;
+      try {
+        dispatched = this.options.backend.generate(request, attemptController.signal).then(
+          (result) => ({ type: 'result', result }),
+          (err) => ({ type: 'error', error: err }),
+        );
+      } catch (syncErr) {
+        // A backend is contracted to return a promise; if one throws synchronously the
+        // permit would otherwise leak (its release transfers to `dispatched` below and
+        // that promise never exists), deadlocking the pool. Release before rethrowing.
+        if (releaseAgentPermit) releaseAgentPermit();
+        throw syncErr;
+      }
       // Release when the real dispatch settles, not when the abort race resolves.
       const generated = releaseAgentPermit
         ? dispatched.finally(releaseAgentPermit)
