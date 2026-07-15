@@ -40,33 +40,8 @@ function runCli(args, context) {
   });
 }
 
-test('worktree clean reads destructive flags by value and rejects contradictory or unknown input', async () => {
-  const context = await makeCliContext();
 
-  // Presence-based parsing would read the literal "false" as enabling --force and let the
-  // destructive path run; by value this must trip the force gate instead.
-  const valued = await runCli(['worktree', 'clean', '--all=true', '--force=false'], context);
-  assert.equal(valued.code, 1, valued.stdout);
-  assert.match(valued.stderr, /--all requires --force/);
-
-  const contradictory = await runCli(['worktree', 'clean', '--clean-only', '--all', '--force'], context);
-  assert.equal(contradictory.code, 1, contradictory.stdout);
-  assert.match(contradictory.stderr, /--clean-only cannot be combined with --all/);
-
-  const nonBoolean = await runCli(['worktree', 'clean', '--all=maybe'], context);
-  assert.equal(nonBoolean.code, 1, nonBoolean.stdout);
-  assert.match(nonBoolean.stderr, /all must be true or false/);
-
-  const unknown = await runCli(['worktree', 'clean', '--bogus'], context);
-  assert.equal(unknown.code, 1, unknown.stdout);
-  assert.match(unknown.stderr, /does not accept --bogus/);
-
-  const badSubcommand = await runCli(['worktree', 'bogus'], context);
-  assert.equal(badSubcommand.code, 1, badSubcommand.stdout);
-  assert.match(badSubcommand.stderr, /one subcommand: clean/);
-});
-
-test('a background launch rejects invalid run options instead of reporting a job that dies', async () => {
+test('a background launch rejects an invalid run option instead of reporting a job that dies', async () => {
   const context = await makeCliContext();
   // Background is the default mode and reports success immediately, so an option parsed
   // only in the detached child would leave an empty result record and an unknown exit.
@@ -76,13 +51,6 @@ test('a background launch rejects invalid run options instead of reporting a job
   );
   assert.equal(retention.code, 1, retention.stdout);
   assert.match(retention.stderr, /worktree-retention must be one of/);
-
-  const backoff = await runCli(
-    ['run', '--accept-llm-guide=v1', '--permission', 'allow', '--retry-backoff-ms', 'soon', '--script', SUCCEEDING_SCRIPT],
-    context,
-  );
-  assert.equal(backoff.code, 1, backoff.stdout);
-  assert.match(backoff.stderr, /retry-backoff-ms/);
 });
 
 test('attached terminal failure writes a parseable failure record to stdout', async () => {

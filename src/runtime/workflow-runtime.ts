@@ -282,9 +282,6 @@ interface WorkflowTaskMutable {
   workflowSourcePath?: string;
   scriptHash: string;
   isolationReview: WorkflowIsolationReview;
-  // Worktree-store run directory, set once this run creates its first isolated worktree.
-  // The run owns the liveness marker there and clears it when the run becomes terminal.
-  worktreeRunDir?: string;
   startedAt: number;
   journal: WorkflowJournalWriter;
   resultPath?: string;
@@ -559,6 +556,7 @@ const WORKFLOW_STABLE_FAILURE_CODES = new Set([
   WORKFLOW_JOURNAL_WRITE_FAILED_REASON,
   'runtime_closed',
   'workflow_aborted',
+  'workflow_agent_failed',
   'workflow_agent_stalled',
   'workflow_input_invalid',
   'workflow_meta_invalid',
@@ -574,6 +572,7 @@ const WORKFLOW_STABLE_FAILURE_CODES = new Set([
 // catch-all), and a newly introduced failure code defaults to non-retryable until listed.
 const WORKFLOW_RETRYABLE_FAILURE_CODES = new Set([
   'workflow_failed',
+  'workflow_agent_failed',
   'workflow_agent_stalled',
   WORKFLOW_JOURNAL_WRITE_FAILED_REASON,
   'workflow_structured_output_failed',
@@ -3060,19 +3059,6 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     }
     const worktreeRoot = join(workflowWorktreeStoreRoot(gitRoot), ctx.task.runId);
     await ensureWorkflowStateDirectory(worktreeRoot);
-    // Colocate a run-liveness marker in the worktree store so `worktree clean` can tell a
-    // live run's worktrees from reclaimable ones. The transcript-dir run.pid lives under a
-    // cwd-partitioned state dir and is not locatable from a gitRoot-partitioned worktree.
-    // This is the only thing standing between a live agent and `worktree clean`, so it fails
-    // closed: no isolated worktree may exist without a marker that protects it.
-    try {
-      await writeWorkflowStateFile(workflowRunPidPath(worktreeRoot), `${process.pid}\n`);
-    } catch (err) {
-      throw workflowInputError(`worktree isolation could not write the run liveness marker: ${workflowErrorMessage(err)}`);
-    }
-    // The marker belongs to this run: finalizeTask clears it so a finished run's worktrees
-    // stop reading as live and become reclaimable.
-    ctx.task.worktreeRunDir = worktreeRoot;
     const worktreePath = join(worktreeRoot, attemptIndex === 0 ? agentId : `${agentId}-attempt-${attemptIndex + 1}`);
     try {
       await gitOutput(gitRoot, ['worktree', 'add', '--detach', worktreePath, 'HEAD']);
@@ -3252,7 +3238,12 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
         throw workflowInputError('Workflow is aborted.');
       }
-      throw outcome.error;
+      // The backend surfaces its failures as plain, uncoded Errors. Left uncoded they
+      // collapse into the `workflow_failed` catch-all, which is indistinguishable from an
+      // uncoded throw in workflow script code -- so any downstream classifier has to guess
+      // transient-vs-deterministic from the shape of the error, and guesses wrong. Code the
+      // failure here, at the boundary it crosses, so classification never has to infer it.
+      throw codedAgentFailure(outcome.error);
     } finally {
       if (timer) clearTimeout(timer);
       ctx.controller.signal.removeEventListener('abort', abortFromWorkflow);
@@ -3427,10 +3418,6 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         this.notifyTaskWaiters(task);
       }
       await rm(workflowRunPidPath(task.transcriptDir), { force: true }).catch(() => undefined);
-      // Drop the worktree-store liveness marker: this run no longer protects its worktrees.
-      if (task.worktreeRunDir) {
-        await rm(workflowRunPidPath(task.worktreeRunDir), { force: true }).catch(() => undefined);
-      }
       return workflowTaskSnapshot(task);
     })();
     return await task.terminalFinalization;
@@ -6576,8 +6563,7 @@ function isWorkflowProcessAlive(pid: number): boolean {
 }
 
 // Sibling-of-repo store that holds every run's isolated worktrees, keyed by repo slug and
-// hash. createAgentWorktree and `worktree clean` share this convention so cleanup only ever
-// touches runtime-owned paths.
+// hash, so isolated checkouts never land inside the source working tree.
 function workflowWorktreeStoreRoot(gitRoot: string): string {
   return join(
     dirname(gitRoot),
@@ -6586,147 +6572,6 @@ function workflowWorktreeStoreRoot(gitRoot: string): string {
   );
 }
 
-export interface WorktreeCleanOptions {
-  readonly cwd: string;
-  readonly includeChanged: boolean;
-  readonly force: boolean;
-  readonly dryRun: boolean;
-}
-
-export interface WorktreeCleanEntry {
-  readonly path: string;
-  readonly runId: string | null;
-  readonly action: 'removed' | 'kept-changed' | 'kept-live' | 'kept-unavailable' | 'would-remove' | 'failed';
-  readonly detail?: string;
-}
-
-export interface WorktreeCleanResult {
-  readonly storeRoot: string;
-  readonly entries: readonly WorktreeCleanEntry[];
-}
-
-// Offline reclaim of leaked isolated worktrees. Enumerates only worktrees under this repo's
-// runtime-owned store (canonical path containment, never a substring match), never touches a
-// live run's worktrees (colocated run.pid liveness), removes clean ones by delegating the
-// cleanliness gate to `git worktree remove` (no --force), and only removes changed ones under
-// an explicit --all --force. prune + empty-run-dir reclaim run afterwards.
-export async function cleanWorkflowWorktrees(options: WorktreeCleanOptions): Promise<WorktreeCleanResult> {
-  let gitRoot: string;
-  try {
-    gitRoot = await gitOutput(options.cwd, ['rev-parse', '--show-toplevel']);
-  } catch (err) {
-    throw workflowInputError(`worktree clean requires a git repository: ${workflowErrorMessage(err)}`);
-  }
-  const storeRoot = workflowWorktreeStoreRoot(gitRoot);
-  const canonicalStore = await realpath(storeRoot).catch(() => null);
-  if (!canonicalStore) return { storeRoot, entries: [] };
-
-  const entries: WorktreeCleanEntry[] = [];
-  const runIdsWithKeptWorktree = new Set<string>();
-  for (const rawPath of await listGitWorktreePaths(gitRoot)) {
-    const canonical = await realpath(rawPath).catch(() => null);
-    if (!canonical || !pathInsideOrEqual(canonicalStore, canonical) || canonical === canonicalStore) continue;
-    const runId = worktreeStoreRunId(canonicalStore, canonical);
-    if (runId && await isWorktreeRunLive(canonicalStore, runId)) {
-      entries.push({ path: canonical, runId, action: 'kept-live' });
-      runIdsWithKeptWorktree.add(runId);
-      continue;
-    }
-    const state = await worktreeRemovalState(canonical);
-    if (state === 'unavailable') {
-      // A worktree whose contents could not be assessed is never removed, not even under
-      // --all --force: force may only ever act on changes we actually observed.
-      entries.push({ path: canonical, runId, action: 'kept-unavailable' });
-      if (runId) runIdsWithKeptWorktree.add(runId);
-      continue;
-    }
-    if (state === 'changed' && !(options.includeChanged && options.force)) {
-      entries.push({ path: canonical, runId, action: 'kept-changed' });
-      if (runId) runIdsWithKeptWorktree.add(runId);
-      continue;
-    }
-    if (options.dryRun) {
-      entries.push({ path: canonical, runId, action: 'would-remove', detail: state });
-      continue;
-    }
-    try {
-      await gitOutput(gitRoot, state === 'changed'
-        ? ['worktree', 'remove', '--force', canonical]
-        : ['worktree', 'remove', canonical]);
-      entries.push({ path: canonical, runId, action: 'removed', detail: state });
-    } catch (err) {
-      entries.push({ path: canonical, runId, action: 'failed', detail: workflowErrorMessage(err) });
-      if (runId) runIdsWithKeptWorktree.add(runId);
-    }
-  }
-
-  if (!options.dryRun) {
-    await gitOutput(gitRoot, ['worktree', 'prune']).catch(() => undefined);
-    await reclaimEmptyWorktreeRunDirs(canonicalStore, runIdsWithKeptWorktree);
-  }
-  return { storeRoot, entries };
-}
-
-async function listGitWorktreePaths(gitRoot: string): Promise<readonly string[]> {
-  // `-z` is required for correctness, not just tidiness: without it git C-quotes unusual
-  // path bytes (including non-ASCII under core.quotePath's default), and the quoted text
-  // would fail to resolve, silently skipping real runtime-owned worktrees. `-z` emits raw
-  // NUL-terminated fields, so read the raw (untrimmed) stdout.
-  const out = await gitOutputRaw(gitRoot, ['worktree', 'list', '--porcelain', '-z']).catch(() => '');
-  const paths: string[] = [];
-  for (const field of out.split('\0')) {
-    if (field.startsWith('worktree ')) paths.push(field.slice('worktree '.length));
-  }
-  return paths;
-}
-
-function worktreeStoreRunId(canonicalStore: string, canonicalWorktree: string): string | null {
-  const rel = relative(canonicalStore, canonicalWorktree);
-  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return null;
-  return rel.split(sep)[0] ?? null;
-}
-
-async function isWorktreeRunLive(canonicalStore: string, runId: string): Promise<boolean> {
-  const pidText = await readFile(workflowRunPidPath(join(canonicalStore, runId)), 'utf8').catch(() => '');
-  const pid = Number.parseInt(pidText.trim(), 10);
-  return Number.isInteger(pid) && pid > 0 && isWorkflowProcessAlive(pid);
-}
-
-type WorktreeRemovalState = 'clean' | 'changed' | 'unavailable';
-
-async function worktreeRemovalState(worktreePath: string): Promise<WorktreeRemovalState> {
-  // Match `git worktree remove`'s own criterion: modified or untracked files count as
-  // changed, while ignored artifacts do not, so an ignored-only worktree reads as clean.
-  // A status failure is its own state, never conflated with `changed`: `changed` is what
-  // --force may act on, and an unassessable worktree must stay out of that set.
-  try {
-    const status = await gitOutput(worktreePath, ['status', '--porcelain=v1', '--untracked-files=all']);
-    return status.trim().length > 0 ? 'changed' : 'clean';
-  } catch {
-    return 'unavailable';
-  }
-}
-
-async function reclaimEmptyWorktreeRunDirs(canonicalStore: string, keep: ReadonlySet<string>): Promise<void> {
-  for (const runId of await readdir(canonicalStore).catch(() => [] as string[])) {
-    if (keep.has(runId)) continue;
-    const runDir = join(canonicalStore, runId);
-    // Containment must hold for the *resolved* path, not just the joined one: lstat rejects
-    // a symlinked entry outright (isDirectory() is false for a link), and re-checking the
-    // realpath keeps a relinked directory from moving deletion outside the store.
-    const link = await lstat(runDir).catch(() => null);
-    if (!link?.isDirectory()) continue;
-    const canonicalRunDir = await realpath(runDir).catch(() => null);
-    if (!canonicalRunDir
-      || !pathInsideOrEqual(canonicalStore, canonicalRunDir)
-      || canonicalRunDir === canonicalStore) continue;
-    if (await isWorktreeRunLive(canonicalStore, runId)) continue;
-    const remaining = (await readdir(canonicalRunDir).catch(() => [] as string[])).filter((entry) => entry !== 'run.pid');
-    if (remaining.length > 0) continue;
-    await rm(join(canonicalRunDir, 'run.pid'), { force: true }).catch(() => undefined);
-    await rmdir(canonicalRunDir).catch(() => undefined);
-  }
-}
 
 function workflowResumeUnknownError(runId: string): UltracodeRequestError {
   // Workflow state is partitioned by the exact working directory, so the most
@@ -6777,6 +6622,19 @@ function workflowScriptError(message: string): UltracodeRequestError {
 
 function workflowAgentStalledError(message: string): UltracodeRequestError {
   return new UltracodeRequestError(message, 408, 'invalid_request_error', WORKFLOW_INPUT_PARAM, 'workflow_agent_stalled');
+}
+
+// Give an uncoded backend failure its canonical, retryable code. An error that already
+// carries one (a stall, an aborted workflow) keeps it.
+function codedAgentFailure(err: unknown): unknown {
+  if (workflowFailureReason(err) !== 'workflow_failed') return err;
+  return new UltracodeRequestError(
+    workflowErrorMessage(err),
+    502,
+    'invalid_request_error',
+    WORKFLOW_INPUT_PARAM,
+    'workflow_agent_failed',
+  );
 }
 
 function isWorkflowAgentStalledError(err: unknown): boolean {

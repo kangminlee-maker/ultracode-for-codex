@@ -14,7 +14,6 @@ export interface UltracodeSettings {
     readonly progress: WorkflowProgressMode;
     readonly permission: WorkflowPermissionPolicy;
     readonly retryLimit: number;
-    readonly retryBackoffMs: number;
     readonly timeoutMs: number;
     readonly heartbeatMs: number;
     readonly worktreeRetention: WorktreeRetention;
@@ -74,10 +73,6 @@ export function loadSettings(): UltracodeSettings {
       retryLimit: readNonNegativeIntegerSetting(
         workflow?.retryLimit,
         'workflow.retryLimit',
-      ),
-      retryBackoffMs: readNonNegativeIntegerSetting(
-        workflow?.retryBackoffMs,
-        'workflow.retryBackoffMs',
       ),
       timeoutMs: readNonNegativeIntegerSetting(
         workflow?.timeoutMs,
@@ -143,10 +138,6 @@ export function workflowDefaultPermissionPolicy(): WorkflowPermissionPolicy {
 
 export function workflowDefaultRetryLimit(): number {
   return loadSettings().workflow.retryLimit;
-}
-
-export function workflowDefaultRetryBackoffMs(): number {
-  return loadSettings().workflow.retryBackoffMs;
 }
 
 export function workflowDefaultTimeoutMs(): number {

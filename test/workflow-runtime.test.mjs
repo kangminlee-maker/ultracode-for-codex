@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, delimiter, dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { afterEach, test } from 'node:test';
 import { promisify } from 'node:util';
-import { WorkflowTaskRegistry, isRetryableFailureReason, cleanWorkflowWorktrees } from '../dist/runtime/workflow-runtime.js';
+import { WorkflowTaskRegistry, isRetryableFailureReason } from '../dist/runtime/workflow-runtime.js';
 import {
   WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
   computeWorkflowAgentCallKey,
@@ -225,6 +225,26 @@ return "done";`;
   }
 });
 
+test('a backend failure surfacing through an unawaited agent stays retryable', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend() });
+  try {
+    // Start both, await sequentially: a normal fan-out idiom where the second agent can
+    // reject while the script is still blocked on the first, so it reaches the runtime as
+    // an unhandled tracked-promise rejection rather than a throw from `await`.
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "unawaited-backend-failure" };\nconst first = agent("SILENT_75MS");\nconst second = agent("FAIL_AGENT");\nawait first;\nreturn await second;',
+    });
+    const events = await collectEvents(runtime, launch.taskId);
+    assert.equal(events.at(-1).type, 'workflow.failed');
+    // The backend throws a plain uncoded Error; coding it at the boundary keeps a transient
+    // failure retryable instead of collapsing it into a deterministic-defect wrapper reason.
+    assert.equal(events.at(-1).recovery.reason, 'workflow_agent_failed');
+    assert.equal(events.at(-1).recovery.retryable, true);
+  } finally {
+    await runtime.close();
+  }
+});
+
 test('a plain timer callback throw keeps its wrapper reason and stays non-retryable', async () => {
   const { runtime } = await createRuntime({ backend: new FakeSubagentBackend() });
   try {
@@ -245,6 +265,7 @@ test('a plain timer callback throw keeps its wrapper reason and stays non-retrya
 test('isRetryableFailureReason classifies transient reasons retryable and deterministic reasons non-retryable', () => {
   for (const reason of [
     'workflow_failed',
+    'workflow_agent_failed',
     'workflow_agent_stalled',
     'workflow_journal_write_failed',
     'workflow_structured_output_failed',
@@ -1664,159 +1685,14 @@ test('workflow runtime remove-clean reclaims an ignored-only worktree (native un
   }
 });
 
-async function launchPreservedWorktree(runtime, prompt) {
-  const launch = await runtime.launch({
-    script: `export const meta = { name: "wt-clean-fixture" };\nreturn await agent(${JSON.stringify(prompt)}, { isolation: "worktree" });`,
-  });
-  await collectEvents(runtime, launch.taskId);
-  const snapshot = runtime.get(launch.taskId);
-  assert.equal(snapshot.status, 'completed');
-  const completed = snapshot.events.find((event) => event.type === 'workflow.agent.completed');
-  assert.equal(completed.worktreePreserved, true);
-  return completed.worktreePath;
-}
 
-test('worktree clean removes a clean orphaned worktree and reclaims its run dir', async () => {
-  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { worktreeRetention: 'preserve-all' } });
-  try {
-    await initializeGitRepo(root);
-    const worktreePath = await launchPreservedWorktree(runtime, 'READ_ONLY_WORKTREE');
-    const runDir = dirname(worktreePath);
-    // Simulate a finished run: drop the liveness marker so the worktree is reclaimable.
-    await rm(join(runDir, 'run.pid'), { force: true });
-    const result = await cleanWorkflowWorktrees({ cwd: root, includeChanged: false, force: false, dryRun: false });
-    assert.equal(await fileExists(worktreePath), false);
-    assert.equal(await fileExists(runDir), false);
-    assert.equal(result.entries.some((entry) => entry.path === worktreePath && entry.action === 'removed'), true);
-  } finally {
-    await runtime.close();
-  }
-});
 
-test('worktree clean keeps a changed worktree unless --all --force', async () => {
-  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { worktreeRetention: 'preserve-all' } });
-  try {
-    await initializeGitRepo(root);
-    const worktreePath = await launchPreservedWorktree(runtime, 'WRITE_WORKTREE');
-    await rm(join(dirname(worktreePath), 'run.pid'), { force: true });
-    const kept = await cleanWorkflowWorktrees({ cwd: root, includeChanged: false, force: false, dryRun: false });
-    assert.equal(await fileExists(worktreePath), true);
-    assert.equal(kept.entries.some((entry) => entry.path === worktreePath && entry.action === 'kept-changed'), true);
-    const removed = await cleanWorkflowWorktrees({ cwd: root, includeChanged: true, force: true, dryRun: false });
-    assert.equal(await fileExists(worktreePath), false);
-    assert.equal(removed.entries.some((entry) => entry.path === worktreePath && entry.action === 'removed'), true);
-  } finally {
-    await runtime.close();
-  }
-});
 
-test('worktree clean skips worktrees of a live run even with --all --force', async () => {
-  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { worktreeRetention: 'preserve-all' } });
-  let worktreePath;
-  try {
-    await initializeGitRepo(root);
-    worktreePath = await launchPreservedWorktree(runtime, 'READ_ONLY_WORKTREE');
-    // The finished run clears its own marker, so wait for that to land and then re-assert
-    // liveness with this live test process's pid, standing in for a still-executing run.
-    await waitFor(async () => !(await fileExists(join(dirname(worktreePath), 'run.pid'))));
-    await writeFile(join(dirname(worktreePath), 'run.pid'), `${process.pid}\n`);
-    const result = await cleanWorkflowWorktrees({ cwd: root, includeChanged: true, force: true, dryRun: false });
-    assert.equal(await fileExists(worktreePath), true);
-    assert.equal(result.entries.some((entry) => entry.path === worktreePath && entry.action === 'kept-live'), true);
-  } finally {
-    if (worktreePath) {
-      await gitLines(root, ['worktree', 'remove', '--force', worktreePath]).catch(() => undefined);
-    }
-    await runtime.close();
-  }
-});
 
-test('a finished run clears its worktree liveness marker so its worktrees become reclaimable', async () => {
-  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { worktreeRetention: 'preserve-all' } });
-  try {
-    await initializeGitRepo(root);
-    const worktreePath = await launchPreservedWorktree(runtime, 'READ_ONLY_WORKTREE');
-    // A marker that outlived its run would pin the worktree as live forever, and a reused
-    // pid would make that a false positive; the terminal run must drop it.
-    await waitFor(async () => !(await fileExists(join(dirname(worktreePath), 'run.pid'))));
-    const result = await cleanWorkflowWorktrees({ cwd: root, includeChanged: false, force: false, dryRun: false });
-    assert.equal(await fileExists(worktreePath), false);
-    assert.equal(result.entries.some((entry) => entry.path === worktreePath && entry.action === 'removed'), true);
-  } finally {
-    await runtime.close();
-  }
-});
 
-test('worktree clean never removes a worktree whose status is unavailable, even with --all --force', async () => {
-  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { worktreeRetention: 'preserve-all' } });
-  let worktreePath;
-  try {
-    await initializeGitRepo(root);
-    worktreePath = await launchPreservedWorktree(runtime, 'WRITE_WORKTREE');
-    await waitFor(async () => !(await fileExists(join(dirname(worktreePath), 'run.pid'))));
-    // Break the worktree's git link so `git status` fails: force may only act on changes we
-    // actually observed, never on a worktree we could not assess.
-    await writeFile(join(worktreePath, '.git'), 'gitdir: /nonexistent-ultracode-test\n');
-    const result = await cleanWorkflowWorktrees({ cwd: root, includeChanged: true, force: true, dryRun: false });
-    assert.equal(await fileExists(worktreePath), true);
-    assert.equal(result.entries.some((entry) => entry.path === worktreePath && entry.action === 'kept-unavailable'), true);
-  } finally {
-    if (worktreePath) await rm(worktreePath, { recursive: true, force: true }).catch(() => undefined);
-    await gitLines(root, ['worktree', 'prune']).catch(() => undefined);
-    await runtime.close();
-  }
-});
 
-test('worktree clean refuses to follow a symlinked run directory out of the store', async () => {
-  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { worktreeRetention: 'preserve-all' } });
-  const external = join(dirname(root), `external-runpid-${basename(root)}`);
-  tempDirs.push(external);
-  try {
-    await initializeGitRepo(root);
-    const worktreePath = await launchPreservedWorktree(runtime, 'READ_ONLY_WORKTREE');
-    const storeRoot = dirname(dirname(worktreePath));
-    // An out-of-store directory that looks exactly like a dead, empty run dir.
-    await mkdir(external, { recursive: true });
-    await writeFile(join(external, 'run.pid'), '2147483647\n');
-    await symlink(external, join(storeRoot, 'symlinked-run'));
-    await cleanWorkflowWorktrees({ cwd: root, includeChanged: true, force: true, dryRun: false });
-    // Reclamation must not have traversed the link and deleted the external file.
-    assert.equal(await fileExists(join(external, 'run.pid')), true);
-  } finally {
-    await runtime.close();
-  }
-});
 
-test('worktree clean --dry-run removes nothing', async () => {
-  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { worktreeRetention: 'preserve-all' } });
-  try {
-    await initializeGitRepo(root);
-    const worktreePath = await launchPreservedWorktree(runtime, 'READ_ONLY_WORKTREE');
-    await rm(join(dirname(worktreePath), 'run.pid'), { force: true });
-    const result = await cleanWorkflowWorktrees({ cwd: root, includeChanged: false, force: false, dryRun: true });
-    assert.equal(await fileExists(worktreePath), true);
-    assert.equal(result.entries.some((entry) => entry.path === worktreePath && entry.action === 'would-remove'), true);
-  } finally {
-    await runtime.close();
-  }
-});
 
-test('worktree clean never touches worktrees outside the runtime store', async () => {
-  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { worktreeRetention: 'preserve-all' } });
-  const externalWorktree = join(dirname(root), `external-worktree-${basename(root)}`);
-  tempDirs.push(externalWorktree);
-  try {
-    await initializeGitRepo(root);
-    // A user-created worktree that merely lives near, but not inside, the runtime store.
-    await gitLines(root, ['worktree', 'add', '--detach', externalWorktree, 'HEAD']);
-    const result = await cleanWorkflowWorktrees({ cwd: root, includeChanged: true, force: true, dryRun: false });
-    assert.equal(await fileExists(externalWorktree), true);
-    assert.equal(result.entries.some((entry) => entry.path.includes('external-worktree')), false);
-  } finally {
-    await gitLines(root, ['worktree', 'remove', '--force', externalWorktree]).catch(() => undefined);
-    await runtime.close();
-  }
-});
 
 async function createRuntime({ backend, runtimeOptions = {} }) {
   const root = await mkdtemp(join(tmpdir(), 'workflow-runtime-'));
@@ -2230,16 +2106,6 @@ async function fileExists(path) {
   }
 }
 
-// The run clears its worktree liveness marker just after emitting its terminal event, so a
-// test observing that cleanup polls rather than assuming it already landed.
-async function waitFor(predicate, timeoutMs = 3000) {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    if (await predicate()) return;
-    if (Date.now() >= deadline) assert.fail('waitFor timed out');
-    await sleep(20);
-  }
-}
 
 function jsonValue(value) {
   return JSON.parse(JSON.stringify(value));

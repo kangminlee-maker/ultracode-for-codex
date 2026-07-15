@@ -9,7 +9,7 @@ import { pathToFileURL } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { CodexSubagentBackend } from './codex/subagent-backend.js';
 import { probeCodexSetup } from './codex/setup-probe.js';
-import { WorkflowTaskRegistry, isRetryableFailureReason, cleanWorkflowWorktrees } from './runtime/workflow-runtime.js';
+import { WorkflowTaskRegistry, isRetryableFailureReason } from './runtime/workflow-runtime.js';
 import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, isWorktreeRetention } from './runtime/types.js';
 import { ultracodePackageVersion } from './runtime/package-info.js';
 import { defaultUltracodeStateRoot, resolveUltracodeStatePath } from './runtime/state-root.js';
@@ -27,7 +27,6 @@ import {
   workflowDefaultPermissionPolicy,
   workflowDefaultProgressMode,
   workflowDefaultRetryLimit,
-  workflowDefaultRetryBackoffMs,
   workflowDefaultTimeoutMs,
   workflowDefaultHeartbeatMs,
   workflowDefaultWorktreeRetention,
@@ -83,7 +82,6 @@ async function main(argv: readonly string[]): Promise<number> {
   if (command === 'cancel') return cancelBackgroundJob(args);
   if (command === 'jobs' || command === 'list') return listBackgroundJobs(args);
   if (command === 'archive' || command === 'export') return archiveBackgroundJob(args);
-  if (command === 'worktree') return manageWorktrees(args);
   if (command === 'skills') return manageCodexSkills(args);
   if (command === 'setup' || command === 'doctor') return runCodexSetup(args);
   process.stderr.write(`Unknown command: ${command}\n\n${helpText()}`);
@@ -109,7 +107,6 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   // Parse the run options this command owns before the background branch: a background
   // launch reports success immediately, so an invalid value rejected only in the detached
   // child would surface as an empty result record and an unknown early exit.
-  const retryBackoffMs = parseNonNegativeIntOption(options.retryBackoffMs, workflowDefaultRetryBackoffMs(), 'retry-backoff-ms');
   const worktreeRetention = parseWorktreeRetention(options.worktreeRetention);
   if (executionMode === 'background') {
     const input = await inputPromise;
@@ -162,40 +159,16 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
         return snapshot.failureReason === 'workflow_aborted' ? 130 : 1;
       }
       retries += 1;
-      const backoffMs = computeRetryBackoffMs(retryBackoffMs, retries);
-      const backoffSuffix = backoffMs > 0 ? ` after ${backoffMs}ms` : '';
       renderControlProgress('workflow.retrying', progressMode, {
         status: 'retrying',
-        summary: `Retrying workflow ${retries}/${retryLimit}${backoffSuffix}`,
+        summary: `Retrying workflow ${retries}/${retryLimit}`,
         taskId: snapshot.taskId,
         runId: snapshot.runId,
         workflowName: snapshot.workflowName,
         retryIndex: retries,
         retryLimit,
-        backoffMs,
-      }, `[workflow] retrying ${retries}/${retryLimit}${backoffSuffix}\n`);
-      // A retry backoff must stay cancellable: without its own signal handler the wait
-      // sits between streamCommandWorkflow's handler scope, so Ctrl-C would hard-kill.
-      if (backoffMs > 0 && (await interruptibleBackoff(backoffMs)) === 'interrupted') {
-        // Report the cancellation itself; copying the failed attempt's record would persist
-        // an operator abort as that attempt's transient failure.
-        process.stdout.write(`${JSON.stringify(workflowFailureRecord(snapshot, {
-          reason: 'workflow_aborted',
-          error: 'Retry cancelled by signal during backoff.',
-        }), null, 2)}\n`);
-        return 130;
-      }
-      try {
-        launch = await requireRunnableLaunch(runtime, await runtime.retry(snapshot.taskId), permissionPolicy, progressMode);
-      } catch (err) {
-        // A rejected retry launch must not escape to main's stderr-only handler: in
-        // background mode stdout is result.json, so the job would end with an empty result
-        // and the last progress event stuck at `retrying`.
-        process.stdout.write(`${JSON.stringify(workflowFailureRecord(snapshot, {
-          error: `${snapshot.error ?? 'unknown'} (retry launch failed: ${errorMessage(err)})`,
-        }), null, 2)}\n`);
-        return 1;
-      }
+      }, `[workflow] retrying ${retries}/${retryLimit}\n`);
+      launch = await requireRunnableLaunch(runtime, await runtime.retry(snapshot.taskId), permissionPolicy, progressMode);
     }
   } finally {
     await runtime.close();
@@ -281,13 +254,8 @@ interface ParsedOptions {
   readonly resumeFromRunId?: string;
   readonly validate?: string;
   readonly install?: string;
-  readonly all?: string;
-  readonly force?: string;
-  readonly dryRun?: string;
-  readonly cleanOnly?: string;
   readonly permission?: string;
   readonly retryLimit?: string;
-  readonly retryBackoffMs?: string;
   readonly worktreeRetention?: string;
   readonly jobId?: string;
   readonly metadataPath?: string;
@@ -306,7 +274,7 @@ interface ParsedOptions {
   readonly outputPath?: string;
 }
 
-const VALUELESS_FLAGS = new Set(['install', 'plain', 'result', 'wait', 'validate', 'dryRun', 'all', 'force', 'cleanOnly']);
+const VALUELESS_FLAGS = new Set(['install', 'plain', 'result', 'wait', 'validate']);
 
 export function parseOptions(args: readonly string[]): ParsedOptions {
   const out: Record<string, string | string[]> = { _: [] };
@@ -526,13 +494,8 @@ interface WorkflowFailureRecord {
   };
 }
 
-function workflowFailureRecord(
-  snapshot: WorkflowTaskSnapshot,
-  // Overrides let a terminal condition that is not the snapshot's own failure -- an abort
-  // during a retry backoff, or a rejected retry launch -- be reported as itself instead of
-  // being silently persisted as the preceding attempt's failure.
-  override?: { readonly reason?: string; readonly error?: string },
-): WorkflowFailureRecord {
+
+function workflowFailureRecord(snapshot: WorkflowTaskSnapshot): WorkflowFailureRecord {
   let phase: string | undefined;
   let agentsCompleted: number | undefined;
   for (const event of snapshot.events) {
@@ -544,8 +507,9 @@ function workflowFailureRecord(
     version: 1,
     status: 'failed',
     failure: {
-      reason: override?.reason ?? snapshot.failureReason ?? 'unknown',
-      error: override?.error ?? snapshot.error ?? 'unknown',
+      reason: snapshot.failureReason ?? 'unknown',
+      error: snapshot.error ?? 'unknown',
+
       workflowName: snapshot.workflowName,
       taskId: snapshot.taskId,
       runId: snapshot.runId,
@@ -1232,57 +1196,6 @@ const CODEX_SKILL_NAMES = ['ultracode-for-codex', 'ultracode-for-codex-cli'] as 
 
 export type CodexSkillState = 'current' | 'stale' | 'missing' | 'unmanaged';
 
-async function manageWorktrees(args: readonly string[]): Promise<number> {
-  const options = parseOptions(args);
-  const subcommand = options._[0];
-  if (subcommand !== 'clean') {
-    throw new Error('worktree supports one subcommand: clean.');
-  }
-  if (options._.length > 1) {
-    throw new Error('worktree clean does not accept positional arguments.');
-  }
-  assertKnownWorktreeCleanFlags(options);
-  // Destructive flags are read by value, never by presence: `--all=false` must disable the
-  // destructive mode it names, and a contradictory --clean-only --all must be rejected
-  // rather than silently letting the destructive side win.
-  const cleanOnly = parseBooleanFlag(options.cleanOnly, 'clean-only');
-  const includeChanged = parseBooleanFlag(options.all, 'all');
-  const force = parseBooleanFlag(options.force, 'force');
-  const dryRun = parseBooleanFlag(options.dryRun, 'dry-run');
-  if (cleanOnly && includeChanged) {
-    throw new Error('worktree clean --clean-only cannot be combined with --all.');
-  }
-  if (includeChanged && !force) {
-    throw new Error('worktree clean --all requires --force to remove changed worktrees.');
-  }
-  const result = await cleanWorkflowWorktrees({
-    cwd: options.cwd ?? process.cwd(),
-    includeChanged,
-    force,
-    dryRun,
-  });
-  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-  // An incomplete cleanup must not report process success to status-driven automation.
-  return result.entries.some((entry) => entry.action === 'failed') ? 1 : 0;
-}
-
-const WORKTREE_CLEAN_OPTION_KEYS = new Set(['_', 'cwd', 'cleanOnly', 'all', 'force', 'dryRun']);
-
-function assertKnownWorktreeCleanFlags(options: ParsedOptions): void {
-  for (const key of Object.keys(options)) {
-    if (WORKTREE_CLEAN_OPTION_KEYS.has(key)) continue;
-    const flag = key.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
-    throw new Error(`worktree clean does not accept --${flag}.`);
-  }
-}
-
-function parseBooleanFlag(value: string | undefined, label: string): boolean {
-  if (value === undefined) return false;
-  if (value === 'true') return true;
-  if (value === 'false') return false;
-  throw new Error(`${label} must be true or false.`);
-}
-
 async function manageCodexSkills(args: readonly string[]): Promise<number> {
   const options = parseOptions(args);
   if (options._.length > 0) throw new Error('skills does not accept positional arguments.');
@@ -1879,7 +1792,6 @@ interface ProgressPayload {
   readonly signal?: string;
   readonly retryIndex?: number;
   readonly retryLimit?: number;
-  readonly backoffMs?: number;
   readonly phasesSummary?: readonly WorkflowPhaseExecutionSummary[];
   readonly totalPhaseCount?: number;
   readonly totalPlannedAgentCount?: number;
@@ -2103,35 +2015,6 @@ function parseRetryLimit(value: string | undefined): number {
   return parsed;
 }
 
-const MAX_RETRY_BACKOFF_MS = 60_000;
-
-// Exponential backoff between whole-workflow retries: base doubles each attempt, capped.
-// base 0 (default) disables the wait entirely, preserving immediate-retry behavior.
-function computeRetryBackoffMs(base: number, retryIndex: number): number {
-  if (base <= 0) return 0;
-  return Math.min(base * 2 ** (retryIndex - 1), MAX_RETRY_BACKOFF_MS);
-}
-
-// A backoff wait that resolves early on SIGINT/SIGTERM so the retry loop can cancel
-// cleanly instead of the default hard-kill during the pause between attempts.
-async function interruptibleBackoff(ms: number): Promise<'elapsed' | 'interrupted'> {
-  return await new Promise((resolve) => {
-    let settled = false;
-    const finish = (outcome: 'elapsed' | 'interrupted'): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      process.off('SIGINT', onSignal);
-      process.off('SIGTERM', onSignal);
-      resolve(outcome);
-    };
-    const onSignal = (): void => finish('interrupted');
-    const timer = setTimeout(() => finish('elapsed'), ms);
-    process.once('SIGINT', onSignal);
-    process.once('SIGTERM', onSignal);
-  });
-}
-
 function parseWorktreeRetention(value: string | undefined): WorktreeRetention {
   if (value === undefined) return workflowDefaultWorktreeRetention();
   if (isWorktreeRetention(value)) return value;
@@ -2187,7 +2070,6 @@ Commands:
   list       Alias for jobs.
   archive    Export one background workflow job state to an archive JSON file.
   export     Alias for archive.
-  worktree   Manage isolated agent worktrees. Subcommand: clean [--clean-only|--all --force] [--dry-run].
   skills     Report whether the installed Codex skill commands match this package; --install updates them.
   setup      Check readiness: package, Codex CLI, app-server, authentication, selected model/effort, and installed skill commands (alias: doctor).
 
@@ -2205,7 +2087,6 @@ Options:
   --args-file <path>                 Read workflow args JSON from a file.
   --permission <ask|allow|deny>      Permission review behavior. Default: settings.json (${workflowDefaultPermissionPolicy()}).
   --retry-limit <number>             Retry failed workflows in the same process. Default: settings.json (${workflowDefaultRetryLimit()}).
-  --retry-backoff-ms <number>        Exponential backoff before each retry (doubles per attempt, capped, cancellable); 0 disables. Default: settings.json (${workflowDefaultRetryBackoffMs()}).
   --worktree-retention <preserve-all|remove-clean>  Reclaim unchanged completed isolated worktrees. Default: settings.json (${workflowDefaultWorktreeRetention()}).
   --progress <jsonl|plain>           Progress format on stderr. Default: settings.json (${workflowDefaultProgressMode()}).
   --execution <background|attached>  Execution mode. Default: settings.json (${workflowDefaultExecutionMode()}).
