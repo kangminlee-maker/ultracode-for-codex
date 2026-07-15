@@ -6,9 +6,10 @@ export type Verbosity = 'low' | 'medium' | 'high';
 
 export const REASONING_EFFORTS: readonly ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
-// How isolated agent worktrees are retained after a run. `preserve-all` keeps every
-// worktree (the safe default); `remove-clean` reclaims completed worktrees with no real
-// changes (native "unchanged" semantics), preserving changed/stalled/aborted ones.
+// How isolated agent worktrees are retained after a run. `remove-clean` (the default)
+// reclaims a completed worktree with no real changes, matching native "unchanged"
+// semantics, and preserves changed/stalled/aborted ones for review; `preserve-all` opts
+// out and keeps every worktree.
 export type WorktreeRetention = 'preserve-all' | 'remove-clean';
 export const WORKTREE_RETENTIONS: readonly WorktreeRetention[] = ['preserve-all', 'remove-clean'];
 export function isWorktreeRetention(value: unknown): value is WorktreeRetention {

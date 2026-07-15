@@ -8,6 +8,22 @@ the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `workflow.worktreeRetention` (`--worktree-retention`): a completed
+  `isolation: "worktree"` agent's worktree is now reclaimed when it holds no real
+  changes, matching native `isolation` semantics. Cleanliness is decided by
+  `git worktree remove` itself (no `--force`), so a clean or ignored-only tree is
+  removed while one holding real changes is refused and preserved — build output
+  no longer strands a multi-gigabyte worktree. Changed, stalled, and aborted
+  worktrees are still always preserved for review. Set the setting (or the flag)
+  to `preserve-all` to keep every worktree, as previous versions did.
+- Workflow failure reasons now drive retry: `recovery.retryable` is derived from
+  the reason instead of being hard-coded `true`, so a deterministic failure
+  (invalid input or meta, a nondeterministic script) is no longer retried to the
+  configured `--retry-limit`. Backend failures carry a canonical
+  `workflow_agent_failed` reason and stay retryable.
+
 ### Changed
 
 - Lowered the packaged default reasoning effort (`settings.json`

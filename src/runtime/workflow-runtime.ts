@@ -1679,7 +1679,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       options.requestTimeoutMs,
     );
     this.heartbeatMs = normalizeHeartbeatMs(options.heartbeatMs);
-    this.worktreeRetention = options.worktreeRetention ?? 'preserve-all';
+    this.worktreeRetention = options.worktreeRetention ?? 'remove-clean';
   }
 
   async launch(input: WorkflowLaunchInput): Promise<WorkflowLaunchResult> {

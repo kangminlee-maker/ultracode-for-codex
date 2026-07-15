@@ -1583,8 +1583,8 @@ test('workflow runtime preserves changed worktree-isolated agents for review', a
   }
 });
 
-test('workflow runtime preserves clean worktree-isolated agents for review', async () => {
-  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend() });
+test('workflow runtime preserve-all opts out and retains a clean worktree for review', async () => {
+  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { worktreeRetention: 'preserve-all' } });
   let preservedPath;
   try {
     await initializeGitRepo(root);
@@ -1610,9 +1610,10 @@ test('workflow runtime preserves clean worktree-isolated agents for review', asy
   }
 });
 
-test('workflow runtime remove-clean reclaims a clean completed worktree', async () => {
+test('workflow runtime reclaims a clean completed worktree by default', async () => {
   const backend = new FakeSubagentBackend();
-  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { worktreeRetention: 'remove-clean' } });
+  // No retention option: this pins the shipped default, which is remove-clean.
+  const { runtime, root } = await createRuntime({ backend });
   try {
     await initializeGitRepo(root);
     const launch = await runtime.launch({
