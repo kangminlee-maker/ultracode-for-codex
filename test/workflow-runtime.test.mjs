@@ -225,6 +225,23 @@ return "done";`;
   }
 });
 
+test('a plain timer callback throw keeps its wrapper reason and stays non-retryable', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend() });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "timer-throw" };\nsetTimeout(function () { throw new Error("boom"); }, 1);\nreturn await agent("WAIT");',
+    });
+    const events = await collectEvents(runtime, launch.taskId);
+    assert.equal(events.at(-1).type, 'workflow.failed');
+    // Deriving purely from the underlying error would collapse this deterministic script
+    // defect into the retryable `workflow_failed` catch-all and repeat it to the limit.
+    assert.equal(events.at(-1).recovery.reason, 'workflow_timer_callback_failed');
+    assert.equal(events.at(-1).recovery.retryable, false);
+  } finally {
+    await runtime.close();
+  }
+});
+
 test('isRetryableFailureReason classifies transient reasons retryable and deterministic reasons non-retryable', () => {
   for (const reason of [
     'workflow_failed',

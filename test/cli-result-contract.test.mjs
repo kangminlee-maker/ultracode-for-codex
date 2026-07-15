@@ -66,6 +66,25 @@ test('worktree clean reads destructive flags by value and rejects contradictory 
   assert.match(badSubcommand.stderr, /one subcommand: clean/);
 });
 
+test('a background launch rejects invalid run options instead of reporting a job that dies', async () => {
+  const context = await makeCliContext();
+  // Background is the default mode and reports success immediately, so an option parsed
+  // only in the detached child would leave an empty result record and an unknown exit.
+  const retention = await runCli(
+    ['run', '--accept-llm-guide=v1', '--permission', 'allow', '--worktree-retention', 'typo', '--script', SUCCEEDING_SCRIPT],
+    context,
+  );
+  assert.equal(retention.code, 1, retention.stdout);
+  assert.match(retention.stderr, /worktree-retention must be one of/);
+
+  const backoff = await runCli(
+    ['run', '--accept-llm-guide=v1', '--permission', 'allow', '--retry-backoff-ms', 'soon', '--script', SUCCEEDING_SCRIPT],
+    context,
+  );
+  assert.equal(backoff.code, 1, backoff.stdout);
+  assert.match(backoff.stderr, /retry-backoff-ms/);
+});
+
 test('attached terminal failure writes a parseable failure record to stdout', async () => {
   const context = await makeCliContext();
   const result = await runCli([...RUN_ARGS, '--execution', 'attached', '--script', FAILING_SCRIPT], context);

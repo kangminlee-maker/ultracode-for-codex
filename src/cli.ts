@@ -106,6 +106,11 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   if (options.validate !== undefined) {
     return await validateWorkflowCommand(await inputPromise, cwd, options);
   }
+  // Parse the run options this command owns before the background branch: a background
+  // launch reports success immediately, so an invalid value rejected only in the detached
+  // child would surface as an empty result record and an unknown early exit.
+  const retryBackoffMs = parseNonNegativeIntOption(options.retryBackoffMs, workflowDefaultRetryBackoffMs(), 'retry-backoff-ms');
+  const worktreeRetention = parseWorktreeRetention(options.worktreeRetention);
   if (executionMode === 'background') {
     const input = await inputPromise;
     if (input.resumeFromRunId) await assertBackgroundResumeSource(cwd, input.resumeFromRunId);
@@ -114,8 +119,6 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   const timeoutMs = parseIntOption(options.timeoutMs, workflowDefaultTimeoutMs());
   const heartbeatMs = parseNonNegativeIntOption(options.heartbeatMs, workflowDefaultHeartbeatMs(), 'heartbeat-ms');
   const retryLimit = parseRetryLimit(options.retryLimit);
-  const retryBackoffMs = parseNonNegativeIntOption(options.retryBackoffMs, workflowDefaultRetryBackoffMs(), 'retry-backoff-ms');
-  const worktreeRetention = parseWorktreeRetention(options.worktreeRetention);
   const permissionPolicy = parsePermissionPolicy(options.permission);
   const progressMode = parseProgressMode(options.progress);
   const input = await inputPromise;
@@ -174,10 +177,25 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
       // A retry backoff must stay cancellable: without its own signal handler the wait
       // sits between streamCommandWorkflow's handler scope, so Ctrl-C would hard-kill.
       if (backoffMs > 0 && (await interruptibleBackoff(backoffMs)) === 'interrupted') {
-        process.stdout.write(`${JSON.stringify(workflowFailureRecord(snapshot), null, 2)}\n`);
+        // Report the cancellation itself; copying the failed attempt's record would persist
+        // an operator abort as that attempt's transient failure.
+        process.stdout.write(`${JSON.stringify(workflowFailureRecord(snapshot, {
+          reason: 'workflow_aborted',
+          error: 'Retry cancelled by signal during backoff.',
+        }), null, 2)}\n`);
         return 130;
       }
-      launch = await requireRunnableLaunch(runtime, await runtime.retry(snapshot.taskId), permissionPolicy, progressMode);
+      try {
+        launch = await requireRunnableLaunch(runtime, await runtime.retry(snapshot.taskId), permissionPolicy, progressMode);
+      } catch (err) {
+        // A rejected retry launch must not escape to main's stderr-only handler: in
+        // background mode stdout is result.json, so the job would end with an empty result
+        // and the last progress event stuck at `retrying`.
+        process.stdout.write(`${JSON.stringify(workflowFailureRecord(snapshot, {
+          error: `${snapshot.error ?? 'unknown'} (retry launch failed: ${errorMessage(err)})`,
+        }), null, 2)}\n`);
+        return 1;
+      }
     }
   } finally {
     await runtime.close();
@@ -508,7 +526,13 @@ interface WorkflowFailureRecord {
   };
 }
 
-function workflowFailureRecord(snapshot: WorkflowTaskSnapshot): WorkflowFailureRecord {
+function workflowFailureRecord(
+  snapshot: WorkflowTaskSnapshot,
+  // Overrides let a terminal condition that is not the snapshot's own failure -- an abort
+  // during a retry backoff, or a rejected retry launch -- be reported as itself instead of
+  // being silently persisted as the preceding attempt's failure.
+  override?: { readonly reason?: string; readonly error?: string },
+): WorkflowFailureRecord {
   let phase: string | undefined;
   let agentsCompleted: number | undefined;
   for (const event of snapshot.events) {
@@ -520,8 +544,8 @@ function workflowFailureRecord(snapshot: WorkflowTaskSnapshot): WorkflowFailureR
     version: 1,
     status: 'failed',
     failure: {
-      reason: snapshot.failureReason ?? 'unknown',
-      error: snapshot.error ?? 'unknown',
+      reason: override?.reason ?? snapshot.failureReason ?? 'unknown',
+      error: override?.error ?? snapshot.error ?? 'unknown',
       workflowName: snapshot.workflowName,
       taskId: snapshot.taskId,
       runId: snapshot.runId,

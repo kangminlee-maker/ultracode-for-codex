@@ -2752,10 +2752,10 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
           try {
             const returned = (callback as (...values: unknown[]) => unknown)(...args);
             Promise.resolve(returned).catch((err) => {
-              void this.failTaskFromCallback(ctx, err);
+              void this.failTaskFromCallback(ctx, err, 'workflow_timer_callback_failed');
             });
           } catch (err) {
-            void this.failTaskFromCallback(ctx, err);
+            void this.failTaskFromCallback(ctx, err, 'workflow_timer_callback_failed');
           }
         }
       }, ms);
@@ -3439,14 +3439,19 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   private async failTaskFromCallback(
     ctx: WorkflowRunContext,
     err: unknown,
+    fallbackReason: string,
     excludeFinalizer?: Promise<void>,
   ): Promise<void> {
     if (ctx.controller.signal.aborted || ctx.task.status !== 'running') return;
-    // Classify by the underlying error's canonical code (e.g. a stall surfacing through a
-    // tracked promise stays `workflow_agent_stalled`), not a fixed timer/promise wrapper.
+    // Prefer the underlying error's canonical code so a stall surfacing through a tracked
+    // promise stays `workflow_agent_stalled` and remains retryable. Keep the callback's own
+    // wrapper reason for an uncoded error: a plain throw from a timer or a rejected promise
+    // in workflow script code is a deterministic defect, and the `workflow_failed` catch-all
+    // would classify it as retryable and repeat it to the retry limit.
+    const derived = workflowFailureReason(err);
     ctx.task.abortFailure = {
       message: workflowErrorMessage(err),
-      reason: workflowFailureReason(err),
+      reason: derived === 'workflow_failed' ? fallbackReason : derived,
     };
     ctx.controller.abort();
     await this.drainWorkflowFinalizers(ctx, excludeFinalizer);
@@ -3478,7 +3483,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       async (reason) => {
         await sleep(0);
         if (!tracking.handled) {
-          await this.failTaskFromCallback(ctx, reason, finalizer);
+          await this.failTaskFromCallback(ctx, reason, 'workflow_promise_rejected', finalizer);
         }
       },
     );
