@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, mkdir, readdir, readFile, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readdir, readFile, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
@@ -282,6 +282,9 @@ interface WorkflowTaskMutable {
   workflowSourcePath?: string;
   scriptHash: string;
   isolationReview: WorkflowIsolationReview;
+  // Worktree-store run directory, set once this run creates its first isolated worktree.
+  // The run owns the liveness marker there and clears it when the run becomes terminal.
+  worktreeRunDir?: string;
   startedAt: number;
   journal: WorkflowJournalWriter;
   resultPath?: string;
@@ -3060,7 +3063,16 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     // Colocate a run-liveness marker in the worktree store so `worktree clean` can tell a
     // live run's worktrees from reclaimable ones. The transcript-dir run.pid lives under a
     // cwd-partitioned state dir and is not locatable from a gitRoot-partitioned worktree.
-    await writeWorkflowStateFile(workflowRunPidPath(worktreeRoot), `${process.pid}\n`).catch(() => undefined);
+    // This is the only thing standing between a live agent and `worktree clean`, so it fails
+    // closed: no isolated worktree may exist without a marker that protects it.
+    try {
+      await writeWorkflowStateFile(workflowRunPidPath(worktreeRoot), `${process.pid}\n`);
+    } catch (err) {
+      throw workflowInputError(`worktree isolation could not write the run liveness marker: ${workflowErrorMessage(err)}`);
+    }
+    // The marker belongs to this run: finalizeTask clears it so a finished run's worktrees
+    // stop reading as live and become reclaimable.
+    ctx.task.worktreeRunDir = worktreeRoot;
     const worktreePath = join(worktreeRoot, attemptIndex === 0 ? agentId : `${agentId}-attempt-${attemptIndex + 1}`);
     try {
       await gitOutput(gitRoot, ['worktree', 'add', '--detach', worktreePath, 'HEAD']);
@@ -3415,6 +3427,10 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         this.notifyTaskWaiters(task);
       }
       await rm(workflowRunPidPath(task.transcriptDir), { force: true }).catch(() => undefined);
+      // Drop the worktree-store liveness marker: this run no longer protects its worktrees.
+      if (task.worktreeRunDir) {
+        await rm(workflowRunPidPath(task.worktreeRunDir), { force: true }).catch(() => undefined);
+      }
       return workflowTaskSnapshot(task);
     })();
     return await task.terminalFinalization;
@@ -6575,7 +6591,7 @@ export interface WorktreeCleanOptions {
 export interface WorktreeCleanEntry {
   readonly path: string;
   readonly runId: string | null;
-  readonly action: 'removed' | 'kept-changed' | 'kept-live' | 'would-remove' | 'failed';
+  readonly action: 'removed' | 'kept-changed' | 'kept-live' | 'kept-unavailable' | 'would-remove' | 'failed';
   readonly detail?: string;
 }
 
@@ -6611,21 +6627,28 @@ export async function cleanWorkflowWorktrees(options: WorktreeCleanOptions): Pro
       runIdsWithKeptWorktree.add(runId);
       continue;
     }
-    const changed = await isWorktreeChangedForRemoval(canonical);
-    if (changed && !(options.includeChanged && options.force)) {
+    const state = await worktreeRemovalState(canonical);
+    if (state === 'unavailable') {
+      // A worktree whose contents could not be assessed is never removed, not even under
+      // --all --force: force may only ever act on changes we actually observed.
+      entries.push({ path: canonical, runId, action: 'kept-unavailable' });
+      if (runId) runIdsWithKeptWorktree.add(runId);
+      continue;
+    }
+    if (state === 'changed' && !(options.includeChanged && options.force)) {
       entries.push({ path: canonical, runId, action: 'kept-changed' });
       if (runId) runIdsWithKeptWorktree.add(runId);
       continue;
     }
     if (options.dryRun) {
-      entries.push({ path: canonical, runId, action: 'would-remove', detail: changed ? 'changed' : 'clean' });
+      entries.push({ path: canonical, runId, action: 'would-remove', detail: state });
       continue;
     }
     try {
-      await gitOutput(gitRoot, changed
+      await gitOutput(gitRoot, state === 'changed'
         ? ['worktree', 'remove', '--force', canonical]
         : ['worktree', 'remove', canonical]);
-      entries.push({ path: canonical, runId, action: 'removed', detail: changed ? 'changed' : 'clean' });
+      entries.push({ path: canonical, runId, action: 'removed', detail: state });
     } catch (err) {
       entries.push({ path: canonical, runId, action: 'failed', detail: workflowErrorMessage(err) });
       if (runId) runIdsWithKeptWorktree.add(runId);
@@ -6640,10 +6663,14 @@ export async function cleanWorkflowWorktrees(options: WorktreeCleanOptions): Pro
 }
 
 async function listGitWorktreePaths(gitRoot: string): Promise<readonly string[]> {
-  const out = await gitOutput(gitRoot, ['worktree', 'list', '--porcelain']).catch(() => '');
+  // `-z` is required for correctness, not just tidiness: without it git C-quotes unusual
+  // path bytes (including non-ASCII under core.quotePath's default), and the quoted text
+  // would fail to resolve, silently skipping real runtime-owned worktrees. `-z` emits raw
+  // NUL-terminated fields, so read the raw (untrimmed) stdout.
+  const out = await gitOutputRaw(gitRoot, ['worktree', 'list', '--porcelain', '-z']).catch(() => '');
   const paths: string[] = [];
-  for (const line of out.split('\n')) {
-    if (line.startsWith('worktree ')) paths.push(line.slice('worktree '.length));
+  for (const field of out.split('\0')) {
+    if (field.startsWith('worktree ')) paths.push(field.slice('worktree '.length));
   }
   return paths;
 }
@@ -6660,25 +6687,39 @@ async function isWorktreeRunLive(canonicalStore: string, runId: string): Promise
   return Number.isInteger(pid) && pid > 0 && isWorkflowProcessAlive(pid);
 }
 
-async function isWorktreeChangedForRemoval(worktreePath: string): Promise<boolean> {
+type WorktreeRemovalState = 'clean' | 'changed' | 'unavailable';
+
+async function worktreeRemovalState(worktreePath: string): Promise<WorktreeRemovalState> {
   // Match `git worktree remove`'s own criterion: modified or untracked files count as
-  // changed, while ignored artifacts do not, so an ignored-only worktree reads as removable.
-  // A status failure is treated as changed so an unassessable worktree is preserved.
-  const status = await gitOutput(worktreePath, ['status', '--porcelain=v1', '--untracked-files=all']).catch(() => 'status-unavailable');
-  return status.trim().length > 0;
+  // changed, while ignored artifacts do not, so an ignored-only worktree reads as clean.
+  // A status failure is its own state, never conflated with `changed`: `changed` is what
+  // --force may act on, and an unassessable worktree must stay out of that set.
+  try {
+    const status = await gitOutput(worktreePath, ['status', '--porcelain=v1', '--untracked-files=all']);
+    return status.trim().length > 0 ? 'changed' : 'clean';
+  } catch {
+    return 'unavailable';
+  }
 }
 
 async function reclaimEmptyWorktreeRunDirs(canonicalStore: string, keep: ReadonlySet<string>): Promise<void> {
   for (const runId of await readdir(canonicalStore).catch(() => [] as string[])) {
     if (keep.has(runId)) continue;
     const runDir = join(canonicalStore, runId);
-    if (!pathInsideOrEqual(canonicalStore, runDir) || runDir === canonicalStore) continue;
-    const stats = await stat(runDir).catch(() => null);
-    if (!stats?.isDirectory() || await isWorktreeRunLive(canonicalStore, runId)) continue;
-    const remaining = (await readdir(runDir).catch(() => [] as string[])).filter((entry) => entry !== 'run.pid');
+    // Containment must hold for the *resolved* path, not just the joined one: lstat rejects
+    // a symlinked entry outright (isDirectory() is false for a link), and re-checking the
+    // realpath keeps a relinked directory from moving deletion outside the store.
+    const link = await lstat(runDir).catch(() => null);
+    if (!link?.isDirectory()) continue;
+    const canonicalRunDir = await realpath(runDir).catch(() => null);
+    if (!canonicalRunDir
+      || !pathInsideOrEqual(canonicalStore, canonicalRunDir)
+      || canonicalRunDir === canonicalStore) continue;
+    if (await isWorktreeRunLive(canonicalStore, runId)) continue;
+    const remaining = (await readdir(canonicalRunDir).catch(() => [] as string[])).filter((entry) => entry !== 'run.pid');
     if (remaining.length > 0) continue;
-    await rm(join(runDir, 'run.pid'), { force: true }).catch(() => undefined);
-    await rmdir(runDir).catch(() => undefined);
+    await rm(join(canonicalRunDir, 'run.pid'), { force: true }).catch(() => undefined);
+    await rmdir(canonicalRunDir).catch(() => undefined);
   }
 }
 

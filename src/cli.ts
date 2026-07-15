@@ -1217,8 +1217,17 @@ async function manageWorktrees(args: readonly string[]): Promise<number> {
   if (options._.length > 1) {
     throw new Error('worktree clean does not accept positional arguments.');
   }
-  const includeChanged = options.all !== undefined;
-  const force = options.force !== undefined;
+  assertKnownWorktreeCleanFlags(options);
+  // Destructive flags are read by value, never by presence: `--all=false` must disable the
+  // destructive mode it names, and a contradictory --clean-only --all must be rejected
+  // rather than silently letting the destructive side win.
+  const cleanOnly = parseBooleanFlag(options.cleanOnly, 'clean-only');
+  const includeChanged = parseBooleanFlag(options.all, 'all');
+  const force = parseBooleanFlag(options.force, 'force');
+  const dryRun = parseBooleanFlag(options.dryRun, 'dry-run');
+  if (cleanOnly && includeChanged) {
+    throw new Error('worktree clean --clean-only cannot be combined with --all.');
+  }
   if (includeChanged && !force) {
     throw new Error('worktree clean --all requires --force to remove changed worktrees.');
   }
@@ -1226,10 +1235,28 @@ async function manageWorktrees(args: readonly string[]): Promise<number> {
     cwd: options.cwd ?? process.cwd(),
     includeChanged,
     force,
-    dryRun: options.dryRun !== undefined,
+    dryRun,
   });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-  return 0;
+  // An incomplete cleanup must not report process success to status-driven automation.
+  return result.entries.some((entry) => entry.action === 'failed') ? 1 : 0;
+}
+
+const WORKTREE_CLEAN_OPTION_KEYS = new Set(['_', 'cwd', 'cleanOnly', 'all', 'force', 'dryRun']);
+
+function assertKnownWorktreeCleanFlags(options: ParsedOptions): void {
+  for (const key of Object.keys(options)) {
+    if (WORKTREE_CLEAN_OPTION_KEYS.has(key)) continue;
+    const flag = key.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
+    throw new Error(`worktree clean does not accept --${flag}.`);
+  }
+}
+
+function parseBooleanFlag(value: string | undefined, label: string): boolean {
+  if (value === undefined) return false;
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw new Error(`${label} must be true or false.`);
 }
 
 async function manageCodexSkills(args: readonly string[]): Promise<number> {
