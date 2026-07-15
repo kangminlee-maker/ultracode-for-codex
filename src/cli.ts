@@ -1623,19 +1623,13 @@ function renderWorkflowEvent(event: WorkflowEvent, progressMode: ProgressMode): 
 // mismatched shell would run the edited suffix against the wrong workspace. Chained (unkeyed)
 // calls after the first edit re-run live (native semantics); an unchanged keyed (opts.key) call
 // may reuse its cached result out-of-prefix.
+//
+// Plain-mode only: this is human guidance for an interactive terminal. In jsonl mode the machine
+// consumer already has `scriptPath` on the `workflow.started` event, and emitting a post-completion
+// event here would displace `workflow.completed` as the run's terminal/`lastEvent` for background
+// `status`/`logs` consumers.
 function renderWorkflowIterateHint(snapshot: WorkflowTaskSnapshot, progressMode: ProgressMode, cwd: string): void {
-  if (progressMode === 'jsonl') {
-    writeJsonlProgress({
-      event: 'workflow.iterate.ready',
-      status: 'iterate_ready',
-      summary: `Script for this run is at ${snapshot.scriptPath} (resume anchor — keep it intact). To iterate, copy it, edit the copy, then re-run from ${cwd}: --script-file <copy> --resume-from-run-id ${snapshot.runId} --cwd ${cwd}. Unchanged chained agent() calls before your edit reuse cached results; the first edit and downstream chained calls run live.`,
-      taskId: snapshot.taskId,
-      runId: snapshot.runId,
-      workflowName: snapshot.workflowName,
-      scriptPath: snapshot.scriptPath,
-    });
-    return;
-  }
+  if (progressMode === 'jsonl') return;
   process.stderr.write(
     `[iterate] script: ${snapshot.scriptPath} (resume anchor — copy before editing). Re-run edits: --script-file <copy> --resume-from-run-id ${snapshot.runId} --cwd ${cwd}\n`,
   );
@@ -1809,7 +1803,6 @@ interface ProgressPayload {
   readonly workflowSource?: string;
   readonly workflowSourcePath?: string;
   readonly scriptHash?: string;
-  readonly scriptPath?: string;
   readonly permissionRequestId?: string;
   readonly riskSummary?: string;
   readonly phases?: readonly string[];
