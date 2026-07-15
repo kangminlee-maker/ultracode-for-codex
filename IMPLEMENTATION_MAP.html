@@ -274,6 +274,8 @@
       <tr><td>Capability gate</td><td>Setup and run agree on selected model and effort; unsupported combinations fail before a turn.</td></tr>
       <tr><td>Isolation gate</td><td>No-token prompt inspection proves the worker receives one total native thread slot.</td></tr>
       <tr><td>Release gate</td><td>Typecheck, runtime-boundary check, full tests, installed package E2E, HTML render, and live Sol medium/high probes pass.</td></tr>
+      <tr><td>Dispatch gate</td><td>Open. Every <code>agent()</code> launch — bare, inside <code>parallel()</code>, or nested — acquires from one per-workflow slot pool at <code>runAgentInner</code>, so concurrency is bounded however agents are launched. Today <code>MAX_PARALLELISM</code> is applied per <code>parallel()</code>/<code>pipeline()</code> batch, so bare and concurrent batches bypass it.</td></tr>
+      <tr><td>Spend gate</td><td>Open. A token target bounds a run: <code>budget</code> exposes <code>spent()</code>/<code>remaining()</code> and <code>runAgentInner</code> refuses to dispatch past the ceiling. Today <code>budget</code> reports static resource caps only.</td></tr>
     </table>
 
     <h2>Change Impact</h2>
@@ -283,6 +285,8 @@
       <tr><td>Run</td><td><code>--model gpt-5.6-sol --reasoning-effort medium|high|max</code> is validated and inherited by agents without overrides.</td></tr>
       <tr><td>Built-ins</td><td>Task execution claims are read-only and evidence-bound; high-level review avoids xhigh by using a medium/high funnel.</td></tr>
       <tr><td>Recovery</td><td>The effective catalog model is journaled, strengthening resume cache identity and mismatch disclosure.</td></tr>
+      <tr><td>Isolation</td><td>A completed <code>isolation: "worktree"</code> agent's worktree is reclaimed when it holds no real changes; <code>git worktree remove</code> itself decides, so ignored-only build output is reclaimed while real changes are refused and preserved. Changed, stalled, and aborted worktrees are always preserved for review. <code>workflow.worktreeRetention: preserve-all</code> opts out.</td></tr>
+      <tr><td>Retry</td><td><code>recovery.retryable</code> is derived from the failure reason instead of always <code>true</code>, so a deterministic failure is no longer retried to <code>--retry-limit</code>. Backend failures carry a canonical retryable <code>workflow_agent_failed</code> reason.</td></tr>
     </table>
 
     <h2>Verification</h2>
