@@ -12,8 +12,9 @@ the project uses [semantic versioning](https://semver.org/).
 
 - Edit-and-iterate DX (PG-ITER). **(a)** Every run now surfaces where its script was
   persisted: the `[workflow] started` line prints `script=<path>`, and on both completion
-  and terminal failure an `[iterate]` hint (jsonl `workflow.iterate.ready`) prints the
-  script path, a copy-edit-resume command, and `--cwd <cwd>`. **(b)** `--resume-from-run-id`
+  and terminal failure a plain-mode `[iterate]` hint prints the script path, a
+  copy-edit-resume command, and `--cwd <cwd>` (jsonl consumers already have `scriptPath` on
+  the `workflow.started` event). **(b)** `--resume-from-run-id`
   may now be **co-supplied with one source selector** (`--script`/`--script-file`/
   `--script-path`/`--name`) to resume a prior run with an **edited** script: the resume cache
   is keyed by the source journal's `agent()` call-key chain (independent of script text), so

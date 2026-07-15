@@ -362,7 +362,7 @@ async function assertNpmExecRun() {
   assertProgressEvent(progressEvents(result.stderr), 'workflow.agent.completed', {
     label: 'npm-exec-agent',
   });
-  assert.equal(JSON.parse(result.stdout), 'OK');
+  assert.equal(JSON.parse(result.stdout), 'MEDIUM_OK'); // default reasoning effort is medium
 }
 
 function packageArtifactName(name, version) {
@@ -740,7 +740,11 @@ async function assertBuiltinCodeReviewResume(installedCli, previousRun) {
   const summary = assertProgressEvent(progress, 'workflow.summary.ready', { status: 'completed' });
   assert.equal(summary.phasesSummary.find((phase) => phase.title === 'Verify')?.agentCount, 3);
 
-  const conflictingSource = runCliAttached(installedCli, [
+  // Edit-and-iterate (PG-ITER): a single source selector co-supplied with --resume-from-run-id
+  // is now accepted and resumes with that (edited) source instead of being rejected. Here
+  // --name code-review resolves the same built-in as the source run, so it is a full cache hit
+  // like the no-selector resume above.
+  const editedResume = runCliAttached(installedCli, [
     '--resume-from-run-id',
     previousRun.runId,
     '--name',
@@ -748,10 +752,13 @@ async function assertBuiltinCodeReviewResume(installedCli, previousRun) {
     '--permission',
     'allow',
   ]);
-  assert.equal(conflictingSource.status, 1);
-  assert.match(conflictingSource.stderr, /--resume-from-run-id cannot be combined/);
+  assert.equal(editedResume.status, 0);
+  assert.deepEqual(JSON.parse(editedResume.stdout).findings, previousRun.output.findings);
+  const editedCompletions = progressEvents(editedResume.stderr).filter((event) => event.event === 'workflow.agent.completed');
+  assert.equal(editedCompletions.length, 7);
+  assert.ok(editedCompletions.every((event) => event.cached === true), 'edited resume with the same named source is a full cache hit');
 
-  const conflictingBackgroundSource = runCli(installedCli, [
+  const editedResumeBackground = runCli(installedCli, [
     '--resume-from-run-id',
     previousRun.runId,
     '--name',
@@ -759,8 +766,10 @@ async function assertBuiltinCodeReviewResume(installedCli, previousRun) {
     '--permission',
     'allow',
   ]);
-  assert.equal(conflictingBackgroundSource.status, 1);
-  assert.match(conflictingBackgroundSource.stderr, /--resume-from-run-id cannot be combined/);
+  assert.equal(editedResumeBackground.status, 0);
+  const editedBackgroundLaunch = JSON.parse(editedResumeBackground.stdout);
+  assert.equal(editedBackgroundLaunch.kind, 'ultracode.workflow.background');
+  assert.equal(editedBackgroundLaunch.status, 'launched');
 
   const emptyResume = runCli(installedCli, [
     '--resume-from-run-id=',
@@ -919,7 +928,7 @@ async function assertPlainProgress(installedCli) {
   assert.match(result.stderr, /\[agent:1\] started plain-agent/);
   assert.match(result.stderr, /\[agent:1\] completed plain-agent \| Phase Plain \(1\/1\), 1 out of 1 agents have completed the task, \d+s elapsed \| tokens=/);
   assert.match(result.stderr, /\[workflow\] completed/);
-  assert.equal(JSON.parse(result.stdout), 'OK');
+  assert.equal(JSON.parse(result.stdout), 'MEDIUM_OK'); // default reasoning effort is medium
 }
 
 async function assertPermissionAllow(installedCli) {
@@ -958,7 +967,7 @@ async function assertRetry(installedCli) {
   assertProgressEvent(progress, 'workflow.terminal_failure', { status: 'failed' });
   assertProgressEvent(progress, 'workflow.retrying', { status: 'retrying', retryIndex: 1, retryLimit: 1 });
   assertProgressEvent(progress, 'workflow.completed', { status: 'completed' });
-  assert.equal(JSON.parse(result.stdout), 'OK');
+  assert.equal(JSON.parse(result.stdout), 'MEDIUM_OK'); // default reasoning effort is medium
 }
 
 async function assertCancel(installedCli) {
@@ -1588,12 +1597,16 @@ rl.on('line', (line) => {
         return;
       }
     }
+    // Structured output and the plain smoke reply are effort-agnostic (they run at the default
+    // effort, which is medium since the xhigh-to-medium default change). Effort propagation is
+    // verified separately: explicitly per-profile in assertInstalledModelProfiles, and by
+    // default via the MEDIUM_OK fallback below.
     const text = input.includes('Return structured installed workflow result.')
-      ? outputSchema?.properties?.detail && outputSchema?.properties?.count && effort === 'xhigh'
+      ? outputSchema?.properties?.detail && outputSchema?.properties?.count
         ? '{"detail":"OK","count":2}'
         : '{"detail":"NOT_XHIGH","count":0}'
       : input.includes('Return OK for installed workflow.')
-      ? effort === 'xhigh' ? 'OK' : 'NOT_XHIGH'
+      ? 'OK'
       : effort === 'medium' ? 'MEDIUM_OK' : 'OK';
     setTimeout(() => emitTurn(threadId, turnId, text), 0);
     return;
