@@ -156,6 +156,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
       if (snapshot.status === 'completed') {
         process.stdout.write(`${JSON.stringify(snapshot.result ?? null, null, 2)}\n`);
         renderWorkflowCompletionGuidance(snapshot, progressMode);
+        renderWorkflowIterateHint(snapshot, progressMode, cwd);
         return 0;
       }
       renderFailedSnapshot(snapshot, progressMode);
@@ -164,6 +165,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
         // is result.json, so a terminal failure writes a machine-readable
         // record where consumers otherwise find a 0-byte file.
         process.stdout.write(`${JSON.stringify(workflowFailureRecord(snapshot), null, 2)}\n`);
+        renderWorkflowIterateHint(snapshot, progressMode, cwd);
         return snapshot.failureReason === 'workflow_aborted' ? 130 : 1;
       }
       retries += 1;
@@ -1374,9 +1376,24 @@ async function workflowLaunchInputFromOptions(options: ParsedOptions): Promise<W
     throw new Error(`Choose only one workflow source selector: ${sourceSelectors.join(', ')}.`);
   }
   if (hasResumeFromRunId) validateCliResumeFromRunId(options.resumeFromRunId);
-  if (hasResumeFromRunId && sourceSelectors.length > 0) {
-    throw new Error('--resume-from-run-id cannot be combined with --script, --script-file, --script-path, --name, or a positional script file.');
+  // When resuming, a source selector supplied with an empty value (--script=, --script-path=,
+  // --name=, or an empty positional/`--script-file`) must fail loud rather than silently
+  // collapsing into a no-selector resume of the source's original script (the truthiness checks
+  // below would otherwise drop it). Gated on resume so non-resume runs keep their prior handling;
+  // `scriptFile` folds in the positional path so an empty positional is caught too.
+  if (hasResumeFromRunId && (
+    (options.script !== undefined && options.script.trim() === '')
+    || (scriptFile !== undefined && scriptFile.trim() === '')
+    || (options.scriptPath !== undefined && options.scriptPath.trim() === '')
+    || (options.name !== undefined && options.name.trim() === '')
+  )) {
+    throw new Error('A workflow source selector supplied with --resume-from-run-id must not be empty.');
   }
+  // Edit-and-iterate (PG-ITER): a single source selector co-supplied with
+  // --resume-from-run-id resumes the source's cached agent results while executing the
+  // EDITED script (unchanged prefix cached, first edit + downstream run live). The
+  // single-selector guard above (sourceSelectors.length > 1) still holds, so at most one
+  // edited source reaches the launch input.
   if (sourceSelectors.length === 0 && !hasResumeFromRunId) {
     throw new Error('run requires --script, --script-file, --script-path, --name, --resume-from-run-id, or a positional script file.');
   }
@@ -1544,7 +1561,7 @@ function renderWorkflowEvent(event: WorkflowEvent, progressMode: ProgressMode): 
   }
   switch (event.type) {
     case 'workflow.started':
-      process.stderr.write(`[workflow] started ${event.workflowName} task=${event.taskId} run=${event.runId}\n`);
+      process.stderr.write(`[workflow] started ${event.workflowName} task=${event.taskId} run=${event.runId} script=${event.scriptPath}\n`);
       return;
     case 'workflow.phase.planned':
       process.stderr.write(`[phase-plan] ${event.title} (${event.plannedAgentCount} agents)${event.goal ? ` - ${event.goal}` : ''}\n`);
@@ -1591,6 +1608,37 @@ function renderWorkflowEvent(event: WorkflowEvent, progressMode: ProgressMode): 
       process.stderr.write(`[workflow] failed ${event.recovery?.reason ?? ''} ${event.error}\n`);
       return;
   }
+}
+
+// Edit-and-iterate DX (PG-ITER): surface where the run's script was persisted and how to
+// resume it with edits. Emitted on both completion and terminal failure (a failed run is a
+// prime iterate case). Progress-channel only (stderr/jsonl) — never stdout, which is the
+// result channel (result.json in background mode).
+//
+// The persisted path is this run's resume ANCHOR: its hash must stay equal to the journal's
+// scriptHash or the run can no longer serve as a resume source. So the hint tells the author to
+// edit a COPY, not the anchor in place — the copy re-runs as a fresh inline script that reuses
+// the unchanged prefix of the source's cached agent() results. The command pins --cwd to this
+// run's working directory: resume does not restore the source cwd (only warns on drift), so a
+// mismatched shell would run the edited suffix against the wrong workspace. Chained (unkeyed)
+// calls after the first edit re-run live (native semantics); an unchanged keyed (opts.key) call
+// may reuse its cached result out-of-prefix.
+function renderWorkflowIterateHint(snapshot: WorkflowTaskSnapshot, progressMode: ProgressMode, cwd: string): void {
+  if (progressMode === 'jsonl') {
+    writeJsonlProgress({
+      event: 'workflow.iterate.ready',
+      status: 'iterate_ready',
+      summary: `Script for this run is at ${snapshot.scriptPath} (resume anchor — keep it intact). To iterate, copy it, edit the copy, then re-run from ${cwd}: --script-file <copy> --resume-from-run-id ${snapshot.runId} --cwd ${cwd}. Unchanged chained agent() calls before your edit reuse cached results; the first edit and downstream chained calls run live.`,
+      taskId: snapshot.taskId,
+      runId: snapshot.runId,
+      workflowName: snapshot.workflowName,
+      scriptPath: snapshot.scriptPath,
+    });
+    return;
+  }
+  process.stderr.write(
+    `[iterate] script: ${snapshot.scriptPath} (resume anchor — copy before editing). Re-run edits: --script-file <copy> --resume-from-run-id ${snapshot.runId} --cwd ${cwd}\n`,
+  );
 }
 
 function renderFailedSnapshot(snapshot: WorkflowTaskSnapshot, progressMode: ProgressMode): void {
@@ -1761,6 +1809,7 @@ interface ProgressPayload {
   readonly workflowSource?: string;
   readonly workflowSourcePath?: string;
   readonly scriptHash?: string;
+  readonly scriptPath?: string;
   readonly permissionRequestId?: string;
   readonly riskSummary?: string;
   readonly phases?: readonly string[];
@@ -2125,7 +2174,7 @@ Options:
   --script-file <path>               Workflow script file. A positional file path is also accepted.
   --script-path <path>               Runtime-owned persisted workflow script path.
   --name <name>                      Named workflow from .codex/workflows or built-ins.
-  --resume-from-run-id <runId>        Resume a completed, failed, cancelled, or interrupted local workflow run from preserved runtime state; run it from the source run's working directory.
+  --resume-from-run-id <runId>        Resume a completed, failed, cancelled, or interrupted local workflow run from preserved runtime state; run it from the source run's working directory. Co-supply one source selector (e.g. --script-file) to resume with an EDITED script: unchanged chained agent() calls before your edit reuse cached results, the first edit and downstream chained calls run live (an unchanged keyed opts.key call may reuse its cached result out of prefix).
   --validate                         Validate the workflow source without running agents: hard-fails structural problems, prints static schema/key warnings.
   --args <json>                      Workflow args JSON. Default: {}; resume runs inherit prior args when omitted.
   --args-file <path>                 Read workflow args JSON from a file.

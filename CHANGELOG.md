@@ -10,6 +10,22 @@ the project uses [semantic versioning](https://semver.org/).
 
 ### Added
 
+- Edit-and-iterate DX (PG-ITER). **(a)** Every run now surfaces where its script was
+  persisted: the `[workflow] started` line prints `script=<path>`, and on both completion
+  and terminal failure an `[iterate]` hint (jsonl `workflow.iterate.ready`) prints the
+  script path, a copy-edit-resume command, and `--cwd <cwd>`. **(b)** `--resume-from-run-id`
+  may now be **co-supplied with one source selector** (`--script`/`--script-file`/
+  `--script-path`/`--name`) to resume a prior run with an **edited** script: the resume cache
+  is keyed by the source journal's `agent()` call-key chain (independent of script text), so
+  unchanged **chained** calls before your edit reuse cached results and the first edit plus its
+  downstream chained calls run live — native's prefix semantics. An unchanged keyed (`opts.key`)
+  call may reuse its cached result out of prefix (position-independent by design). The new input
+  combination is the opt-in: without it every invocation is byte-identical (the source integrity,
+  permission gate, and isolation review all apply to the edited script exactly as to a fresh run,
+  so an edited `script_path`/project/user/plugin source is re-reviewed and inline stays ungated).
+  Editing a run's own persisted anchor in place breaks its resume, so iterate on a **copy**. An
+  empty selector value (e.g. `--name=`) now fails loud instead of silently resuming the original
+  script. See `docs/ultracode-p6-edit-and-iterate.md`.
 - `workflow.nestedWorkflows` (`--nested-workflows`): opt-in support for a workflow
   script calling `workflow(nameOrRef, args?)` to run another workflow inline as a
   child. `disabled` (the default) keeps the previous throwing stub, so existing

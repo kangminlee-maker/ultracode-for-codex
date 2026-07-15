@@ -1946,20 +1946,39 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     const sourceTask = await this.workflowTaskByRunId(resumeFromRunId);
     if (!sourceTask) throw workflowResumeUnknownError(resumeFromRunId);
     if (sourceTask.status === 'running') throw workflowResumeRunningError(resumeFromRunId);
-    if (workflowLaunchHasSourceSelector(input)) {
-      throw workflowInputError('resumeFromRunId cannot be combined with script, scriptPath, or name. Resume uses the original persisted workflow source.');
-    }
     const inheritedArgs = !Object.prototype.hasOwnProperty.call(input, 'args') && sourceTask.retryInput.args !== undefined
       ? { args: sourceTask.retryInput.args }
       : {};
+    const carriedArgs = {
+      ...inheritedArgs,
+      ...(Object.prototype.hasOwnProperty.call(input, 'args') ? { args: input.args } : {}),
+      ...(input.toolName ? { toolName: input.toolName } : {}),
+      resumeFromRunId,
+    };
+    if (workflowLaunchHasSourceSelector(input)) {
+      // Edit-and-iterate (PG-ITER): resume the source run's cached agent results
+      // (createResumeCache reads the source journal, independent of script text) while
+      // executing the EDITED script. The unchanged prefix of agent() calls hits the cache;
+      // the first edited/new chained call and everything downstream re-run live.
+      // Build the launch input from ONLY the co-supplied selector so the source's persisted
+      // scriptPath never leaks in and silently wins normalizeLaunchInput's
+      // scriptPath>name>script precedence (which would drop the edit into a no-op cache hit).
+      assertSingleWorkflowSourceSelector(input);
+      return {
+        sourceTask,
+        launchInput: {
+          ...(input.script !== undefined ? { script: input.script } : {}),
+          ...(input.scriptPath !== undefined ? { scriptPath: input.scriptPath } : {}),
+          ...(input.name !== undefined ? { name: input.name } : {}),
+          ...carriedArgs,
+        },
+      };
+    }
     return {
       sourceTask,
       launchInput: {
         ...sourceTask.retryInput,
-        ...inheritedArgs,
-        ...(Object.prototype.hasOwnProperty.call(input, 'args') ? { args: input.args } : {}),
-        ...(input.toolName ? { toolName: input.toolName } : {}),
-        resumeFromRunId,
+        ...carriedArgs,
       },
     };
   }
@@ -3788,6 +3807,18 @@ function normalizeLaunchInput(input: WorkflowLaunchInput): WorkflowLaunchInput {
 
 function workflowLaunchHasSourceSelector(input: WorkflowLaunchInput): boolean {
   return input.script !== undefined || input.name !== undefined || input.scriptPath !== undefined;
+}
+
+// Defense-in-depth for edit-and-iterate resume: the CLI already rejects more than one source
+// selector (cli.ts), but a direct runtime caller could pass several. Exactly one must be present
+// so normalizeLaunchInput's scriptPath>name>script precedence cannot silently drop an edit.
+function assertSingleWorkflowSourceSelector(input: WorkflowLaunchInput): void {
+  const selectorCount = (input.script !== undefined ? 1 : 0)
+    + (input.scriptPath !== undefined ? 1 : 0)
+    + (input.name !== undefined ? 1 : 0);
+  if (selectorCount !== 1) {
+    throw workflowInputError('Resuming with an edited workflow requires exactly one of script, scriptPath, or name.');
+  }
 }
 
 function normalizeResumeFromRunId(value: unknown): string {
