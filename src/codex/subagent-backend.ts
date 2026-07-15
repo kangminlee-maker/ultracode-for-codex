@@ -17,7 +17,8 @@ import type {
   SubagentUsage,
   Verbosity,
 } from '../runtime/types.js';
-import { SUBAGENT_MODEL_PLACEHOLDER, estimateTokens } from '../runtime/types.js';
+import { SUBAGENT_MODEL_PLACEHOLDER, SubagentFailure, estimateTokens } from '../runtime/types.js';
+import { subagentFailureFromNonCompletedStatus, subagentFailureFromTurnError } from './turn-failure.js';
 import { ultracodePackageVersion } from '../runtime/package-info.js';
 import { codexChildProcessEnv } from './env.js';
 import {
@@ -619,19 +620,22 @@ export class CodexSubagentBackend implements SubagentBackend {
       const waiter = this.turnWaiters.get(key);
       if (!waiter) {
         this.bufferTurnState(key, (state) => {
-          if (turn?.status === 'failed') state.error = new Error(JSON.stringify(turn.error ?? 'turn failed'));
-          else {
+          if (turn?.status === 'completed') {
             state.completed = true;
             state.completedAt = Date.now();
+          } else {
+            state.error = turnCompletionFailure(turn);
           }
         });
         return;
       }
-      if (turn?.status === 'failed') {
-        this.turnWaiters.delete(key);
-        waiter.reject(new Error(JSON.stringify(turn.error ?? 'turn failed')));
-      } else {
+      // Only `completed` is a success. `failed` carries a structured error we classify;
+      // `interrupted`/`inProgress`/unknown must not resolve as an empty successful turn.
+      if (turn?.status === 'completed') {
         this.markWaiterCompleted(threadId, turnId, waiter, Date.now());
+      } else {
+        this.turnWaiters.delete(key);
+        waiter.reject(turnCompletionFailure(turn));
       }
     }
   }
@@ -1025,6 +1029,13 @@ function terminateOwnedCodexProcess(child: ChildProcessWithoutNullStreams): void
   } catch {
     // The owned child is already gone.
   }
+}
+
+// A non-success `turn/completed`: classify `failed` from its structured error, and treat
+// every other non-`completed` status as a retryable, flagged-unrecognized failure.
+function turnCompletionFailure(turn: Record<string, unknown> | null): SubagentFailure {
+  if (turn?.status === 'failed') return subagentFailureFromTurnError(turn.error);
+  return subagentFailureFromNonCompletedStatus(turn?.status);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

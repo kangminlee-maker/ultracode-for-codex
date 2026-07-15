@@ -40,6 +40,19 @@ function runCli(args, context) {
   });
 }
 
+
+test('a background launch rejects an invalid run option instead of reporting a job that dies', async () => {
+  const context = await makeCliContext();
+  // Background is the default mode and reports success immediately, so an option parsed
+  // only in the detached child would leave an empty result record and an unknown exit.
+  const retention = await runCli(
+    ['run', '--accept-llm-guide=v1', '--permission', 'allow', '--worktree-retention', 'typo', '--script', SUCCEEDING_SCRIPT],
+    context,
+  );
+  assert.equal(retention.code, 1, retention.stdout);
+  assert.match(retention.stderr, /worktree-retention must be one of/);
+});
+
 test('attached terminal failure writes a parseable failure record to stdout', async () => {
   const context = await makeCliContext();
   const result = await runCli([...RUN_ARGS, '--execution', 'attached', '--script', FAILING_SCRIPT], context);

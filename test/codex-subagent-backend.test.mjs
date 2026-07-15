@@ -301,6 +301,41 @@ test('usageFromCodexTokenUsage returns provider token details', () => {
   assert.equal(usageFromCodexTokenUsage({ last: {} }), null);
 });
 
+test('CodexSubagentBackend classifies a failed turn error into a backend-neutral SubagentFailure', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  setProviderEnv();
+  const backend = new CodexSubagentBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+    reasoningEffort: 'medium',
+  });
+  try {
+    // Terminal: unauthorized must classify terminal, carry the provider message, and keep its variant.
+    await assert.rejects(
+      backend.generate(textRequest({ prompt: 'FAIL_TURN:unauthorized' })),
+      (err) => {
+        assert.equal(err.name, 'SubagentFailure');
+        assert.equal(err.kind, 'terminal');
+        assert.equal(err.variant, 'unauthorized');
+        assert.match(err.message, /turn failed: unauthorized/);
+        return true;
+      },
+    );
+    // Rate limited stays a distinct, retryable kind.
+    await assert.rejects(
+      backend.generate(textRequest({ prompt: 'FAIL_TURN:usageLimitExceeded' })),
+      (err) => {
+        assert.equal(err.kind, 'rate_limited');
+        assert.equal(err.variant, 'usageLimitExceeded');
+        return true;
+      },
+    );
+  } finally {
+    await backend.close();
+  }
+});
+
 function textRequest(overrides = {}) {
   return {
     model: overrides.model ?? 'codex-subagent',

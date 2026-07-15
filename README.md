@@ -177,8 +177,11 @@ run at `high` and scope/verdict/synthesis run at `xhigh`.
 
 The built-in `task` delegates read-only analysis. Its planner runs at `medium`;
 other agents inherit `--reasoning-effort`. The main Codex context applies any
-resulting changes. Custom scripts can opt into `isolation: "worktree"`, and the
-runtime preserves those worktrees for explicit review rather than auto-merging.
+resulting changes. Custom scripts can opt into `isolation: "worktree"`. A completed agent's
+worktree is reclaimed when it holds no real changes; one that holds changes is
+preserved for explicit review rather than auto-merged. Set
+`workflow.worktreeRetention` to `preserve-all` (or `--worktree-retention`) to
+keep every worktree.
 
 CLI runs use OS background execution by default. The command prints a launch
 record with a `jobId`, then you can inspect or control the job:

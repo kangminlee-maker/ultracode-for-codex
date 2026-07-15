@@ -1,12 +1,13 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { chmod, lstat, mkdir, readdir, readFile, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
+import { availableParallelism, homedir } from 'node:os';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { createContext, runInContext } from 'node:vm';
-import type { ReasoningEffort, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage } from './types.js';
-import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort } from './types.js';
+import type { AgentConcurrency, ReasoningEffort, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
+import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort, isSubagentFailure } from './types.js';
+import { AgentConcurrencyPool } from './agent-concurrency-pool.js';
 import {
   WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
   WORKFLOW_JOURNAL_WRITE_FAILED_REASON,
@@ -339,6 +340,11 @@ interface WorkflowRunContext {
   nextTimerId: number;
   previousAgentCallKey: string;
   readonly usedLogicalKeys: Set<string>;
+  // One permit pool per run bounds concurrent agent dispatches. Undefined = unbounded.
+  readonly agentPool?: AgentConcurrencyPool;
+  // Per-run output-token ceiling, or null when unset (inert). budget.spent()/remaining()
+  // and the pre-dispatch ceiling read it; counts this run's fresh spend only (cached = 0).
+  readonly budgetTotal: number | null;
   currentPhase?: string;
   announcedPlan?: WorkflowExecutionPlan;
   pendingPhasePlan?: WorkflowPlanPhase;
@@ -348,6 +354,9 @@ interface WorkflowRunContext {
 interface WorkflowVmGlobals {
   readonly argsLiteral: string;
   readonly budgetLiteral: string;
+  // The run's output-token ceiling as a JSON literal ('null' when unset). Defined as a
+  // non-enumerable budget.total so the budget key set is byte-identical whether set or not.
+  readonly budgetTotalLiteral: string;
   readonly host: Record<string, unknown>;
   readonly setVmValueProjector: (projector: (value: unknown) => unknown) => void;
 }
@@ -380,6 +389,14 @@ interface WorkflowTaskRegistryOptions {
   // Emit a non-destructive workflow.heartbeat every heartbeatMs while running.
   // 0 (or omitted) disables it, preserving the pre-heartbeat event stream.
   readonly heartbeatMs?: number;
+  // Retention policy for isolated agent worktrees. Omitted defaults to 'preserve-all'
+  // (current behavior); 'remove-clean' reclaims unchanged completed worktrees.
+  readonly worktreeRetention?: WorktreeRetention;
+  // Bound on concurrent agent dispatches per run. Omitted or 'unbounded' applies no
+  // pool (current behavior). 'auto' derives a size from CPUs; a positive integer pins it.
+  readonly agentConcurrency?: AgentConcurrency;
+  // Per-run output-token ceiling. Omitted or null = inert (no ceiling, remaining() Infinity).
+  readonly budgetTotal?: number | null;
   readonly userWorkflowDirs?: readonly string[];
   readonly pluginWorkflows?: readonly WorkflowPluginRegistry[];
   readonly builtinWorkflows?: readonly BuiltinWorkflow[];
@@ -553,12 +570,26 @@ const WORKFLOW_STABLE_FAILURE_CODES = new Set([
   WORKFLOW_JOURNAL_WRITE_FAILED_REASON,
   'runtime_closed',
   'workflow_aborted',
+  'workflow_agent_failed',
+  'workflow_agent_terminal',
   'workflow_agent_stalled',
   'workflow_input_invalid',
   'workflow_meta_invalid',
   'workflow_permission_denied',
   'workflow_resume_running',
   'workflow_script_nondeterministic',
+  'workflow_structured_output_failed',
+]);
+// Failure reasons worth re-running: transient/backend/stochastic classes. Every other
+// reason — deterministic config/validation/control failures and any unrecognized code —
+// is non-retryable so a stable failure is not retried to exhaustion. Invariant: this set
+// stays a subset of WORKFLOW_STABLE_FAILURE_CODES ∪ {'workflow_failed'} (the backend
+// catch-all), and a newly introduced failure code defaults to non-retryable until listed.
+const WORKFLOW_RETRYABLE_FAILURE_CODES = new Set([
+  'workflow_failed',
+  'workflow_agent_failed',
+  'workflow_agent_stalled',
+  WORKFLOW_JOURNAL_WRITE_FAILED_REASON,
   'workflow_structured_output_failed',
 ]);
 const FORBIDDEN_HOST_PROPERTY_NAMES = new Set(['constructor', 'prototype', '__proto__', 'process', 'require', 'globalThis', 'global', 'module', 'exports']);
@@ -1653,6 +1684,12 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   private readonly agentStallTimeoutMs: number;
   private readonly agentStallRetryLimit: number;
   private readonly heartbeatMs: number;
+  private readonly worktreeRetention: WorktreeRetention;
+  // Resolved agent-dispatch pool size, or null for unbounded (no pool). Computed once:
+  // availableParallelism() is stable for the process lifetime.
+  private readonly agentConcurrency: number | null;
+  // Per-run output-token ceiling, or null when unset (inert). Parsed by the CLI/caller.
+  private readonly budgetTotal: number | null;
 
   constructor(private readonly options: WorkflowTaskRegistryOptions) {
     this.stateDir = options.stateDir ?? defaultWorkflowStateDir(options.cwd ?? process.cwd());
@@ -1662,6 +1699,9 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       options.requestTimeoutMs,
     );
     this.heartbeatMs = normalizeHeartbeatMs(options.heartbeatMs);
+    this.worktreeRetention = options.worktreeRetention ?? 'remove-clean';
+    this.agentConcurrency = resolveAgentConcurrency(options.agentConcurrency);
+    this.budgetTotal = resolveBudgetTotal(options.budgetTotal);
   }
 
   async launch(input: WorkflowLaunchInput): Promise<WorkflowLaunchResult> {
@@ -2633,6 +2673,8 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       nextTimerId: 1,
       previousAgentCallKey: WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
       usedLogicalKeys: new Set(),
+      budgetTotal: this.budgetTotal,
+      ...(this.agentConcurrency != null ? { agentPool: new AgentConcurrencyPool(this.agentConcurrency) } : {}),
     };
     task.controller = controller;
     if (task.abortRequested) controller.abort();
@@ -2733,10 +2775,10 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
           try {
             const returned = (callback as (...values: unknown[]) => unknown)(...args);
             Promise.resolve(returned).catch((err) => {
-              void this.failTaskFromCallback(ctx, err);
+              void this.failTaskFromCallback(ctx, err, 'workflow_timer_callback_failed');
             });
           } catch (err) {
-            void this.failTaskFromCallback(ctx, err);
+            void this.failTaskFromCallback(ctx, err, 'workflow_timer_callback_failed');
           }
         }
       }, ms);
@@ -2773,6 +2815,12 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     host.workflow = hardenCallable((): never => {
       throw workflowInputError('Nested workflow calls are not supported by this runtime yet.');
     });
+    // Per-run output spend gauge. spent() = this run's fresh successful-agent output tokens
+    // (cached agents contribute 0, matching the journaled per-run cost); remaining() is
+    // Infinity when no ceiling is set, so an unset budget is inert.
+    host.spent = hardenCallable((): number => ctx.outputTokens);
+    host.remaining = hardenCallable((): number =>
+      ctx.budgetTotal == null ? Infinity : Math.max(0, ctx.budgetTotal - ctx.outputTokens));
     host.setTimeout = workflowSetTimeout;
     host.clearTimeout = workflowClearTimeout;
     return {
@@ -2780,9 +2828,13 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       budgetLiteral: vmDataLiteral({
         maxAgentCalls: MAX_AGENT_CALLS,
         maxParallelism: MAX_PARALLELISM,
+        // Effective agent-dispatch pool size, or null when unbounded. Distinct from
+        // maxParallelism, which stays the parallel()/pipeline() item fan-out bound.
+        agentConcurrency: ctx.agentPool?.size ?? null,
         agentStallTimeoutMs: this.agentStallTimeoutMs,
         agentStallRetryLimit: this.agentStallRetryLimit,
       }, 'budget'),
+      budgetTotalLiteral: ctx.budgetTotal === null ? 'null' : String(ctx.budgetTotal),
       host: Object.freeze(host),
       setVmValueProjector: (projector) => {
         ctx.toVmValue = projector;
@@ -2833,6 +2885,12 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     }
     if (ctx.agentCount >= MAX_AGENT_CALLS) {
       throw workflowInputError(`Workflow agent call cap exceeded (${MAX_AGENT_CALLS}).`);
+    }
+    // Pre-dispatch output-token ceiling, beside the agent-call cap: refuse a new dispatch
+    // once this run's fresh spend reaches the budget. Non-retryable workflow_input_invalid,
+    // like the cap; inside parallel()/pipeline() it becomes a per-item null (native parity).
+    if (ctx.budgetTotal != null && ctx.outputTokens >= ctx.budgetTotal) {
+      throw workflowInputError(`Workflow output-token budget exhausted (spent ${ctx.outputTokens} of ${ctx.budgetTotal}).`);
     }
     const schema = normalizeStructuredOutputSchema(options?.schema);
     const isolation = normalizeAgentIsolation(options?.isolation);
@@ -3039,12 +3097,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     } catch (err) {
       throw workflowInputError(`worktree isolation requires a git repository with at least one commit: ${workflowErrorMessage(err)}`);
     }
-    const worktreeRoot = join(
-      dirname(gitRoot),
-      '.ultracode-for-codex-worktrees',
-      `${workflowScriptSlug(basename(gitRoot))}-${shortHash(gitRoot)}`,
-      ctx.task.runId,
-    );
+    const worktreeRoot = join(workflowWorktreeStoreRoot(gitRoot), ctx.task.runId);
     await ensureWorkflowStateDirectory(worktreeRoot);
     const worktreePath = join(worktreeRoot, attemptIndex === 0 ? agentId : `${agentId}-attempt-${attemptIndex + 1}`);
     try {
@@ -3059,26 +3112,40 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     }
   }
 
-  private async finalizeAgentWorktree(worktree: WorkflowAgentWorktree): Promise<WorkflowAgentWorktreeFinalization> {
-    let status: string;
-    try {
-      status = await gitOutput(worktree.path, ['status', '--porcelain=v1', '--untracked-files=all', '--ignored=matching']);
-    } catch {
-      return {
-        preserved: true,
-        preservedWorktree: preservedWorktree(worktree, 'status_unavailable'),
-      };
-    }
-    if (status.trim()) {
-      return {
-        preserved: true,
-        preservedWorktree: preservedWorktree(worktree, 'changed'),
-      };
+  private async finalizeAgentWorktree(
+    worktree: WorkflowAgentWorktree,
+    completed: boolean,
+  ): Promise<WorkflowAgentWorktreeFinalization> {
+    if (completed && this.worktreeRetention === 'remove-clean') {
+      try {
+        // Reclaim an unchanged completed worktree by delegating the cleanliness decision to
+        // git: `worktree remove` (no --force) deletes a clean or ignored-only tree (matching
+        // native "unchanged") and refuses one with real changes, so it is both the removal
+        // gate and TOCTOU-safe. A cleanup failure must never fail a completed agent, so on
+        // any error we fall through and preserve the worktree for review.
+        await gitOutput(worktree.gitRoot, ['worktree', 'remove', worktree.path]);
+        return { preserved: false };
+      } catch {
+        // Real changes (git refused) or a transient failure: preserve below.
+      }
     }
     return {
       preserved: true,
-      preservedWorktree: preservedWorktree(worktree, 'clean'),
+      preservedWorktree: preservedWorktree(worktree, await this.worktreePreservationReason(worktree)),
     };
+  }
+
+  // Provenance status for preservation telemetry only (never the removal gate): includes
+  // ignored artifacts via --ignored=matching, which git's own removal treats as removable.
+  private async worktreePreservationReason(
+    worktree: WorkflowAgentWorktree,
+  ): Promise<'clean' | 'changed' | 'status_unavailable'> {
+    try {
+      const status = await gitOutput(worktree.path, ['status', '--porcelain=v1', '--untracked-files=all', '--ignored=matching']);
+      return status.trim() ? 'changed' : 'clean';
+    } catch {
+      return 'status_unavailable';
+    }
   }
 
   private async runAgentWithStallRetries(
@@ -3109,7 +3176,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
           worktreePath: worktree?.path,
         }));
         const worktreeFinalization = worktree
-          ? await this.finalizeAgentWorktree(worktree)
+          ? await this.finalizeAgentWorktree(worktree, true)
           : undefined;
         if (worktreeFinalization) input.onWorktreeFinalized(worktreeFinalization);
         return {
@@ -3126,7 +3193,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
                   ctx.controller.signal.aborted ? 'aborted' : 'stalled',
                 ),
               } satisfies WorkflowAgentWorktreeFinalization
-            : await this.finalizeAgentWorktree(worktree);
+            : await this.finalizeAgentWorktree(worktree, false);
           input.onWorktreeFinalized(worktreeFinalization);
         }
         if (
@@ -3179,6 +3246,23 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
       throw workflowInputError('Workflow is aborted.');
     }
+    // Acquire a dispatch permit BEFORE the stall timer starts: waiting for a permit
+    // must not count toward agentStallTimeoutMs, and an already-aborted run must not
+    // take a slot (acquire rejects if the signal is aborted). Ownership of the release
+    // transfers to `generated` below, so the permit is held for the real dispatch's
+    // true lifetime -- releasing on the abort race would free the slot while the
+    // dispatch is still in flight and let the next attempt over-subscribe the pool.
+    let releaseAgentPermit: (() => void) | undefined;
+    if (ctx.agentPool) {
+      try {
+        releaseAgentPermit = await ctx.agentPool.acquire(ctx.controller.signal);
+      } catch (err) {
+        if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
+          throw workflowInputError('Workflow is aborted.');
+        }
+        throw err;
+      }
+    }
     ctx.controller.signal.addEventListener('abort', abortFromWorkflow, { once: true });
     const timer = this.agentStallTimeoutMs > 0
       ? setTimeout(() => {
@@ -3191,10 +3275,23 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         | { readonly type: 'result'; readonly result: SubagentResult }
         | { readonly type: 'error'; readonly error: unknown }
         | { readonly type: 'aborted' };
-      const generated: Promise<AgentAttemptOutcome> = this.options.backend.generate(request, attemptController.signal).then(
-        (result) => ({ type: 'result', result }),
-        (err) => ({ type: 'error', error: err }),
-      );
+      let dispatched: Promise<AgentAttemptOutcome>;
+      try {
+        dispatched = this.options.backend.generate(request, attemptController.signal).then(
+          (result) => ({ type: 'result', result }),
+          (err) => ({ type: 'error', error: err }),
+        );
+      } catch (syncErr) {
+        // A backend is contracted to return a promise; if one throws synchronously the
+        // permit would otherwise leak (its release transfers to `dispatched` below and
+        // that promise never exists), deadlocking the pool. Release before rethrowing.
+        if (releaseAgentPermit) releaseAgentPermit();
+        throw syncErr;
+      }
+      // Release when the real dispatch settles, not when the abort race resolves.
+      const generated = releaseAgentPermit
+        ? dispatched.finally(releaseAgentPermit)
+        : dispatched;
       const aborted = new Promise<AgentAttemptOutcome>((resolve) => {
         attemptController.signal.addEventListener('abort', () => {
           resolve({ type: 'aborted' });
@@ -3211,7 +3308,22 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
         throw workflowInputError('Workflow is aborted.');
       }
-      throw outcome.error;
+      // The backend surfaces its failures as plain, uncoded Errors. Left uncoded they
+      // collapse into the `workflow_failed` catch-all, which is indistinguishable from an
+      // uncoded throw in workflow script code -- so any downstream classifier has to guess
+      // transient-vs-deterministic from the shape of the error, and guesses wrong. Code the
+      // failure here, at the boundary it crosses, so classification never has to infer it.
+      if (isSubagentFailure(outcome.error) && !outcome.error.recognized) {
+        // A failure the taxonomy did not recognize defaults to retryable; surface it so a
+        // codex variant renamed upstream cannot degrade into "retry forever" unseen.
+        this.emit(ctx.task, {
+          type: 'workflow.log',
+          taskId: ctx.task.taskId,
+          runId: ctx.task.runId,
+          message: `unclassified backend failure (variant: ${outcome.error.variant ?? 'none'}); treated as ${outcome.error.kind} and retryable.`,
+        });
+      }
+      throw codedAgentFailure(outcome.error);
     } finally {
       if (timer) clearTimeout(timer);
       ctx.controller.signal.removeEventListener('abort', abortFromWorkflow);
@@ -3357,7 +3469,6 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         kind: 'workflow.run.failed',
         reason,
         message: error,
-        recovery: { retryable: true, reason },
         durationMs: Date.now() - task.startedAt,
       });
       task.error = error;
@@ -3367,7 +3478,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         taskId: task.taskId,
         runId: task.runId,
         error,
-        recovery: { retryable: true, reason },
+        recovery: { retryable: isRetryableFailureReason(reason), reason },
       });
       task.status = 'failed';
     });
@@ -3395,13 +3506,19 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   private async failTaskFromCallback(
     ctx: WorkflowRunContext,
     err: unknown,
-    reason = 'workflow_timer_callback_failed',
+    fallbackReason: string,
     excludeFinalizer?: Promise<void>,
   ): Promise<void> {
     if (ctx.controller.signal.aborted || ctx.task.status !== 'running') return;
+    // Prefer the underlying error's canonical code so a stall surfacing through a tracked
+    // promise stays `workflow_agent_stalled` and remains retryable. Keep the callback's own
+    // wrapper reason for an uncoded error: a plain throw from a timer or a rejected promise
+    // in workflow script code is a deterministic defect, and the `workflow_failed` catch-all
+    // would classify it as retryable and repeat it to the retry limit.
+    const derived = workflowFailureReason(err);
     ctx.task.abortFailure = {
       message: workflowErrorMessage(err),
-      reason,
+      reason: derived === 'workflow_failed' ? fallbackReason : derived,
     };
     ctx.controller.abort();
     await this.drainWorkflowFinalizers(ctx, excludeFinalizer);
@@ -5586,7 +5703,13 @@ function installWorkflowVmGlobals(
     '  try { Object.setPrototypeOf(WorkflowPromise, null); } catch {}',
     '  try { Object.setPrototypeOf(WorkflowPromise.prototype, null); } catch {}',
     `  define(globalThis, "args", { value: ${globals.argsLiteral}, writable: false, configurable: false });`,
-    `  define(globalThis, "budget", { value: freeze(${globals.budgetLiteral}), writable: false, configurable: false });`,
+    `  const __budget = ${globals.budgetLiteral};`,
+    // total/spent/remaining are NON-enumerable so Object.keys(budget)/for-in/spread are
+    // byte-identical whether or not a ceiling is set. Direct access still works.
+    `  define(__budget, "total", { value: ${globals.budgetTotalLiteral}, enumerable: false, writable: false, configurable: false });`,
+    '  define(__budget, "spent", { value: () => __host.spent(), enumerable: false, writable: false, configurable: false });',
+    '  define(__budget, "remaining", { value: () => __host.remaining(), enumerable: false, writable: false, configurable: false });',
+    '  define(globalThis, "budget", { value: freeze(__budget), writable: false, configurable: false });',
     '  define(globalThis, "Promise", { value: freeze(WorkflowPromise), writable: false, configurable: false });',
     '  define(globalThis, "agent", { value: (...values) => __host.agent(...values), writable: false, configurable: false });',
     '  define(globalThis, "parallel", { value: (...values) => __host.parallel(...values), writable: false, configurable: false });',
@@ -5833,6 +5956,24 @@ async function waitForWorkflowTaskEvent(task: WorkflowTaskMutable, signal?: Abor
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) abort();
   });
+}
+
+// Resolve the agent-concurrency setting to a pool size, or null for unbounded (no
+// pool). 'auto' matches native's CPU-based bound: min(16, cores - 2), floored at 1.
+function resolveAgentConcurrency(value: AgentConcurrency | undefined): number | null {
+  if (value === undefined || value === 'unbounded') return null;
+  if (value === 'auto') return Math.min(16, Math.max(1, availableParallelism() - 2));
+  if (Number.isInteger(value) && value >= 1) return value;
+  throw workflowInputError(`agentConcurrency must be 'unbounded', 'auto', or a positive integer; got ${String(value)}.`);
+}
+
+// The registry is the authority boundary for the ceiling, mirroring resolveAgentConcurrency:
+// the CLI parses --budget, but a programmatic caller reaches the registry directly, and the
+// ceiling check / remaining() rely on budgetTotal being null or a positive safe integer.
+function resolveBudgetTotal(value: number | null | undefined): number | null {
+  if (value === undefined || value === null) return null;
+  if (Number.isSafeInteger(value) && value >= 1) return value;
+  throw workflowInputError(`budgetTotal must be null or a positive safe integer; got ${String(value)}.`);
 }
 
 async function mapWithConcurrency<T, R>(
@@ -6525,6 +6666,17 @@ function isWorkflowProcessAlive(pid: number): boolean {
   }
 }
 
+// Sibling-of-repo store that holds every run's isolated worktrees, keyed by repo slug and
+// hash, so isolated checkouts never land inside the source working tree.
+function workflowWorktreeStoreRoot(gitRoot: string): string {
+  return join(
+    dirname(gitRoot),
+    '.ultracode-for-codex-worktrees',
+    `${workflowScriptSlug(basename(gitRoot))}-${shortHash(gitRoot)}`,
+  );
+}
+
+
 function workflowResumeUnknownError(runId: string): UltracodeRequestError {
   // Workflow state is partitioned by the exact working directory, so the most
   // common cause of an unknown run id is resuming from a different cwd.
@@ -6554,6 +6706,12 @@ function workflowFailureReason(err: unknown): string {
   return 'workflow_failed';
 }
 
+// Single source of retryability: it is a pure property of the failure reason, derived
+// wherever needed (CLI retry gate, streamed failure event) and stored nowhere durable.
+export function isRetryableFailureReason(reason: string | undefined): boolean {
+  return reason !== undefined && WORKFLOW_RETRYABLE_FAILURE_CODES.has(reason);
+}
+
 function workflowInputError(message: string): UltracodeRequestError {
   return new UltracodeRequestError(message, 400, 'invalid_request_error', WORKFLOW_INPUT_PARAM, 'workflow_input_invalid');
 }
@@ -6568,6 +6726,33 @@ function workflowScriptError(message: string): UltracodeRequestError {
 
 function workflowAgentStalledError(message: string): UltracodeRequestError {
   return new UltracodeRequestError(message, 408, 'invalid_request_error', WORKFLOW_INPUT_PARAM, 'workflow_agent_stalled');
+}
+
+// Give a backend failure its canonical workflow code. A classified SubagentFailure maps
+// by kind: `terminal` becomes the non-retryable `workflow_agent_terminal` so a failure
+// retrying cannot fix (auth, bad request, config) is not retried to exhaustion; every
+// other kind becomes the retryable `workflow_agent_failed`, preserving today's behavior.
+// An uncoded backend Error also becomes `workflow_agent_failed`; an error already
+// carrying a stable code (a stall, an aborted workflow) keeps it.
+function codedAgentFailure(err: unknown): unknown {
+  if (isSubagentFailure(err)) {
+    const terminal = err.kind === 'terminal';
+    return new UltracodeRequestError(
+      err.message,
+      terminal ? 403 : 502,
+      'invalid_request_error',
+      WORKFLOW_INPUT_PARAM,
+      terminal ? 'workflow_agent_terminal' : 'workflow_agent_failed',
+    );
+  }
+  if (workflowFailureReason(err) !== 'workflow_failed') return err;
+  return new UltracodeRequestError(
+    workflowErrorMessage(err),
+    502,
+    'invalid_request_error',
+    WORKFLOW_INPUT_PARAM,
+    'workflow_agent_failed',
+  );
 }
 
 function isWorkflowAgentStalledError(err: unknown): boolean {

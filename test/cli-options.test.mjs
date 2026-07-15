@@ -3,12 +3,28 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
-import { codexSkillState, parseOptions } from '../dist/cli.js';
+import { codexSkillState, parseOptions, parseBudget } from '../dist/cli.js';
 
 const tempDirs = [];
 
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
+test('parseBudget accepts strict token counts and rejects ambiguous or overflowing values (DW-B6)', () => {
+  assert.equal(parseBudget(undefined), null);
+  assert.equal(parseBudget('500000'), 500000);
+  assert.equal(parseBudget('500k'), 500000);
+  assert.equal(parseBudget('+500k'), 500000);
+  assert.equal(parseBudget('2m'), 2000000);
+  assert.equal(parseBudget('1'), 1);
+  const rejected = [
+    '500kb', '5e2k', '0', '-1', '12x', '', ' ', '1.5', '500K', '1_000',
+    `${'9'.repeat(400)}m`, `${Number.MAX_SAFE_INTEGER}0`, `${Number.MAX_SAFE_INTEGER}m`,
+  ];
+  for (const bad of rejected) {
+    assert.throws(() => parseBudget(bad), /budget must be/, `should reject ${JSON.stringify(bad)}`);
+  }
 });
 
 test('codexSkillState classifies installed Codex skill folders', async () => {

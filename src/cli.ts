@@ -9,8 +9,8 @@ import { pathToFileURL } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { CodexSubagentBackend } from './codex/subagent-backend.js';
 import { probeCodexSetup } from './codex/setup-probe.js';
-import { WorkflowTaskRegistry } from './runtime/workflow-runtime.js';
-import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError } from './runtime/types.js';
+import { WorkflowTaskRegistry, isRetryableFailureReason } from './runtime/workflow-runtime.js';
+import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, isAgentConcurrencyKeyword, isWorktreeRetention } from './runtime/types.js';
 import { ultracodePackageVersion } from './runtime/package-info.js';
 import { defaultUltracodeStateRoot, resolveUltracodeStatePath } from './runtime/state-root.js';
 import { renderUltracodeInstallGuideNotice } from './ultracode-install-guide.js';
@@ -29,8 +29,10 @@ import {
   workflowDefaultRetryLimit,
   workflowDefaultTimeoutMs,
   workflowDefaultHeartbeatMs,
+  workflowDefaultWorktreeRetention,
+  workflowDefaultAgentConcurrency,
 } from './settings.js';
-import type { ReasoningEffort, Verbosity } from './runtime/types.js';
+import type { AgentConcurrency, ReasoningEffort, Verbosity, WorktreeRetention } from './runtime/types.js';
 import type { WorkflowExecutionMode, WorkflowPermissionPolicy, WorkflowProgressMode } from './settings.js';
 import type {
   WorkflowEvent,
@@ -103,6 +105,12 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   if (options.validate !== undefined) {
     return await validateWorkflowCommand(await inputPromise, cwd, options);
   }
+  // Parse the run options this command owns before the background branch: a background
+  // launch reports success immediately, so an invalid value rejected only in the detached
+  // child would surface as an empty result record and an unknown early exit.
+  const worktreeRetention = parseWorktreeRetention(options.worktreeRetention);
+  const agentConcurrency = parseAgentConcurrency(options.agentConcurrency);
+  const budgetTotal = parseBudget(options.budget);
   if (executionMode === 'background') {
     const input = await inputPromise;
     if (input.resumeFromRunId) await assertBackgroundResumeSource(cwd, input.resumeFromRunId);
@@ -132,6 +140,9 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
     requestTimeoutMs: timeoutMs,
     defaultReasoningEffort: reasoningEffort,
     heartbeatMs,
+    worktreeRetention,
+    agentConcurrency,
+    budgetTotal,
   });
 
   try {
@@ -145,7 +156,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
         return 0;
       }
       renderFailedSnapshot(snapshot, progressMode);
-      if (snapshot.failureReason === 'workflow_aborted' || retries >= retryLimit) {
+      if (!isRetryableFailureReason(snapshot.failureReason) || retries >= retryLimit) {
         // The result channel must stay total: in background mode this stdout
         // is result.json, so a terminal failure writes a machine-readable
         // record where consumers otherwise find a 0-byte file.
@@ -250,6 +261,9 @@ interface ParsedOptions {
   readonly install?: string;
   readonly permission?: string;
   readonly retryLimit?: string;
+  readonly worktreeRetention?: string;
+  readonly agentConcurrency?: string;
+  readonly budget?: string;
   readonly jobId?: string;
   readonly metadataPath?: string;
   readonly resultPath?: string;
@@ -487,6 +501,7 @@ interface WorkflowFailureRecord {
   };
 }
 
+
 function workflowFailureRecord(snapshot: WorkflowTaskSnapshot): WorkflowFailureRecord {
   let phase: string | undefined;
   let agentsCompleted: number | undefined;
@@ -501,6 +516,7 @@ function workflowFailureRecord(snapshot: WorkflowTaskSnapshot): WorkflowFailureR
     failure: {
       reason: snapshot.failureReason ?? 'unknown',
       error: snapshot.error ?? 'unknown',
+
       workflowName: snapshot.workflowName,
       taskId: snapshot.taskId,
       runId: snapshot.runId,
@@ -2006,6 +2022,39 @@ function parseRetryLimit(value: string | undefined): number {
   return parsed;
 }
 
+function parseWorktreeRetention(value: string | undefined): WorktreeRetention {
+  if (value === undefined) return workflowDefaultWorktreeRetention();
+  if (isWorktreeRetention(value)) return value;
+  throw new Error('worktree-retention must be one of preserve-all, remove-clean.');
+}
+
+function parseAgentConcurrency(value: string | undefined): AgentConcurrency {
+  if (value === undefined) return workflowDefaultAgentConcurrency();
+  if (isAgentConcurrencyKeyword(value)) return value;
+  // Strict positive-integer parse: reject '2x', '2.5', '', and '+2' so a typo cannot
+  // silently narrow the pool. parseInt would accept a prefix and hide the mistake.
+  if (/^[0-9]+$/.test(value)) {
+    const size = Number(value);
+    if (size >= 1) return size;
+  }
+  throw new Error("agent-concurrency must be 'unbounded', 'auto', or a positive integer.");
+}
+
+export function parseBudget(value: string | undefined): number | null {
+  if (value === undefined) return null;
+  // Strict positive-integer parse with an optional +, and a k(×1e3)/m(×1e6) suffix:
+  // '500000', '500k', '+500k'. Reject '500kb', '5e2k', '0', '-1', '12x'. The safe-integer
+  // bound is load-bearing: without it a long digit string parses to Infinity and the ceiling
+  // silently never fires (spent >= Infinity is never true).
+  const match = /^\+?([0-9]+)([km])?$/.exec(value);
+  if (match) {
+    const mult = match[2] === 'k' ? 1_000 : match[2] === 'm' ? 1_000_000 : 1;
+    const total = Number(match[1]) * mult;
+    if (Number.isSafeInteger(total) && total >= 1) return total;
+  }
+  throw new Error('budget must be a positive integer of output tokens, optionally with a k or m suffix (e.g. 500000, 500k, +500k).');
+}
+
 function parsePermissionPolicy(value: string | undefined): PermissionPolicy {
   if (value === undefined) return workflowDefaultPermissionPolicy();
   if (isWorkflowPermissionPolicy(value)) return value;
@@ -2072,6 +2121,9 @@ Options:
   --args-file <path>                 Read workflow args JSON from a file.
   --permission <ask|allow|deny>      Permission review behavior. Default: settings.json (${workflowDefaultPermissionPolicy()}).
   --retry-limit <number>             Retry failed workflows in the same process. Default: settings.json (${workflowDefaultRetryLimit()}).
+  --worktree-retention <preserve-all|remove-clean>  Reclaim unchanged completed isolated worktrees. Default: settings.json (${workflowDefaultWorktreeRetention()}).
+  --agent-concurrency <unbounded|auto|N>  Bound concurrent agent dispatches per run. 'auto' = min(16, cores-2). Default: settings.json (${String(workflowDefaultAgentConcurrency())}).
+  --budget <N|Nk|Nm>                 Per-run output-token ceiling (optional +, k=×1e3, m=×1e6); agent() refuses to launch once budget.spent() reaches it. Off by default. Not inherited on resume: re-pass --budget or the resumed run is uncapped. Counts successful-agent output tokens only; best-effort under concurrency.
   --progress <jsonl|plain>           Progress format on stderr. Default: settings.json (${workflowDefaultProgressMode()}).
   --execution <background|attached>  Execution mode. Default: settings.json (${workflowDefaultExecutionMode()}).
   --command <path>                   Override Codex CLI binary path.

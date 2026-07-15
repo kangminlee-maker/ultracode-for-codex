@@ -347,8 +347,10 @@ Useful controls:
   model mismatch, and workspace drift since the source run as progress log
   lines; drift does not block cached reuse.
 - Use `isolation: "worktree"` only in git repositories with at least one commit.
-  Isolated worktrees are intentionally preserved for review, including clean
-  worktrees.
+  A completed agent's worktree is reclaimed when it holds no real changes; one
+  that holds changes, stalled, or was aborted is intentionally preserved for
+  review and never auto-merged. Set `workflow.worktreeRetention` (or
+  `--worktree-retention`) to `preserve-all` to keep every worktree.
 - Treat workflow state under `${ULTRACODE_FOR_CODEX_HOME:-~/.ultracode-for-codex}`
   as sensitive local data. Project-local `.ultracode-for-codex/` directories are
   legacy state and should stay ignored.

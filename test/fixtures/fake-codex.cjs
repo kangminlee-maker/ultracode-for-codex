@@ -60,6 +60,16 @@ function emitTurn(threadId, turnId, text = 'OK') {
   }, 0);
 }
 
+function emitFailedTurn(threadId, turnId, codexErrorInfo, message) {
+  write({
+    method: 'turn/completed',
+    params: {
+      threadId,
+      turn: { id: turnId, status: 'failed', error: { message, additionalDetails: null, codexErrorInfo } },
+    },
+  });
+}
+
 function emitWorkspaceToolTurn(threadId, turnId, tool, args) {
   void requestWorkspaceTool(threadId, turnId, tool, args).then((response) => {
     const text = response.error
@@ -174,6 +184,12 @@ rl.on('line', (line) => {
     if (input.includes('DEBUG_PAYLOAD')) {
       result(payload.id, { turn: { id: turnId } });
       setTimeout(() => emitTurn(threadId, turnId, JSON.stringify(debugPayload())), 0);
+      return;
+    }
+    const failMatch = input.match(/FAIL_TURN:([A-Za-z]+)/);
+    if (failMatch) {
+      result(payload.id, { turn: { id: turnId } });
+      setTimeout(() => emitFailedTurn(threadId, turnId, failMatch[1], `turn failed: ${failMatch[1]}`), 0);
       return;
     }
     if (input.includes('READ_WORKSPACE_TOOL')) {

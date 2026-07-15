@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import { afterEach, test } from 'node:test';
 import { promisify } from 'node:util';
-import { WorkflowTaskRegistry } from '../dist/runtime/workflow-runtime.js';
+import { WorkflowTaskRegistry, isRetryableFailureReason } from '../dist/runtime/workflow-runtime.js';
+import { SubagentFailure } from '../dist/runtime/types.js';
 import {
   WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
   computeWorkflowAgentCallKey,
@@ -225,6 +226,68 @@ return "done";`;
   }
 });
 
+test('a backend failure surfacing through an unawaited agent stays retryable', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend() });
+  try {
+    // Start both, await sequentially: a normal fan-out idiom where the second agent can
+    // reject while the script is still blocked on the first, so it reaches the runtime as
+    // an unhandled tracked-promise rejection rather than a throw from `await`.
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "unawaited-backend-failure" };\nconst first = agent("SILENT_75MS");\nconst second = agent("FAIL_AGENT");\nawait first;\nreturn await second;',
+    });
+    const events = await collectEvents(runtime, launch.taskId);
+    assert.equal(events.at(-1).type, 'workflow.failed');
+    // The backend throws a plain uncoded Error; coding it at the boundary keeps a transient
+    // failure retryable instead of collapsing it into a deterministic-defect wrapper reason.
+    assert.equal(events.at(-1).recovery.reason, 'workflow_agent_failed');
+    assert.equal(events.at(-1).recovery.retryable, true);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a plain timer callback throw keeps its wrapper reason and stays non-retryable', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend() });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "timer-throw" };\nsetTimeout(function () { throw new Error("boom"); }, 1);\nreturn await agent("WAIT");',
+    });
+    const events = await collectEvents(runtime, launch.taskId);
+    assert.equal(events.at(-1).type, 'workflow.failed');
+    // Deriving purely from the underlying error would collapse this deterministic script
+    // defect into the retryable `workflow_failed` catch-all and repeat it to the limit.
+    assert.equal(events.at(-1).recovery.reason, 'workflow_timer_callback_failed');
+    assert.equal(events.at(-1).recovery.retryable, false);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('isRetryableFailureReason classifies transient reasons retryable and deterministic reasons non-retryable', () => {
+  for (const reason of [
+    'workflow_failed',
+    'workflow_agent_failed',
+    'workflow_agent_stalled',
+    'workflow_journal_write_failed',
+    'workflow_structured_output_failed',
+  ]) {
+    assert.equal(isRetryableFailureReason(reason), true, `${reason} should be retryable`);
+  }
+  for (const reason of [
+    'workflow_meta_invalid',
+    'workflow_input_invalid',
+    'workflow_script_nondeterministic',
+    'workflow_permission_denied',
+    'workflow_resume_running',
+    'runtime_closed',
+    'workflow_aborted',
+    'workflow_unrecognized_future_code',
+    undefined,
+  ]) {
+    assert.equal(isRetryableFailureReason(reason), false, `${String(reason)} should be non-retryable`);
+  }
+});
+
 test('workflow agents reject invalid effort and model values before spending tokens', async () => {
   const backend = new FakeSubagentBackend();
   const { runtime } = await createRuntime({ backend });
@@ -235,6 +298,9 @@ test('workflow agents reject invalid effort and model values before spending tok
     let events = await collectEvents(runtime, invalidEffort.taskId);
     assert.equal(events.at(-1).type, 'workflow.failed');
     assert.equal(events.at(-1).recovery.reason, 'workflow_input_invalid');
+    // Deterministic input failures are non-retryable; the event's retryable is now derived
+    // from the reason (a hardcoded `true` here would fail this assertion).
+    assert.equal(events.at(-1).recovery.retryable, false);
 
     const invalidModel = await runtime.launch({
       script: 'export const meta = { name: "bad-model", description: "Reject blank model" };\nreturn await agent("never runs", { model: "  " });',
@@ -1518,8 +1584,8 @@ test('workflow runtime preserves changed worktree-isolated agents for review', a
   }
 });
 
-test('workflow runtime preserves clean worktree-isolated agents for review', async () => {
-  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend() });
+test('workflow runtime preserve-all opts out and retains a clean worktree for review', async () => {
+  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { worktreeRetention: 'preserve-all' } });
   let preservedPath;
   try {
     await initializeGitRepo(root);
@@ -1545,6 +1611,423 @@ test('workflow runtime preserves clean worktree-isolated agents for review', asy
   }
 });
 
+test('workflow runtime reclaims a clean completed worktree by default', async () => {
+  const backend = new FakeSubagentBackend();
+  // No retention option: this pins the shipped default, which is remove-clean.
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "worktree-remove-clean" };\nreturn await agent("READ_ONLY_WORKTREE", { isolation: "worktree" });',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    // Isolation actually ran (subject cardinality > 0), so the removal assertion is non-vacuous.
+    const worktreePath = backend.requests[0].worktreePath;
+    assert.equal(typeof worktreePath, 'string');
+    assert.equal(await fileExists(worktreePath), false);
+    const completed = snapshot.events.find((event) => event.type === 'workflow.agent.completed');
+    assert.notEqual(completed.worktreePreserved, true);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow runtime remove-clean preserves a changed worktree', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { worktreeRetention: 'remove-clean' } });
+  let preservedPath;
+  try {
+    await initializeGitRepo(root);
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "worktree-remove-clean-changed" };\nreturn await agent("WRITE_WORKTREE", { isolation: "worktree" });',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    const completed = snapshot.events.find((event) => event.type === 'workflow.agent.completed');
+    assert.equal(completed.worktreePreserved, true);
+    preservedPath = completed.worktreePath;
+    assert.equal(await fileExists(join(preservedPath, 'agent-change.txt')), true);
+    assert.equal(completed.preservedWorktrees[0].reason, 'changed');
+  } finally {
+    if (preservedPath) {
+      await gitLines(root, ['worktree', 'remove', '--force', preservedPath]).catch(async () => {
+        await rm(preservedPath, { recursive: true, force: true });
+      });
+    }
+    await runtime.close();
+  }
+});
+
+test('workflow runtime remove-clean reclaims an ignored-only worktree (native unchanged parity)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { worktreeRetention: 'remove-clean' } });
+  try {
+    await initializeGitRepo(root);
+    // Commit a .gitignore so the isolated worktree (checked out from HEAD) treats build/ as ignored.
+    await writeFile(join(root, '.gitignore'), 'build/\n');
+    await gitLines(root, ['add', '.gitignore']);
+    await gitLines(root, ['commit', '-m', 'ignore build']);
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "worktree-remove-ignored" };\nreturn await agent("WRITE_IGNORED_WORKTREE", { isolation: "worktree" });',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    const worktreePath = backend.requests[0].worktreePath;
+    assert.equal(typeof worktreePath, 'string');
+    // Ignored-only content is "unchanged" to `git worktree remove`, so it is reclaimed.
+    assert.equal(await fileExists(worktreePath), false);
+    const completed = snapshot.events.find((event) => event.type === 'workflow.agent.completed');
+    assert.notEqual(completed.worktreePreserved, true);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('agentConcurrency bounds concurrent dispatch across a parallel() burst (DW-A1)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend, runtimeOptions: { agentConcurrency: 1 } });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "pool-bound" };\n'
+        + 'return await parallel([() => agent("SILENT_75MS a"), () => agent("SILENT_75MS b"), () => agent("SILENT_75MS c")]);',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    // Cardinality guard: a pool that dispatched nothing would pass a bound check vacuously.
+    assert.equal(backend.requests.length, 3);
+    assert.equal(backend.maxActiveRequests, 1, 'pool size 1 must serialize agent dispatch');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('agentConcurrency unbounded (landing default) leaves parallel() dispatch concurrent (DW-A2 contrast)', async () => {
+  const backend = new FakeSubagentBackend();
+  // No agentConcurrency option => no pool => current behavior.
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "pool-off" };\n'
+        + 'return await parallel([() => agent("SILENT_75MS a"), () => agent("SILENT_75MS b"), () => agent("SILENT_75MS c")]);',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    assert.equal(backend.requests.length, 3);
+    // Negative control for DW-A1: without a pool the same burst runs concurrently.
+    assert.equal(backend.maxActiveRequests, 3, 'no pool must not serialize dispatch');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('agentConcurrency holds the permit until the real dispatch settles, not the abort race (DW-A6)', async () => {
+  // A backend whose first dispatch ignores its abort signal and stays live past the
+  // stall timeout. The pool must keep that permit held until generate() actually
+  // settles; releasing on the abort race would let the stall-retry's dispatch start
+  // while the first is still in flight -- pushing live dispatches to 2 on a size-1 pool.
+  class LingerBackend {
+    name = 'linger-backend';
+    model = 'fake-model';
+    live = 0;
+    maxLive = 0;
+    calls = 0;
+    async generate() {
+      this.calls += 1;
+      const call = this.calls;
+      this.live += 1;
+      this.maxLive = Math.max(this.maxLive, this.live);
+      try {
+        if (call === 1) await sleep(140); // ignore abort; linger well past the 40ms stall timeout
+        return subagentResult({ text: `ok-${call}` });
+      } finally {
+        this.live -= 1;
+      }
+    }
+    async close() {}
+  }
+  const backend = new LingerBackend();
+  const { runtime } = await createRuntime({
+    backend,
+    runtimeOptions: { agentConcurrency: 1, agentStallTimeoutMs: 40, agentStallRetryLimit: 1 },
+  });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "pool-honest-abort" };\nreturn await agent("linger please");',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    assert.equal(snapshot.result, 'ok-2', 'the stall retry should have produced the second dispatch');
+    assert.equal(backend.calls, 2, 'attempt 1 stalled and attempt 2 retried');
+    assert.equal(backend.maxLive, 1, 'permit must be held until the real dispatch settles; releasing on the abort race would allow 2');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('permit waiting does not count toward the agent stall timeout (DW-A3)', async () => {
+  const backend = new FakeSubagentBackend();
+  // Pool size 1 serializes 3 agents that each work ~75ms. Total serialized time (~225ms)
+  // exceeds the 150ms stall timeout, but no single agent's WORK does. If permit waiting
+  // counted toward the stall clock the later agents would stall; acquiring before the
+  // timer starts means each agent's clock covers only its own dispatch.
+  const { runtime } = await createRuntime({
+    backend,
+    runtimeOptions: { agentConcurrency: 1, agentStallTimeoutMs: 150 },
+  });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "pool-stall-isolation" };\n'
+        + 'return await parallel([() => agent("SILENT_75MS a"), () => agent("SILENT_75MS b"), () => agent("SILENT_75MS c")]);',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed', 'serialized agents must not stall while waiting for a permit');
+    assert.equal(backend.requests.length, 3);
+    assert.equal(backend.maxActiveRequests, 1);
+    assert.equal(snapshot.events.some((event) => event.type === 'workflow.log' && /stalled/.test(event.message)), false);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('cancelling a workflow settles queued permit waiters without hanging (DW-A4)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend, runtimeOptions: { agentConcurrency: 1 } });
+  try {
+    // Pool size 1: the first WAIT agent holds the permit (it never resolves until abort);
+    // the other two queue on it. Cancelling must settle the queued waiters and terminate --
+    // a leaked/unsettled waiter would hang this await forever.
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "pool-cancel" };\n'
+        + 'return await parallel([() => agent("WAIT a"), () => agent("WAIT b"), () => agent("WAIT c")]);',
+    });
+    await waitForEvent(runtime, launch.taskId, 'workflow.agent.started');
+    const cancelled = await runtime.cancel(launch.taskId);
+    assert.equal(cancelled.status, 'failed');
+    assert.equal(cancelled.failureReason, 'workflow_aborted');
+  } finally {
+    await runtime.close();
+  }
+});
+
+class ClassifiedFailureBackend {
+  name = 'classified-failure';
+  model = 'fake-model';
+  constructor(failure) { this.failure = failure; }
+  async generate() { throw this.failure; }
+  async close() {}
+}
+
+test('a terminal backend failure fails the workflow non-retryably (DW-C2)', async () => {
+  const backend = new ClassifiedFailureBackend(new SubagentFailure('you are not authorized', 'terminal', 'unauthorized', true));
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "terminal-failure" };\nreturn await agent("go");',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.equal(snapshot.failureReason, 'workflow_agent_terminal');
+    assert.equal(isRetryableFailureReason(snapshot.failureReason), false, 'a terminal backend failure must not be retryable');
+    // The provider message survives classification (no JSON.stringify flattening).
+    assert.match(snapshot.error, /you are not authorized/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a transient backend failure stays retryable, preserving current behavior (DW-C2 contrast)', async () => {
+  const backend = new ClassifiedFailureBackend(new SubagentFailure('server overloaded', 'transient', 'serverOverloaded', true));
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "transient-failure" };\nreturn await agent("go");',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.equal(snapshot.failureReason, 'workflow_agent_failed');
+    assert.equal(isRetryableFailureReason(snapshot.failureReason), true, 'a transient backend failure stays retryable');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('an unclassified backend failure emits an observability log and stays retryable (DW-C6)', async () => {
+  const backend = new ClassifiedFailureBackend(new SubagentFailure('mystery', 'transient', 'someFutureVariant', false));
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "unclassified-failure" };\nreturn await agent("go");',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.equal(snapshot.failureReason, 'workflow_agent_failed');
+    const logged = snapshot.events.some((event) =>
+      event.type === 'workflow.log' && /unclassified backend failure \(variant: someFutureVariant\)/.test(event.message));
+    assert.ok(logged, 'an unrecognized failure variant must surface a distinguishable log');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('budget is inert and enumeration-identical whether or not a ceiling is set (DW-B1)', async () => {
+  // The sandbox exposes no Object, so a script can only observe budget's keys via for-in
+  // (or spread) — both of which see own-enumerable properties, so this is the real test of
+  // whether total/spent/remaining stay hidden.
+  const script = `export const meta = { name: "budget-shape" };
+const keys = [];
+for (const key in budget) keys.push(key);
+return { keys, total: budget.total, remainingIsInfinity: budget.remaining() === Infinity, spent: budget.spent() };`;
+  const expectedKeys = ['maxAgentCalls', 'maxParallelism', 'agentConcurrency', 'agentStallTimeoutMs', 'agentStallRetryLimit'];
+
+  const off = await createRuntime({ backend: new FakeSubagentBackend() });
+  try {
+    const launch = await off.runtime.launch({ script });
+    await collectEvents(off.runtime, launch.taskId);
+    const result = jsonValue(off.runtime.get(launch.taskId).result);
+    assert.deepEqual(result.keys, expectedKeys);
+    assert.equal(result.total, null);
+    assert.equal(result.remainingIsInfinity, true);
+    assert.equal(result.spent, 0);
+  } finally {
+    await off.runtime.close();
+  }
+
+  const on = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { budgetTotal: 500 } });
+  try {
+    const launch = await on.runtime.launch({ script });
+    await collectEvents(on.runtime, launch.taskId);
+    const result = jsonValue(on.runtime.get(launch.taskId).result);
+    // total/spent/remaining are non-enumerable, so the key set is byte-identical when on.
+    assert.deepEqual(result.keys, expectedKeys);
+    assert.equal(result.total, 500);
+    assert.equal(result.remainingIsInfinity, false);
+    assert.equal(result.spent, 0);
+  } finally {
+    await on.runtime.close();
+  }
+});
+
+test('an output-token budget refuses further agent dispatch once exhausted (DW-B2)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend, runtimeOptions: { budgetTotal: 3 } });
+  try {
+    // Each fake agent spends outputTokens=2. total=3: agent0 (spent 0->2), agent1 (2->4),
+    // agent2 is refused pre-dispatch because spent 4 >= 3.
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "budget-ceiling" };
+const out = [];
+for (let i = 0; i < 5; i += 1) out.push(await agent("agent " + i));
+return out.length;`,
+    });
+    const events = await collectEvents(runtime, launch.taskId);
+    assert.equal(events.at(-1).type, 'workflow.failed');
+    assert.equal(events.at(-1).recovery.reason, 'workflow_input_invalid');
+    assert.equal(events.at(-1).recovery.retryable, false);
+    assert.equal(isRetryableFailureReason('workflow_input_invalid'), false);
+    assert.equal(backend.requests.length, 2, 'the exhausting agent is refused before it reaches the backend');
+    assert.match(runtime.get(launch.taskId).error, /budget exhausted/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a budget larger than the run never throws (DW-B2 negative control)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend, runtimeOptions: { budgetTotal: 1000 } });
+  try {
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "budget-headroom" };
+const out = [];
+for (let i = 0; i < 5; i += 1) out.push(await agent("agent " + i));
+return out.length;`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed');
+    assert.equal(jsonValue(snapshot.result), 5);
+    assert.equal(backend.requests.length, 5);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('spent() counts this run only; cached agents contribute 0 on resume (DW-B3)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const script = `export const meta = { name: "budget-per-run" };
+await agent("solo");
+return budget.spent();`;
+    const first = await runtime.launch({ script });
+    await collectEvents(runtime, first.taskId);
+    assert.equal(jsonValue(runtime.get(first.taskId).result), 2, 'fresh run: one agent spent 2 output tokens');
+    assert.equal(backend.requests.length, 1);
+
+    const resumed = await runtime.launch({ resumeFromRunId: first.runId });
+    const events = await collectEvents(runtime, resumed.taskId);
+    const completions = events.filter((event) => event.type === 'workflow.agent.completed');
+    assert.equal(completions.length, 1);
+    assert.equal(completions.every((event) => event.cached === true), true, 'the resumed agent must be a cache hit (cardinality > 0)');
+    assert.equal(jsonValue(runtime.get(resumed.taskId).result), 0, 'per-run semantics: a cached agent contributes 0 to spent()');
+    assert.equal(backend.requests.length, 1, 'no re-dispatch on resume');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('an exhausted budget inside parallel() becomes a per-item null, not a run failure (G-B2)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend, runtimeOptions: { budgetTotal: 3 } });
+  try {
+    // Two sequential agents spend to 4 >= 3; the parallel batch is then all refused, and
+    // parallel() converts each per-item throw to null instead of failing the run.
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "budget-parallel-null" };
+await agent("warm 0");
+await agent("warm 1");
+return await parallel([() => agent("p0"), () => agent("p1")]);`,
+    });
+    const events = await collectEvents(runtime, launch.taskId);
+    assert.equal(events.at(-1).type, 'workflow.completed');
+    assert.deepEqual(jsonValue(runtime.get(launch.taskId).result), [null, null]);
+    assert.equal(backend.requests.length, 2, 'only the two warm-up agents reach the backend');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('the registry rejects an invalid budgetTotal at its boundary, like agentConcurrency', () => {
+  const backend = new FakeSubagentBackend();
+  for (const bad of [-1, 0, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(
+      () => new WorkflowTaskRegistry({ backend, requestTimeoutMs: 30_000, budgetTotal: bad }),
+      /budgetTotal must be/,
+      `registry should reject budgetTotal ${String(bad)}`,
+    );
+  }
+  for (const ok of [null, undefined, 1, 500000]) {
+    assert.doesNotThrow(() => new WorkflowTaskRegistry({ backend, requestTimeoutMs: 30_000, budgetTotal: ok }));
+  }
+});
+
+
+
+
+
+
+
+
 async function createRuntime({ backend, runtimeOptions = {} }) {
   const root = await mkdtemp(join(tmpdir(), 'workflow-runtime-'));
   tempDirs.push(root);
@@ -1559,6 +2042,9 @@ async function createRuntime({ backend, runtimeOptions = {} }) {
       agentStallTimeoutMs: runtimeOptions.agentStallTimeoutMs,
       agentStallRetryLimit: runtimeOptions.agentStallRetryLimit,
       heartbeatMs: runtimeOptions.heartbeatMs,
+      worktreeRetention: runtimeOptions.worktreeRetention,
+      agentConcurrency: runtimeOptions.agentConcurrency,
+      budgetTotal: runtimeOptions.budgetTotal,
       journalDurability: runtimeOptions.journalDurability,
     }),
   };
@@ -1600,7 +2086,11 @@ class FakeSubagentBackend {
       this.#stallCounts.set(workflowPrompt, count + 1);
       if (count === 0) return await neverUntilAbort(signal);
     }
-    if (workflowPrompt.includes('WRITE_WORKTREE')) {
+    if (workflowPrompt.includes('WRITE_IGNORED_WORKTREE')) {
+      assert.equal(typeof request.worktreePath, 'string');
+      await mkdir(join(request.worktreePath, 'build'), { recursive: true });
+      await writeFile(join(request.worktreePath, 'build', 'artifact.txt'), 'ignored build output\n');
+    } else if (workflowPrompt.includes('WRITE_WORKTREE')) {
       assert.equal(typeof request.worktreePath, 'string');
       await writeFile(join(request.worktreePath, 'agent-change.txt'), 'changed\n');
     }
@@ -1951,6 +2441,7 @@ async function fileExists(path) {
     return false;
   }
 }
+
 
 function jsonValue(value) {
   return JSON.parse(JSON.stringify(value));

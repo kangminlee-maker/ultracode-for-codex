@@ -11,8 +11,11 @@ P3-C is done when:
 
 - the runtime creates a detached git worktree before the backend call;
 - the backend turn runs with that worktree as its workspace;
-- isolated worktrees are preserved after the agent finishes, including clean,
-  changed, stalled, aborted, or status-unavailable worktrees;
+- a completed agent's worktree is reclaimed when it holds no real changes
+  (`workflow.worktreeRetention: remove-clean`, the default); `preserve-all` opts
+  out and keeps every worktree;
+- changed, stalled, aborted, and status-unavailable worktrees are always
+  preserved for review, under either retention policy;
 - `semanticOpts.isolation` participates in the agent cache key.
 
 ## Authority Model
@@ -22,7 +25,7 @@ P3-C is done when:
 | isolation request | workflow script | Only `isolation: "worktree"` is accepted. |
 | worktree path | runtime | Runtime creates paths outside the source repo working tree. |
 | backend cwd | runtime request packet | Subagent backend executes the turn in `worktreePath`. |
-| changed/unchanged decision | runtime git status | `git status --porcelain --untracked-files=all --ignored=matching` decides the preservation reason. |
+| changed/unchanged decision | runtime git status | `git status --porcelain --untracked-files=all --ignored=matching` decides the preservation *reason*. It never gates removal: `git worktree remove` owns that, so ignored-only trees stay reclaimable. |
 | preserved path projection | runtime event | Preserved worktrees are surfaced on agent final events. |
 
 The accepted isolation values are `"none"` and `"worktree"`; any other value
@@ -48,13 +51,17 @@ copied into the isolated worktree.
 4. Pass `worktreePath` to the subagent backend and append path-free worktree
    context to the backend prompt.
 5. Inspect worktree status after the attempt settles.
-6. Preserve the worktree with reason `clean`, `changed`, `stalled`, `aborted`,
-   or `status_unavailable` and surface it on the agent final event.
+6. Under `remove-clean`, reclaim a completed agent's worktree by delegating the
+   cleanliness gate to `git worktree remove` (no `--force`): git deletes a clean
+   or ignored-only tree and refuses one holding real changes, so the decision and
+   the deletion are the same atomic step. A cleanup failure preserves instead.
+7. Otherwise preserve the worktree with reason `clean`, `changed`, `stalled`,
+   `aborted`, or `status_unavailable` and surface it on the agent final event.
 
 ## Verification
 
 - `test/codex-isolation.test.mjs` verifies Codex backend request projection.
-- `test/workflow-runtime.test.mjs` verifies clean and changed worktree
-  preservation.
+- `test/workflow-runtime.test.mjs` verifies default clean reclamation, the
+  `preserve-all` opt-out, ignored-only reclamation, and changed preservation.
 - `scripts/e2e-installed-ultracode-for-codex.mjs` verifies packaged CLI workflow
   execution through the fake Codex app-server boundary.

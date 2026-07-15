@@ -8,6 +8,52 @@ the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `workflow.agentConcurrency` (`--agent-concurrency`): bound the number of agent
+  dispatches running concurrently within a single workflow run. `unbounded` (the
+  default) applies no pool and preserves current behavior; `auto` derives a size
+  from available CPUs (`min(16, cores - 2)`); a positive integer pins it. Exposed
+  to workflow scripts as `budget.agentConcurrency` (`budget.maxParallelism` still
+  reports the `parallel()`/`pipeline()` item bound). The permit is held for the
+  real dispatch's full lifetime, so an aborted or stalled agent cannot let a retry
+  over-subscribe the pool.
+- `--budget <N|Nk|Nm>`: an optional per-run output-token ceiling (with an optional
+  `+`, and `k`/`m` = ×1e3/×1e6). Once a run's successful-agent output tokens reach
+  it, `agent()` refuses to launch a further dispatch (a non-retryable
+  `workflow_input_invalid`; inside `parallel()`/`pipeline()` the refused item resolves
+  to `null`). Workflow scripts read `budget.total`, `budget.spent()`, and
+  `budget.remaining()` to self-pace (e.g. `while (budget.remaining() > N)`); these are
+  non-enumerable, so a run with no budget is byte-identical to before. Per-run and
+  best-effort by design: it counts successful-agent output tokens only
+  (stall/validation-failed spend is not counted), it is soft under concurrency (agents
+  admitted before a sibling exhausts the ceiling still dispatch), and it is **not
+  inherited on resume** — a `--resume-from-run-id` invocation that omits `--budget`
+  runs uncapped, so re-pass the flag. An output-token guardrail, not a hard cost cap.
+- Backend failures are now classified `terminal`, `transient`, or `rate_limited`
+  at the boundary from the codex turn error, instead of being flattened into an
+  opaque message. A `terminal` failure (auth, bad request, context-window, sandbox,
+  and similar) fails with the non-retryable `workflow_agent_terminal` reason and is
+  no longer retried; transient and rate-limited failures keep the retryable
+  `workflow_agent_failed` reason. A failure whose variant is not recognized defaults
+  to retryable and emits a distinguishable log, so a renamed provider variant cannot
+  degrade into silent infinite retry. A `turn/completed` with a non-`completed`
+  status (for example `interrupted`) is now treated as a failure rather than an
+  empty successful turn.
+- `workflow.worktreeRetention` (`--worktree-retention`): a completed
+  `isolation: "worktree"` agent's worktree is now reclaimed when it holds no real
+  changes, matching native `isolation` semantics. Cleanliness is decided by
+  `git worktree remove` itself (no `--force`), so a clean or ignored-only tree is
+  removed while one holding real changes is refused and preserved — build output
+  no longer strands a multi-gigabyte worktree. Changed, stalled, and aborted
+  worktrees are still always preserved for review. Set the setting (or the flag)
+  to `preserve-all` to keep every worktree, as previous versions did.
+- Workflow failure reasons now drive retry: `recovery.retryable` is derived from
+  the reason instead of being hard-coded `true`, so a deterministic failure
+  (invalid input or meta, a nondeterministic script) is no longer retried to the
+  configured `--retry-limit`. Backend failures carry a canonical
+  `workflow_agent_failed` reason and stay retryable.
+
 ### Changed
 
 - Lowered the packaged default reasoning effort (`settings.json`

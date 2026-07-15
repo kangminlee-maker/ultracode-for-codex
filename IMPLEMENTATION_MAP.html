@@ -161,7 +161,7 @@
       <div class="tile"><strong>Current goal</strong><span>Release 0.4.5 with live Codex model capabilities authoritative and gpt-5.6-sol medium/high/max available without unjournaled native descendants</span></div>
       <div class="tile"><strong>Runtime health</strong><span>Model/effort boundary and Sol profiles implemented; full test suite, packaged E2E, no-token prompt inspection, and live Sol medium/high N=1 paths green</span></div>
       <div class="tile"><strong>Main risk</strong><span>Live N=1 proves dispatch, file read, schema submission, and POSIX clean shutdown—not comparative quality on representative repository tasks; Windows terminates only the direct child</span></div>
-      <div class="tile"><strong>Recent decision</strong><span>Effort quality A/B done (2026-07-14, REVIEW/ANALYSIS scope): quality tier-independent, xhigh costs 1.7&ndash;2.4&times; latency for no gain. Owner lowered the global default <code>codex.reasoningEffort</code> xhigh&rarr;medium (overridable; code-writing unmeasured &mdash; revisit if it becomes primary).</span></div>
+      <div class="tile"><strong>Recent decision</strong><span>Dispatch-core parity landed (2026-07-15): opt-in agent concurrency pool, backend failure taxonomy (terminal/transient/rate_limited), and a per-run output-token spend ceiling (<code>--budget</code>). The spend ceiling's resume-deterministic ambition was reviewed by two lenses and dropped as unachievable by a scalar counter &mdash; it is per-run, off by default.</span></div>
     </section>
 
     <h2>Service Blueprint</h2>
@@ -274,6 +274,8 @@
       <tr><td>Capability gate</td><td>Setup and run agree on selected model and effort; unsupported combinations fail before a turn.</td></tr>
       <tr><td>Isolation gate</td><td>No-token prompt inspection proves the worker receives one total native thread slot.</td></tr>
       <tr><td>Release gate</td><td>Typecheck, runtime-boundary check, full tests, installed package E2E, HTML render, and live Sol medium/high probes pass.</td></tr>
+      <tr><td>Dispatch gate</td><td>Shipped, opt-in. A per-run permit pool bounds concurrent agent dispatches however launched (bare, <code>parallel()</code>, nested); the permit is held for the real dispatch's full lifetime so an aborted/stalled retry cannot over-subscribe. Default <code>agentConcurrency: unbounded</code> is byte-identical to before; <code>auto</code> (<code>min(16, cores-2)</code>) or a positive integer enables it. Default-on flip deferred on the pool+stall-retry latency tension (O-6). See <code>docs/ultracode-p3d-dispatch-core.md</code>.</td></tr>
+      <tr><td>Spend gate</td><td>Shipped, off by default. <code>--budget &lt;+Nk|N&gt;</code> sets a per-run output-token ceiling; non-enumerable <code>budget.total</code>/<code>spent()</code>/<code>remaining()</code> let a script self-pace, and <code>runAgentInner</code> refuses to dispatch once <code>spent() &gt;= total</code> (non-retryable <code>workflow_input_invalid</code>). Per-run, best-effort by design — counts successful-agent output only and a resumed run counts from zero. The resume-deterministic variant was reviewed and dropped as unachievable by a scalar counter. See <code>docs/ultracode-p3e-spend-ceiling.md</code>.</td></tr>
     </table>
 
     <h2>Change Impact</h2>
@@ -283,6 +285,8 @@
       <tr><td>Run</td><td><code>--model gpt-5.6-sol --reasoning-effort medium|high|max</code> is validated and inherited by agents without overrides.</td></tr>
       <tr><td>Built-ins</td><td>Task execution claims are read-only and evidence-bound; high-level review avoids xhigh by using a medium/high funnel.</td></tr>
       <tr><td>Recovery</td><td>The effective catalog model is journaled, strengthening resume cache identity and mismatch disclosure.</td></tr>
+      <tr><td>Isolation</td><td>A completed <code>isolation: "worktree"</code> agent's worktree is reclaimed when it holds no real changes; <code>git worktree remove</code> itself decides, so ignored-only build output is reclaimed while real changes are refused and preserved. Changed, stalled, and aborted worktrees are always preserved for review. <code>workflow.worktreeRetention: preserve-all</code> opts out.</td></tr>
+      <tr><td>Retry</td><td><code>recovery.retryable</code> is derived from the failure reason instead of always <code>true</code>, so a deterministic failure is no longer retried to <code>--retry-limit</code>. Backend failures carry a canonical retryable <code>workflow_agent_failed</code> reason.</td></tr>
     </table>
 
     <h2>Verification</h2>
