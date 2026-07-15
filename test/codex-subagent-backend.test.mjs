@@ -166,6 +166,7 @@ test('CodexSubagentBackend uses an Ultracode-only app-server surface', async () 
     assert.equal(payload.threadStart.persistExtendedHistory, false);
     assert.equal(payload.threadStart.config.model_reasoning_effort, 'xhigh');
     assert.equal(payload.threadStart.config.model_verbosity, 'medium');
+    assert.equal(payload.threadStart.config.web_search, 'disabled');
     assert.equal(payload.threadStart.cwd, process.cwd());
     assert.equal(payload.threadStart.model, 'gpt-test-model');
     assert.deepEqual(payload.threadStart.runtimeWorkspaceRoots, [process.cwd()]);
@@ -177,6 +178,25 @@ test('CodexSubagentBackend uses an Ultracode-only app-server surface', async () 
     assert.equal(payload.turnStart.effort, 'xhigh');
     assert.equal(payload.turnStart.summary, 'none');
     assert.equal(payload.turnStart.personality, 'none');
+  } finally {
+    await backend.close();
+  }
+});
+
+test('CodexSubagentBackend flips per-thread web_search to live when the gate is enabled', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  const backend = new CodexSubagentBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+    reasoningEffort: 'xhigh',
+    webSearch: true,
+  });
+
+  try {
+    const result = await backend.generate(textRequest({ prompt: 'DEBUG_PAYLOAD' }));
+    const payload = JSON.parse(result.text);
+    assert.equal(payload.threadStart.config.web_search, 'live');
   } finally {
     await backend.close();
   }

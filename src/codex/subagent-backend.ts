@@ -37,6 +37,10 @@ interface CodexSubagentBackendOptions {
   readonly timeoutMs: number;
   readonly reasoningEffort?: ReasoningEffort;
   readonly verbosity?: Verbosity;
+  // Run-level gate for the native Responses web_search tool. Omitted/false keeps
+  // web_search="disabled" at every config site (byte-identical to a no-web-search run);
+  // true flips every site to "live". See docs/ultracode-p7-agent-web-search.md.
+  readonly webSearch?: boolean;
 }
 
 interface PendingRequest {
@@ -162,6 +166,7 @@ export class CodexSubagentBackend implements SubagentBackend {
   private readonly rpcTimeoutMs: number;
   private readonly reasoningEffort: ReasoningEffort;
   private readonly verbosity: Verbosity;
+  private readonly webSearch: boolean;
   private child: ChildProcessWithoutNullStreams | null = null;
   private lineReader: readline.Interface | null = null;
   private nextId = 1;
@@ -187,6 +192,7 @@ export class CodexSubagentBackend implements SubagentBackend {
     this.rpcTimeoutMs = this.timeoutMs > 0 ? this.timeoutMs : DEFAULT_CODEX_RPC_TIMEOUT_MS;
     this.reasoningEffort = options.reasoningEffort ?? codexDefaultReasoningEffort();
     this.verbosity = options.verbosity ?? codexDefaultVerbosity();
+    this.webSearch = options.webSearch ?? false;
   }
 
   async generate(request: SubagentRequest, signal?: AbortSignal): Promise<SubagentResult> {
@@ -298,6 +304,7 @@ export class CodexSubagentBackend implements SubagentBackend {
       configuredModel: this.configuredModel,
       reasoningEffort: this.reasoningEffort,
       verbosity: this.verbosity,
+      webSearch: this.webSearch,
     });
     this.isolation = isolation;
     const appServerArgs = [
@@ -306,6 +313,7 @@ export class CodexSubagentBackend implements SubagentBackend {
         model: this.configuredModel ?? isolation.defaultModel,
         reasoningEffort: this.reasoningEffort,
         verbosity: this.verbosity,
+        webSearch: this.webSearch,
       }),
       '--listen',
       'stdio://',
@@ -384,7 +392,7 @@ export class CodexSubagentBackend implements SubagentBackend {
         model_reasoning_effort: reasoningEffort,
         model_reasoning_summary: 'none',
         model_verbosity: verbosity,
-        web_search: 'disabled',
+        web_search: webSearchConfigValue(this.webSearch),
       },
     });
     const threadId = readPath<string>(thread, ['result', 'thread', 'id']);
@@ -791,6 +799,13 @@ function workflowAgentPrompt(request: SubagentRequest): string {
   return request.messages.map((message) => message.content).join('\n\n').trim();
 }
 
+// Single source for the Codex `web_search` config value across all three sites (app-server
+// spawn args, isolated home config.toml, per-thread config). `false` reproduces today's
+// literal "disabled" exactly; `true` enables the native Responses web_search tool.
+function webSearchConfigValue(webSearch: boolean | undefined): 'live' | 'disabled' {
+  return webSearch ? 'live' : 'disabled';
+}
+
 function estimatedUsage(prompt: string, text: string): SubagentUsage {
   const inputTokens = estimateTokens(prompt);
   const outputTokens = estimateTokens(text);
@@ -900,6 +915,7 @@ export function codexContextIsolationArgs(options: {
   readonly model?: string;
   readonly reasoningEffort: ReasoningEffort;
   readonly verbosity: Verbosity;
+  readonly webSearch?: boolean;
 }): string[] {
   return [
     ...(options.model ? ['-c', `model=${tomlString(options.model)}`] : []),
@@ -910,7 +926,7 @@ export function codexContextIsolationArgs(options: {
     '-c',
     `model_verbosity=${tomlString(options.verbosity)}`,
     '-c',
-    'web_search="disabled"',
+    `web_search=${tomlString(webSearchConfigValue(options.webSearch))}`,
     '-c',
     'approval_policy="never"',
     '-c',
@@ -936,6 +952,7 @@ export async function createCodexIsolation(options: {
   readonly configuredModel?: string;
   readonly reasoningEffort: ReasoningEffort;
   readonly verbosity: Verbosity;
+  readonly webSearch?: boolean;
 }): Promise<CodexIsolation> {
   const rootDir = await mkdtemp(join(tmpdir(), 'ultracode-for-codex-codex-'));
   const homeDir = join(rootDir, 'codex-home');
@@ -954,6 +971,7 @@ export async function createCodexIsolation(options: {
       model: defaultModel,
       reasoningEffort: options.reasoningEffort,
       verbosity: options.verbosity,
+      webSearch: options.webSearch,
     }),
     { mode: 0o600 },
   );
@@ -977,13 +995,14 @@ export function minimalCodexConfigToml(options: {
   readonly model?: string;
   readonly reasoningEffort: ReasoningEffort;
   readonly verbosity: Verbosity;
+  readonly webSearch?: boolean;
 }): string {
   return [
     ...(options.model ? [`model = ${tomlString(options.model)}`] : []),
     `model_reasoning_effort = ${tomlString(options.reasoningEffort)}`,
     'model_reasoning_summary = "none"',
     `model_verbosity = ${tomlString(options.verbosity)}`,
-    'web_search = "disabled"',
+    `web_search = ${tomlString(webSearchConfigValue(options.webSearch))}`,
     'approval_policy = "never"',
     'sandbox_mode = "read-only"',
     '',

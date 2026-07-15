@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
-import type { AgentConcurrency, NestedWorkflows, ReasoningEffort, Verbosity, WorktreeRetention } from './runtime/types.js';
-import { NESTED_WORKFLOWS_VALUES, REASONING_EFFORTS, WORKTREE_RETENTIONS, isAgentConcurrencyKeyword, isNestedWorkflows, isReasoningEffort, isWorktreeRetention } from './runtime/types.js';
+import type { AgentConcurrency, AgentWebSearch, NestedWorkflows, ReasoningEffort, Verbosity, WorktreeRetention } from './runtime/types.js';
+import { AGENT_WEB_SEARCH_VALUES, NESTED_WORKFLOWS_VALUES, REASONING_EFFORTS, WORKTREE_RETENTIONS, isAgentConcurrencyKeyword, isAgentWebSearch, isNestedWorkflows, isReasoningEffort, isWorktreeRetention } from './runtime/types.js';
 
 export { isReasoningEffort };
 
@@ -19,6 +19,7 @@ export interface UltracodeSettings {
     readonly worktreeRetention: WorktreeRetention;
     readonly agentConcurrency: AgentConcurrency;
     readonly nestedWorkflows: NestedWorkflows;
+    readonly agentWebSearch: AgentWebSearch;
     readonly background: {
       readonly runDir: string;
       readonly resultFile: string;
@@ -96,6 +97,10 @@ export function loadSettings(): UltracodeSettings {
         workflow?.nestedWorkflows,
         'workflow.nestedWorkflows',
       ),
+      agentWebSearch: readAgentWebSearchSetting(
+        workflow?.agentWebSearch,
+        'workflow.agentWebSearch',
+      ),
       background: {
         runDir: readTemplateSetting(
           background?.runDir,
@@ -170,6 +175,10 @@ export function workflowDefaultNestedWorkflows(): NestedWorkflows {
   return loadSettings().workflow.nestedWorkflows;
 }
 
+export function workflowDefaultAgentWebSearch(): AgentWebSearch {
+  return loadSettings().workflow.agentWebSearch;
+}
+
 export function workflowBackgroundDefaults(): UltracodeSettings['workflow']['background'] {
   return loadSettings().workflow.background;
 }
@@ -239,6 +248,15 @@ function readNestedWorkflowsSetting(
   if (value === undefined) return 'disabled';
   if (isNestedWorkflows(value)) return value;
   throw new Error(`${key} must be one of ${NESTED_WORKFLOWS_VALUES.join(', ')}.`);
+}
+
+function readAgentWebSearchSetting(
+  value: unknown,
+  key: string,
+): AgentWebSearch {
+  if (value === undefined) return 'disabled';
+  if (isAgentWebSearch(value)) return value;
+  throw new Error(`${key} must be one of ${AGENT_WEB_SEARCH_VALUES.join(', ')}.`);
 }
 
 function readAgentConcurrencySetting(

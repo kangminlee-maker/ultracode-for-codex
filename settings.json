@@ -9,6 +9,7 @@
     "worktreeRetention": "remove-clean",
     "agentConcurrency": "unbounded",
     "nestedWorkflows": "disabled",
+    "agentWebSearch": "disabled",
     "background": {
       "runDir": "{stateRoot}/background/{jobId}",
       "resultFile": "result.json",
