@@ -1358,8 +1358,12 @@ return await parallel(order.map((id) => () => agent("durable:" + id, {
     requestTimeoutMs: 30_000,
   });
   try {
+    // Edit-and-iterate (PG-ITER) now ALLOWS a single co-supplied source selector with resume
+    // (see the dedicated tests below); more than one still fails loud — defense-in-depth for the
+    // normalizeLaunchInput scriptPath>name>script precedence that would otherwise silently drop
+    // an edit.
     await assertRejectCode(
-      () => runtime2.launch({ resumeFromRunId: runId, name: 'task' }),
+      () => runtime2.launch({ resumeFromRunId: runId, script: 'export const meta = { name: "two" };', name: 'task' }),
       'workflow_input_invalid',
     );
     const resumed = await runtime2.launch({
@@ -1445,6 +1449,103 @@ return await parallel(order.map((id) => () => agent("durable:" + id, {
     assert.equal(backend2.requests.length, 0);
   } finally {
     await runtime2.close();
+  }
+});
+
+test('workflow resume with an edited inline script caches the unchanged chained prefix and runs the edit plus downstream live (PG-ITER)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const v1 = 'export const meta = { name: "iter" };\n'
+      + 'const a = await agent("A");\n'
+      + 'const b = await agent("B");\n'
+      + 'return { a, b };';
+    const first = await runtime.launch({ script: v1 });
+    await collectEvents(runtime, first.taskId);
+    assert.equal(runtime.get(first.taskId).status, 'completed');
+    assert.equal(backend.requests.length, 2);
+
+    // Edit: a unchanged (cached), b changed (live), c appended (live).
+    const v2 = 'export const meta = { name: "iter" };\n'
+      + 'const a = await agent("A");\n'
+      + 'const b = await agent("B_EDITED");\n'
+      + 'const c = await agent("C_NEW");\n'
+      + 'return { a, b, c };';
+    const resumed = await runtime.launch({ resumeFromRunId: first.runId, script: v2 });
+    const events = await collectEvents(runtime, resumed.taskId);
+    const completions = events.filter((event) => event.type === 'workflow.agent.completed');
+
+    // The EDITED script executed with native prefix semantics for chained calls.
+    assert.deepEqual(jsonValue(runtime.get(resumed.taskId).result), { a: 'RAW:A', b: 'RAW:B_EDITED', c: 'RAW:C_NEW' });
+    assert.equal(completions.length, 3);
+    assert.equal(completions.filter((event) => event.cached === true).length, 1); // a
+    assert.equal(completions.filter((event) => event.cached !== true).length, 2); // b, c
+    // MAJOR-3 edit-drop guard: only the two live calls (b, c) reach the backend on resume; the
+    // source script was NOT silently resolved (that would be a 0-live 100%-cache-hit no-op that
+    // returned the stale { a, b } and never ran c).
+    assert.equal(backend.requests.length, 4);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow resume with an edited script reuses a logicalKey call out-of-prefix (documented superset of native) (PG-ITER)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend });
+  try {
+    const v1 = 'export const meta = { name: "iter-keyed" };\n'
+      + 'const a = await agent("A");\n'
+      + 'const b = await agent("B", { key: "kb" });\n'
+      + 'return { a, b };';
+    const first = await runtime.launch({ script: v1 });
+    await collectEvents(runtime, first.taskId);
+    assert.equal(backend.requests.length, 2);
+
+    // Edit the chained call a: a runs live and closes the prefix, but the keyed call b keeps its
+    // key+prompt+opts so its position-independent call key still exact-key-hits the source result.
+    const v2 = 'export const meta = { name: "iter-keyed" };\n'
+      + 'const a = await agent("A_EDITED");\n'
+      + 'const b = await agent("B", { key: "kb" });\n'
+      + 'return { a, b };';
+    const resumed = await runtime.launch({ resumeFromRunId: first.runId, script: v2 });
+    const events = await collectEvents(runtime, resumed.taskId);
+    const completions = events.filter((event) => event.type === 'workflow.agent.completed');
+
+    assert.deepEqual(jsonValue(runtime.get(resumed.taskId).result), { a: 'RAW:A_EDITED', b: 'RAW:B' });
+    // b (keyed) is reused from the source even though the prefix closed at the edited a.
+    assert.equal(completions.filter((event) => event.cached === true).length, 1);
+    assert.equal(backend.requests.length, 3); // only a_edited runs live on resume
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('resume with an edited script_path selector is gated by the permission review and does not inherit the source grant (PG-ITER)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  const stateDir = join(root, '.ultracode-for-codex');
+  try {
+    // Source: a completed inline (ungated) run — its own persisted anchor stays intact.
+    const first = await runtime.launch({ script: 'export const meta = { name: "sec-src" };\nreturn await agent("A");' });
+    await collectEvents(runtime, first.taskId);
+    assert.equal(runtime.get(first.taskId).status, 'completed');
+    assert.equal(backend.requests.length, 1);
+
+    // An unreviewed script_path file inside the runtime scripts dir (no sidecar → untrusted, no
+    // allow record). script_path is a permission-required source.
+    await mkdir(join(stateDir, 'workflows', 'scripts'), { recursive: true });
+    const editedPath = join(stateDir, 'workflows', 'scripts', 'sec-edited.js');
+    await writeFile(editedPath, 'export const meta = { name: "sec-edited" };\nreturn await agent("A");');
+
+    // Resuming with this script_path routes through the permission gate rather than running
+    // under the source run's implicit grant.
+    const gated = await runtime.launch({ resumeFromRunId: first.runId, scriptPath: editedPath });
+    assert.equal(gated.status, 'permission_required');
+    assert.equal(gated.workflowSource, 'script_path');
+    // No extra agent ran under a bypassed grant (still just the source's single agent).
+    assert.equal(backend.requests.length, 1);
+  } finally {
+    await runtime.close();
   }
 });
 
