@@ -713,6 +713,145 @@ return { result, events };`,
   }
 });
 
+test('pipeline stages receive (prevResult, originalItem, index)', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend() });
+  try {
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "pipeline-signature" };
+return await pipeline(["a", "b"],
+  (prev, original, index) => "s1(" + String(prev) + "," + String(original) + "," + String(index) + ")",
+  (prev, original, index) => "s2(" + String(prev) + "," + String(original) + "," + String(index) + ")"
+);`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    // Under the old single-arg call the originalItem/index args are undefined, so the
+    // embedded strings would read "undefined" — this assertion pins the native signature.
+    assert.deepEqual(jsonValue(runtime.get(launch.taskId).result), [
+      's2(s1(a,a,0),a,0)',
+      's2(s1(b,b,1),b,1)',
+    ]);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('pipeline passes a stage-returned null onward instead of short-circuiting the item', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend() });
+  try {
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "pipeline-null-passthrough" };
+const ran = [];
+const result = await pipeline([1],
+  () => null,
+  (prev) => { ran.push("stage2:" + String(prev)); return "recovered"; }
+);
+return { result, ran };`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    // Negative control: the old short-circuit turned a returned null into a skipped item,
+    // yielding { result: [null], ran: [] }. Native passes the null onward, so stage2 runs.
+    assert.deepEqual(jsonValue(runtime.get(launch.taskId).result), {
+      result: ['recovered'],
+      ran: ['stage2:null'],
+    });
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('pipeline passes a stage-returned undefined onward as well (not only null)', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend() });
+  try {
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "pipeline-undefined-passthrough" };
+const ran = [];
+const result = await pipeline([1],
+  () => undefined,
+  (prev) => { ran.push("stage2:" + String(prev)); return "recovered"; }
+);
+return { result, ran };`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    // The old short-circuit caught undefined too; native passes it onward so stage2 runs.
+    assert.deepEqual(jsonValue(runtime.get(launch.taskId).result), {
+      result: ['recovered'],
+      ran: ['stage2:undefined'],
+    });
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('pipeline drops an item to null and skips remaining stages only when a stage throws', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend() });
+  try {
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "pipeline-throw-skips" };
+const ran = [];
+const result = await pipeline([1],
+  () => { throw new Error("boom"); },
+  (prev) => { ran.push("stage2"); return "reached"; }
+);
+return { result, ran };`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    // Regression guard: throw still drops the item to null and skips the remaining stage.
+    assert.deepEqual(jsonValue(runtime.get(launch.taskId).result), {
+      result: [null],
+      ran: [],
+    });
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('parallel() and pipeline() reject more than 4096 items with an explicit error', async () => {
+  const { runtime } = await createRuntime({ backend: new FakeSubagentBackend() });
+  try {
+    const over = Array.from({ length: 4097 }, (_, i) => i);
+    const under = Array.from({ length: 4096 }, (_, i) => i);
+
+    const parallelOver = await runtime.launch({
+      script: 'export const meta = { name: "parallel-cap-over" };\nreturn await parallel(args);',
+      args: over,
+    });
+    let events = await collectEvents(runtime, parallelOver.taskId);
+    assert.equal(events.at(-1).type, 'workflow.failed');
+    assert.equal(events.at(-1).recovery.reason, 'workflow_input_invalid');
+    // Pin the hook name so a copy-pasted wrong name in the message is caught.
+    assert.match(runtime.get(parallelOver.taskId).error, /parallel\(\) accepts at most 4096 items; got 4097/);
+
+    const pipelineOver = await runtime.launch({
+      script: 'export const meta = { name: "pipeline-cap-over" };\nreturn await pipeline(args, (x) => x);',
+      args: over,
+    });
+    events = await collectEvents(runtime, pipelineOver.taskId);
+    assert.equal(events.at(-1).type, 'workflow.failed');
+    assert.equal(events.at(-1).recovery.reason, 'workflow_input_invalid');
+    assert.match(runtime.get(pipelineOver.taskId).error, /pipeline\(\) accepts at most 4096 items; got 4097/);
+
+    // Boundary: exactly 4096 items is accepted and completes — pinned for BOTH hooks so a
+    // `>= 4096` off-by-one in either guard is caught (the pipeline guard is a separate copy).
+    const parallelUnder = await runtime.launch({
+      script: 'export const meta = { name: "parallel-cap-under" };\nconst r = await parallel(args);\nreturn r.length;',
+      args: under,
+    });
+    events = await collectEvents(runtime, parallelUnder.taskId);
+    assert.equal(events.at(-1).type, 'workflow.completed');
+    assert.equal(jsonValue(runtime.get(parallelUnder.taskId).result), 4096);
+
+    const pipelineUnder = await runtime.launch({
+      script: 'export const meta = { name: "pipeline-cap-under" };\nconst r = await pipeline(args, (x) => x);\nreturn r.length;',
+      args: under,
+    });
+    events = await collectEvents(runtime, pipelineUnder.taskId);
+    assert.equal(events.at(-1).type, 'workflow.completed');
+    assert.equal(jsonValue(runtime.get(pipelineUnder.taskId).result), 4096);
+  } finally {
+    await runtime.close();
+  }
+});
+
 test('workspaceContext includeDiff returns deterministic change evidence refs', async () => {
   const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend() });
   try {

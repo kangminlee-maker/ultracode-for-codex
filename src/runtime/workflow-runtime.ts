@@ -550,6 +550,9 @@ interface AgentOptions {
 const MAX_SCRIPT_BYTES = 64 * 1024;
 const MAX_AGENT_CALLS = 1000;
 const MAX_PARALLELISM = 16;
+// Native parity: a single parallel()/pipeline() call accepts at most this many items;
+// beyond it the call is an explicit error, not a silent truncation.
+const MAX_PARALLEL_ITEMS = 4096;
 const DEFAULT_AGENT_STALL_RETRY_LIMIT = 5;
 const DEFAULT_WORKSPACE_CONTEXT_MAX_FILES = 24;
 const DEFAULT_WORKSPACE_CONTEXT_MAX_FILE_BYTES = 12_000;
@@ -3332,6 +3335,9 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
 
   private async parallel(ctx: WorkflowRunContext, items: unknown): Promise<unknown[]> {
     if (!Array.isArray(items)) throw workflowInputError('parallel() requires an array.');
+    if (items.length > MAX_PARALLEL_ITEMS) {
+      throw workflowInputError(`parallel() accepts at most ${MAX_PARALLEL_ITEMS} items; got ${items.length}.`);
+    }
     return mapWithConcurrency(items, MAX_PARALLELISM, async (item) => {
       try {
         return typeof item === 'function' ? await (item as () => unknown)() : await item;
@@ -3349,15 +3355,20 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
 
   private async pipeline(ctx: WorkflowRunContext, items: unknown, stages: unknown[]): Promise<unknown[]> {
     if (!Array.isArray(items)) throw workflowInputError('pipeline() requires an item array.');
+    if (items.length > MAX_PARALLEL_ITEMS) {
+      throw workflowInputError(`pipeline() accepts at most ${MAX_PARALLEL_ITEMS} items; got ${items.length}.`);
+    }
     for (const stage of stages) {
       if (typeof stage !== 'function') throw workflowInputError('pipeline() stages must be functions.');
     }
-    return mapWithConcurrency(items, MAX_PARALLELISM, async (item) => {
+    return mapWithConcurrency(items, MAX_PARALLELISM, async (item, index) => {
+      // Native parity: each stage receives (prevResult, originalItem, index). Only a
+      // stage that THROWS drops the item to null and skips the rest; a stage that
+      // returns null/undefined passes that value onward to the next stage.
       let current: unknown = item;
-      for (const stage of stages as Array<(value: unknown) => unknown>) {
-        if (current === null || current === undefined) return null;
+      for (const stage of stages as Array<(prev: unknown, original: unknown, index: number) => unknown>) {
         try {
-          current = await stage(current);
+          current = await stage(current, item, index);
         } catch (err) {
           this.emit(ctx.task, {
             type: 'workflow.log',

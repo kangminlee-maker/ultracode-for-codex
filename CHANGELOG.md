@@ -53,6 +53,9 @@ the project uses [semantic versioning](https://semver.org/).
   (invalid input or meta, a nondeterministic script) is no longer retried to the
   configured `--retry-limit`. Backend failures carry a canonical
   `workflow_agent_failed` reason and stay retryable.
+- `parallel()` and `pipeline()` now reject a call with more than 4096 items with an
+  explicit `workflow_input_invalid` error instead of silently accepting an unbounded
+  batch, matching the native per-call item cap.
 
 ### Changed
 
@@ -68,6 +71,16 @@ the project uses [semantic versioning](https://semver.org/).
   overridable with `--reasoning-effort`, and the `code-review` built-in's own
   `level` (which sets its own effort) is unchanged. See
   `docs/20260714-effort-quality-ab.md`.
+- `pipeline()` stages now receive `(prevResult, originalItem, index)`, matching the
+  native signature; previously a stage saw only `prevResult`. This part is additive:
+  existing single-argument stages ignore the new arguments and behave identically.
+  Separately — and this is a behavior change — a stage that *returns* `null`/`undefined`
+  now passes that value onward to the next stage instead of short-circuiting the item;
+  only a stage that *throws* drops the item to `null` and skips its remaining stages
+  (unchanged). This affects any multi-stage pipeline whose earlier stage can return a
+  nullish value, regardless of how many arguments its stages read. Every built-in
+  workflow is unaffected (`code-review` runs a single-stage pipeline). See
+  `docs/ultracode-p3f-contract-correctness.md`.
 
 ## [0.4.5] - 2026-07-12
 
