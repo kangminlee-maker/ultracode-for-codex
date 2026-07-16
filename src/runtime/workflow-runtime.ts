@@ -312,6 +312,16 @@ interface ParsedWorkflowScript {
   readonly metaLiteral: string;
 }
 
+// A nested workflow() child resolved to its parsed script + the source metadata the permission-record
+// gate keys on (PG-NEST v2-A). scriptHash is of the exact executed text, so the key can't drift.
+interface ResolvedNestedChild {
+  readonly parsed: ParsedWorkflowScript;
+  readonly script: string;
+  readonly workflowSource: WorkflowSource;
+  readonly workflowSourcePath?: string;
+  readonly scriptHash: string;
+}
+
 interface WorkflowMeta {
   readonly name: string;
   readonly description?: string;
@@ -3606,26 +3616,58 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   }
 
   // Resolve a nested workflow() reference to a parsed child script. v1 supports a built-in
-  // name and an inline { script } object — both permission-free sources (built-ins are trusted;
-  // an inline child's text is part of the already-approved parent script). project/user/plugin
-  // and { scriptPath } (arbitrary file exec) are deferred behind the permission gate (backlog).
-  // Throws (catchably) on an unknown name, a bad reference, or a child parse/meta error (C5f).
-  private resolveNestedChild(nameOrRef: unknown): ParsedWorkflowScript {
+  // Resolve a nested child ref to its parsed script + source metadata (PG-NEST v2-A). A string name
+  // now follows the SAME project→user→plugin→built-in precedence as a top-level launch (v1 was
+  // built-in-only); an inline { script } is a permission-free source (its text is part of the
+  // already-approved parent script). { scriptPath } stays rejected (a scriptPath ref is confined to
+  // runtime-owned scripts whose records live under their original source, so it has no clean gate —
+  // deferred; see docs/ultracode-p11). Throws (catchably) on an unknown name, a bad ref, or a child
+  // parse/meta error (C5f). The permission-record gate is applied separately in assertNestedChildPermitted.
+  private async resolveNestedChild(nameOrRef: unknown): Promise<ResolvedNestedChild> {
     if (typeof nameOrRef === 'string') {
-      const resolved = this.findBuiltinWorkflow(nameOrRef, new Set());
-      if (!resolved) {
-        throw workflowInputError(`workflow('${nameOrRef}') did not match a built-in workflow; v1 nesting supports built-in names and { script }.`);
-      }
-      return parseInlineWorkflowScript(resolved.script);
+      return this.nestedChildFromResolved(await this.resolveNamedWorkflow(nameOrRef));
     }
     if (nameOrRef && typeof nameOrRef === 'object') {
       const ref = nameOrRef as Record<string, unknown>;
-      if (typeof ref.script === 'string') return parseInlineWorkflowScript(ref.script);
+      if (typeof ref.script === 'string') {
+        return this.nestedChildFromResolved({ script: ref.script, workflowSource: 'inline' });
+      }
       if (typeof ref.scriptPath === 'string') {
-        throw workflowInputError('workflow({ scriptPath }) is not supported yet; v1 nesting supports built-in names and { script }.');
+        throw workflowInputError('workflow({ scriptPath }) is not supported yet; nesting supports workflow names and { script }.');
       }
     }
-    throw workflowInputError('workflow() requires a built-in workflow name or { script }.');
+    throw workflowInputError('workflow() requires a workflow name or { script }.');
+  }
+
+  // Parse + hash a resolved child source. scriptHash is taken from the exact text that is then
+  // parsed and executed (no re-read), so the permission key can never drift from the run content.
+  private nestedChildFromResolved(
+    resolved: { readonly script: string; readonly workflowSource: WorkflowSource; readonly workflowSourcePath?: string },
+  ): ResolvedNestedChild {
+    return {
+      parsed: parseInlineWorkflowScript(resolved.script),
+      script: resolved.script,
+      workflowSource: resolved.workflowSource,
+      ...(resolved.workflowSourcePath ? { workflowSourcePath: resolved.workflowSourcePath } : {}),
+      scriptHash: workflowScriptHash(resolved.script),
+    };
+  }
+
+  // Record-only permission gate for a nested child (PG-NEST v2-A). A mid-run child cannot show an
+  // interactive prompt, so a permission-required source (project/user/plugin/script_path) must already
+  // hold a matching `allow` record; otherwise it fails loud — never a silent run of unreviewed content.
+  // Mirrors the top-level allow-check (workflowPermissionRequired): the matcher does not check the
+  // decision, so the explicit allow/deny branches are load-bearing.
+  private async assertNestedChildPermitted(child: ResolvedNestedChild): Promise<void> {
+    if (!WORKFLOW_PERMISSION_REQUIRED_SOURCES.has(child.workflowSource)) return;
+    const childReview = workflowRequestedIsolationModes(child.script);
+    const permissionKey = workflowPermissionKey(child.workflowSource, child.workflowSourcePath, child.parsed.meta.name, child.scriptHash);
+    const record = await this.workflowPermissionRecord(permissionKey);
+    if (record?.decision === 'allow' && workflowPermissionRecordMatchesCurrentReview(record, childReview)) return;
+    if (record?.decision === 'deny') {
+      throw workflowPermissionDeniedError(child.parsed.meta.name, child.workflowSource, child.scriptHash);
+    }
+    throw workflowInputError(`nested workflow "${child.parsed.meta.name}" (${child.workflowSource}) is not approved; approve it by running it directly once and then re-launch this workflow (a nested call cannot prompt for approval mid-run).`);
   }
 
   // Run a nested child inline on the SHARED parent ctx (so it shares the concurrency pool,
@@ -3635,30 +3677,32 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   // intact (the call key is script-agnostic). Returns the child's result as a PARENT-realm value.
   private async runNestedWorkflow(ctx: WorkflowRunContext, nameOrRef: unknown, childArgs: unknown): Promise<unknown> {
     // Reject a concurrent second child (v1 runs nested children sequentially — see the field
-    // comment). This check + set is synchronous (before the first await below), so under
-    // parallel([() => workflow('a'), () => workflow('b')]) the second call rejects deterministically.
+    // comment). Resolution is now async (name resolution + record read), so the guard SET must happen
+    // synchronously BEFORE the first await, and the finally must cover resolution: otherwise two
+    // concurrent workflow() calls both pass the guard and clobber the single shared projector, and a
+    // caught unapproved/denied throw during resolution would wedge nestedInFlight stuck true.
     if (ctx.nestedInFlight) {
       throw workflowInputError('workflow() cannot run a nested child while another is in flight; run nested workflows sequentially.');
     }
-    const childParsed = this.resolveNestedChild(nameOrRef);
     ctx.nestedInFlight = true;
     const parentProjector = ctx.toVmValue;
-    const frame: WorkflowChildFrame = {
-      args: childArgs,
-      group: `▸ ${childParsed.meta.name}`,
-      metaSource: childParsed,
-    };
-    const childGlobals = this.createVmGlobals(ctx, frame);
-    let childResult: unknown;
     try {
-      childResult = await executeInlineWorkflow(childParsed, childGlobals, ctx.controller.signal);
+      const child = await this.resolveNestedChild(nameOrRef);
+      await this.assertNestedChildPermitted(child);
+      const frame: WorkflowChildFrame = {
+        args: childArgs,
+        group: `▸ ${child.parsed.meta.name}`,
+        metaSource: child.parsed,
+      };
+      const childGlobals = this.createVmGlobals(ctx, frame);
+      const childResult = await executeInlineWorkflow(child.parsed, childGlobals, ctx.controller.signal);
+      return parentProjector ? parentProjector(childResult) : childResult;
     } finally {
       // Restore the parent's projector so parent agents created after the child marshal into
       // the parent realm; child agents already captured the child projector at their creation.
       ctx.toVmValue = parentProjector;
       ctx.nestedInFlight = false;
     }
-    return parentProjector ? parentProjector(childResult) : childResult;
   }
 
   private async completeTask(

@@ -1018,6 +1018,101 @@ return outcomes;`,
   }
 });
 
+async function writeProjectWorkflow(root, name, script) {
+  const dir = join(root, '.codex', 'workflows');
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, `${name}.js`), script);
+}
+
+async function approveAndRunNamed(runtime, name) {
+  const req = await runtime.launch({ name });
+  assert.equal(req.status, 'permission_required', `${name} should require approval`);
+  const run = await runtime.approvePermissionRequest(req.permissionRequestId);
+  await collectEvents(runtime, run.taskId);
+}
+
+test('workflow() nests an APPROVED project workflow by name and runs it (PG-NEST v2-A full-scope)', async () => {
+  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { nestedWorkflows: 'enabled' } });
+  try {
+    await writeProjectWorkflow(root, 'child-proj', 'export const meta = { name: "child-proj" };\nreturn await agent("from project child");');
+    await approveAndRunNamed(runtime, 'child-proj'); // records the allow (and runs it once top-level)
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "parent" };\nreturn await workflow("child-proj");`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    assert.equal(runtime.get(launch.taskId).status, 'completed', runtime.get(launch.taskId).error);
+    assert.equal(jsonValue(runtime.get(launch.taskId).result), 'RAW:from project child');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow() fails loud (catchably) when nesting an UNAPPROVED or DENIED project workflow (v2-A record gate)', async () => {
+  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { nestedWorkflows: 'enabled' } });
+  try {
+    await writeProjectWorkflow(root, 'unapproved', 'export const meta = { name: "unapproved" };\nreturn 1;');
+    await writeProjectWorkflow(root, 'denied', 'export const meta = { name: "denied" };\nreturn 1;');
+    const deny = await runtime.launch({ name: 'denied' });
+    await runtime.denyPermissionRequest(deny.permissionRequestId); // records a deny
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "parent" };
+const out = [];
+try { await workflow("unapproved"); out.push("no-throw"); } catch (e) { out.push("unapproved:" + (String(e.message).includes("not approved") ? "loud" : "other")); }
+try { await workflow("denied"); out.push("no-throw"); } catch (e) { out.push("denied:" + (String(e.message).toLowerCase().includes("denied") ? "loud" : "other")); }
+return out;`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    // Both fail loud and are caught — the run still completes (C5f), no unreviewed content ran.
+    assert.deepEqual(jsonValue(runtime.get(launch.taskId).result), ['unapproved:loud', 'denied:loud']);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow() nested name resolution follows project→built-in precedence: a shadowing unapproved project fails loud, not silently running the built-in (v2-A, MAJOR-3)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({
+    backend,
+    runtimeOptions: {
+      nestedWorkflows: 'enabled',
+      builtinWorkflows: [{ name: 'shadowed', script: 'export const meta = { name: "shadowed" };\nreturn "BUILTIN";' }],
+    },
+  });
+  try {
+    // A same-named project workflow shadows the built-in and is unapproved.
+    await writeProjectWorkflow(root, 'shadowed', 'export const meta = { name: "shadowed" };\nreturn "PROJECT";');
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "parent" };
+let r; try { r = "ran:" + await workflow("shadowed"); } catch (e) { r = String(e.message).includes("not approved") ? "shadowed-fail-loud" : "other"; }
+return r;`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    // v1 would silently run the built-in; v2-A resolves the shadowing project source and gates it.
+    assert.equal(jsonValue(runtime.get(launch.taskId).result), 'shadowed-fail-loud');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workflow() still rejects the second concurrent child even though full-scope resolution is async (v2-A, BLOCKER-1)', async () => {
+  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { nestedWorkflows: 'enabled' } });
+  try {
+    await writeProjectWorkflow(root, 'seq-child', 'export const meta = { name: "seq-child" };\nreturn await agent("c");');
+    await approveAndRunNamed(runtime, 'seq-child');
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "parent" };
+const results = await parallel([() => workflow("seq-child"), () => workflow("seq-child")]);
+// parallel maps a thrown child to null; exactly one sibling must be rejected by the in-flight guard.
+return { nulls: results.filter((r) => r === null).length, ok: results.filter((r) => r !== null).length };`,
+    });
+    await collectEvents(runtime, launch.taskId);
+    // The set-before-await guard must reject one sibling even with async name resolution + record read.
+    assert.deepEqual(jsonValue(runtime.get(launch.taskId).result), { nulls: 1, ok: 1 });
+  } finally {
+    await runtime.close();
+  }
+});
+
 test('a nested child shares the parent token budget (N2, C5d)', async () => {
   // Each fake agent spends outputTokens=2. spent() reads the shared ctx.outputTokens, so the
   // child's agent must advance it — if the child had a fresh budget, s2 would equal s1.

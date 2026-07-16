@@ -7,8 +7,9 @@ folded: per-execution projector (capture-at-creation + restore), args-by-frame-p
 `▸ name › phase` composed grouping, built-in/inline scope (deletes the security/isolation
 findings), inert `budget.nestedWorkflows` field dropped. Date: 2026-07-15.
 Branch `parity/workflow-nested` @ base `938f461` (v0.4.5). Parity item PG-NEST from
-`memory:parity-gap-map-2026-07`. Full-scope expansion (project/user/plugin/{scriptPath}
-behind the permission gate) is BACKLOG. Built-in workflows do not use worktree isolation,
+`memory:parity-gap-map-2026-07`. Full-scope expansion for **project/user/plugin names** SHIPPED in
+v2-A (`docs/ultracode-p11-nested-full-scope.md`); `{scriptPath}` nesting stays deferred there.
+Built-in workflows do not use worktree isolation,
 so the isolation-review gap does not bite v1; an inline child requesting worktree fails
 closed (documented v1 limit).
 
