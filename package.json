@@ -65,11 +65,15 @@
     "test:all": "npm test && npm run test:e2e:ultracode-for-codex",
     "test": "npm run build && npm run verify:runtime-boundary && node --test --test-concurrency=2 test/*.test.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint src",
     "run": "npm run build && node dist/cli.js run --accept-llm-guide=v1"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.0.0",
-    "typescript": "^5.9.3"
+    "eslint": "^10.7.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.64.0"
   },
   "engines": {
     "node": ">=22.0.0"
