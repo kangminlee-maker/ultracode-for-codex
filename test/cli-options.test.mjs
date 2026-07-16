@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
 import { codexSkillState, parseOptions, parseBudget } from '../dist/cli.js';
+import { parseAgentMcpServerList, isAgentMcpServerName } from '../dist/runtime/types.js';
 
 const tempDirs = [];
 
@@ -104,6 +105,8 @@ test('CLI parser supports run options', () => {
     'enabled',
     '--agent-file-write',
     'enabled',
+    '--agent-mcp',
+    'onto,openaiDeveloperDocs',
   ]);
 
   assert.equal(options.acceptLlmGuide, 'v1');
@@ -122,5 +125,20 @@ test('CLI parser supports run options', () => {
   assert.equal(options.resumeFromRunId, 'run_12345678-1234-4234-9234-123456789abc');
   assert.equal(options.agentWebSearch, 'enabled');
   assert.equal(options.agentFileWrite, 'enabled');
+  assert.equal(options.agentMcp, 'onto,openaiDeveloperDocs');
   assert.deepEqual(options._, []);
+});
+
+test('parseAgentMcpServerList trims, de-dupes, drops empties, and rejects hostile names', () => {
+  // Trim + de-dupe + preserve first-seen order; a trailing comma / blank entry is off, not an error.
+  assert.deepEqual(parseAgentMcpServerList(' onto , day1-mcp ,onto,'), ['onto', 'day1-mcp']);
+  assert.deepEqual(parseAgentMcpServerList(''), []);
+  assert.deepEqual(parseAgentMcpServerList('   '), []);
+  // Bare Codex MCP server names allow letters/digits/'.'/'_'/'-'.
+  assert.equal(isAgentMcpServerName('openaiDeveloperDocs'), true);
+  assert.equal(isAgentMcpServerName('day1-mcp'), true);
+  // Hostile characters (shell/TOML-injection surface) are rejected loud.
+  for (const bad of ['a b', 'a;rm', 'a/b', 'a"b', 'a\nb', '[x]']) {
+    assert.throws(() => parseAgentMcpServerList(`ok,${bad}`), /invalid/);
+  }
 });

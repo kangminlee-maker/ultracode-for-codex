@@ -20,6 +20,7 @@ import {
   workflowDefaultNestedWorkflows,
   workflowDefaultAgentWebSearch,
   workflowDefaultAgentFileWrite,
+  workflowDefaultAgentMcpServers,
 } from '../dist/settings.js';
 import { defaultWorkflowStateDir } from '../dist/runtime/state-root.js';
 
@@ -37,6 +38,7 @@ test('settings.json provides Codex workflow runtime defaults', () => {
       nestedWorkflows: 'disabled',
       agentWebSearch: 'disabled',
       agentFileWrite: 'disabled',
+      agentMcp: [],
       background: {
         runDir: '{stateRoot}/background/{jobId}',
         resultFile: 'result.json',
@@ -69,6 +71,7 @@ test('settings.json provides Codex workflow runtime defaults', () => {
   assert.equal(workflowDefaultNestedWorkflows(), 'disabled');
   assert.equal(workflowDefaultAgentWebSearch(), 'disabled');
   assert.equal(workflowDefaultAgentFileWrite(), 'disabled');
+  assert.deepEqual(workflowDefaultAgentMcpServers(), []);
   assert.match(
     defaultWorkflowStateDir('/tmp/example-workspace'),
     /\/\.ultracode-for-codex\/workspaces\/example-workspace-[0-9a-f]{16}$/,

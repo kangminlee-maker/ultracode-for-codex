@@ -387,6 +387,50 @@ test('write_file rejects path escapes including a final-component symlink (desig
   }
 });
 
+test('MCP tool-call elicitation is accepted only for an allowlisted server + mcp_tool_call kind (W3)', async () => {
+  // Source home must declare the allowlisted server so provisioning succeeds (else fail-loud).
+  const home = await mkdtemp(join(tmpdir(), 'codex-subagent-home-mcp-'));
+  tempDirs.push(home);
+  await writeFile(join(home, 'auth.json'), '{"token":"t"}\n');
+  await writeFile(join(home, 'config.toml'), 'model = "gpt-test-model"\n\n[mcp_servers.onto]\ncommand = "/bin/echo"\nargs = ["mcp"]\n');
+  process.env.CODEX_HOME = home;
+
+  const action = async (mcpServers, serverName, kind) => {
+    const backend = new CodexSubagentBackend({ command: fakeCodex, cwd: process.cwd(), timeoutMs: 30_000, mcpServers });
+    try {
+      const r = await backend.generate(textRequest({ prompt: elicitPrompt({ serverName, kind }) }));
+      return r.text;
+    } finally {
+      await backend.close();
+    }
+  };
+
+  // Allowlisted server + the mcp_tool_call approval kind → accept.
+  assert.equal(await action(['onto'], 'onto', 'mcp_tool_call'), 'ELICIT_ACTION:accept');
+  // A server not in the allowlist → decline (even though the kind is right).
+  assert.equal(await action(['onto'], 'other', 'mcp_tool_call'), 'ELICIT_ACTION:decline');
+  // Allowlisted server but a NON-approval elicitation kind (data-collection form) → decline (F1).
+  assert.equal(await action(['onto'], 'onto', 'form'), 'ELICIT_ACTION:decline');
+  // Default-off (empty allowlist) → always decline, byte-identical to pre-MCP behavior.
+  assert.equal(await action([], 'onto', 'mcp_tool_call'), 'ELICIT_ACTION:decline');
+});
+
+test('write_file refuses a Windows-style .git path (folded P8-P2 denylist fix)', async () => {
+  // On POSIX `.git\config` is one filename, so this exercises the backslash split directly: the fix
+  // splits isGitInternalPath on BOTH separators, so a `.git\config` relative path is refused.
+  process.env.CODEX_HOME = await createCodexHome();
+  const worktreePath = await mkdtemp(join(tmpdir(), 'codex-subagent-worktree-'));
+  tempDirs.push(worktreePath);
+  const backend = new CodexSubagentBackend({ command: fakeCodex, cwd: process.cwd(), timeoutMs: 30_000, fileWrite: true });
+  try {
+    const res = await backend.generate({ ...textRequest({ prompt: writeToolPrompt({ path: '.git\\config', content: 'x' }) }), worktreePath });
+    assert.match(res.text, /refusing to write git metadata path/);
+    await assert.rejects(() => readFile(join(worktreePath, '.git\\config'), 'utf8'));
+  } finally {
+    await backend.close();
+  }
+});
+
 test('CodexSubagentBackend runs worktree-isolated turns in the requested workspace', async () => {
   process.env.CODEX_HOME = await createCodexHome();
   const worktreePath = await mkdtemp(join(tmpdir(), 'codex-subagent-worktree-'));
@@ -493,6 +537,10 @@ function writeToolPrompt(args) {
 
 function strReplaceToolPrompt(args) {
   return `STR_REPLACE_TOOL_B64 ${Buffer.from(JSON.stringify(args)).toString('base64')}`;
+}
+
+function elicitPrompt(args) {
+  return `MCP_ELICIT_B64 ${Buffer.from(JSON.stringify(args)).toString('base64')}`;
 }
 
 async function createCodexHome() {

@@ -7,7 +7,37 @@ import {
   codexContextIsolationArgs,
   createCodexIsolation,
   minimalCodexConfigToml,
+  sliceMcpServerSections,
 } from '../dist/codex/subagent-backend.js';
+
+// A hand-written multi-server config.toml fixture (NOT the user's real config) — includes a prefix
+// trap (`ontology_docs` must not match `onto`), a subtable server (`node_repl.env`), a hyphenated
+// name, and a non-mcp section to prove sections outside the allowlist are never sliced.
+const MCP_FIXTURE_TOML = [
+  'model = "gpt-fixture"',
+  '',
+  '[mcp_servers.onto]',
+  'command = "/opt/homebrew/bin/onto"',
+  'args = ["mcp"]',
+  '',
+  '[mcp_servers.ontology_docs]',
+  'command = "/opt/od"',
+  '',
+  '[mcp_servers.node_repl]',
+  'command = "/n/node_repl"',
+  'startup_timeout_sec = 120',
+  '',
+  '[mcp_servers.node_repl.env]',
+  'CODEX_HOME = "/home/x/.codex"',
+  '',
+  '[mcp_servers.day1-mcp]',
+  'command = "/d/day1-mcp"',
+  'cwd = "/home/x"',
+  '',
+  '[other]',
+  'z = 1',
+  '',
+].join('\n');
 
 const originalCodexHome = process.env.CODEX_HOME;
 const tempDirs = [];
@@ -111,4 +141,63 @@ test('agent-web-search gate flips web_search across every isolation config site'
   const isolation = await createCodexIsolation({ reasoningEffort: 'low', verbosity: 'low', webSearch: true });
   tempDirs.push(isolation.rootDir);
   assert.match(await readFile(join(isolation.homeDir, 'config.toml'), 'utf8'), /web_search = "live"/);
+});
+
+test('sliceMcpServerSections extracts allowlisted servers verbatim and segment-exact (W1)', () => {
+  // Single server → exactly its block, nothing else.
+  let r = sliceMcpServerSections(MCP_FIXTURE_TOML, ['onto']);
+  assert.deepEqual([...r.found], ['onto']);
+  assert.match(r.block, /\[mcp_servers\.onto\]/);
+  assert.match(r.block, /command = "\/opt\/homebrew\/bin\/onto"/);
+  assert.doesNotMatch(r.block, /\[other\]/);
+  // Prefix-negative (design-verify F2): `onto` must NOT slice `ontology_docs`.
+  assert.doesNotMatch(r.block, /ontology_docs/);
+
+  // Multi-subtable server carries its `.env` subtable.
+  r = sliceMcpServerSections(MCP_FIXTURE_TOML, ['node_repl']);
+  assert.match(r.block, /\[mcp_servers\.node_repl\]/);
+  assert.match(r.block, /\[mcp_servers\.node_repl\.env\]/);
+  assert.match(r.block, /CODEX_HOME = "\/home\/x\/\.codex"/);
+
+  // Hyphenated bare name + multiple names.
+  r = sliceMcpServerSections(MCP_FIXTURE_TOML, ['onto', 'day1-mcp']);
+  assert.deepEqual([...r.found].sort(), ['day1-mcp', 'onto']);
+  assert.match(r.block, /\[mcp_servers\.day1-mcp\]/);
+
+  // A name with no matching table header is reported missing (empty block, empty found).
+  r = sliceMcpServerSections(MCP_FIXTURE_TOML, ['ghost']);
+  assert.equal(r.found.size, 0);
+  assert.equal(r.block, '');
+});
+
+test('MCP allowlist provisions verbatim sections; default-off is byte-identical; unknown fails loud (W2)', async () => {
+  const sourceHome = await mkdtemp(join(tmpdir(), 'codex-source-home-mcp-'));
+  tempDirs.push(sourceHome);
+  process.env.CODEX_HOME = sourceHome;
+  await writeFile(join(sourceHome, 'auth.json'), '{"token":"secret"}\n');
+  await writeFile(join(sourceHome, 'config.toml'), MCP_FIXTURE_TOML);
+
+  // Enabled: the allowlisted section appears verbatim in the isolated config.
+  const on = await createCodexIsolation({ reasoningEffort: 'low', verbosity: 'low', mcpServers: ['onto'] });
+  tempDirs.push(on.rootDir);
+  const onConfig = await readFile(join(on.homeDir, 'config.toml'), 'utf8');
+  assert.match(onConfig, /\[mcp_servers\.onto\]/);
+  assert.match(onConfig, /command = "\/opt\/homebrew\/bin\/onto"/);
+  assert.doesNotMatch(onConfig, /ontology_docs/);
+
+  // Default-off byte-identical: empty list and omitted both produce a config with no [mcp_servers.
+  const emptyList = await createCodexIsolation({ reasoningEffort: 'low', verbosity: 'low', mcpServers: [] });
+  tempDirs.push(emptyList.rootDir);
+  const omitted = await createCodexIsolation({ reasoningEffort: 'low', verbosity: 'low' });
+  tempDirs.push(omitted.rootDir);
+  const emptyConfig = await readFile(join(emptyList.homeDir, 'config.toml'), 'utf8');
+  const omittedConfig = await readFile(join(omitted.homeDir, 'config.toml'), 'utf8');
+  assert.doesNotMatch(emptyConfig, /\[mcp_servers/);
+  assert.equal(emptyConfig, omittedConfig);
+
+  // An allowlisted name with no section fails loud at isolation setup (never a silent no-op).
+  await assert.rejects(
+    () => createCodexIsolation({ reasoningEffort: 'low', verbosity: 'low', mcpServers: ['ghost'] }),
+    /Unknown MCP server/,
+  );
 });
