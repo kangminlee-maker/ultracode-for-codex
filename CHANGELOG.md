@@ -10,6 +10,17 @@ the project uses [semantic versioning](https://semver.org/).
 
 ### Added
 
+- **Concurrent nested `workflow()` children** (PG-NEST v2-B): nested children may now run in parallel
+  (e.g. `parallel([() => workflow("a"), () => workflow("b")])`), lifting the sequential-only limit. The
+  VM value projector — previously a single shared `ctx` slot captured per-promise, which forced
+  sequential nesting to avoid concurrent children clobbering each other's realm — is now
+  **per-execution**: each execution (the top-level run and every nested child) owns its own projector
+  scope, so concurrent children marshal into their own realms without interference. A child's return
+  value is projected into the parent realm on success while errors propagate raw (no double-projection).
+  Still one-level, still behind the default-off `--nested-workflows` gate (byte-identical when off);
+  resume of concurrent-nested runs is best-effort for unkeyed agents (use `key()` for deterministic
+  resume). See `docs/ultracode-p12-concurrent-nesting.md`.
+
 - Nested `workflow()` **full-scope name sources** (PG-NEST v2-A): a nested `workflow(name)` now
   resolves a **project / user / plugin** workflow (same project→user→plugin→built-in precedence as a
   top-level launch), not just a built-in. A nested child from a permission-required source is gated by
