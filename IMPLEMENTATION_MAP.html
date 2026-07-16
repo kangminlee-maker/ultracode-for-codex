@@ -158,10 +158,10 @@
     <p>Current state of the durable Codex workflow runtime, model capability boundary, and hybrid skill route.</p>
 
     <section class="grid" aria-label="Current status">
-      <div class="tile"><strong>Current goal</strong><span>Release 0.4.5 with live Codex model capabilities authoritative and gpt-5.6-sol medium/high/max available without unjournaled native descendants</span></div>
-      <div class="tile"><strong>Runtime health</strong><span>Model/effort boundary and Sol profiles implemented; full test suite, packaged E2E, no-token prompt inspection, and live Sol medium/high N=1 paths green</span></div>
-      <div class="tile"><strong>Main risk</strong><span>Live N=1 proves dispatch, file read, schema submission, and POSIX clean shutdown—not comparative quality on representative repository tasks; Windows terminates only the direct child</span></div>
-      <div class="tile"><strong>Recent decision</strong><span>Dispatch-core parity landed (2026-07-15): opt-in agent concurrency pool, backend failure taxonomy (terminal/transient/rate_limited), and a per-run output-token spend ceiling (<code>--budget</code>). The spend ceiling's resume-deterministic ambition was reviewed by two lenses and dropped as unachievable by a scalar counter &mdash; it is per-run, off by default.</span></div>
+      <div class="tile"><strong>Current goal</strong><span><strong>Released 0.6.0</strong> (npm <code>latest</code>). The native-Workflow parity roadmap is <strong>complete</strong>: contract-correct <code>pipeline()</code>/<code>parallel()</code>, nested <code>workflow()</code> (full-scope names + concurrent), edit-and-iterate resume, and an opt-in <strong>capability stream</strong> giving subagents web search, worktree file writes, MCP servers, and native per-agent types. No parity work is queued.</span></div>
+      <div class="tile"><strong>Runtime health</strong><span>159/159 unit + installed E2E green; typecheck + runtime-boundary + publish dry-run pass. Every capability is <strong>default-off and byte-identical when unused</strong>. Each landed via design-doc &rarr; adversarial design-verify &rarr; falsifiability &rarr; dogfood/bot gate.</span></div>
+      <div class="tile"><strong>Main risk</strong><span>The capability stream widened the worker's <strong>authority surface</strong>: web/MCP are egress channels, file-write runs unsandboxed with a path guard as sole containment, and nested full-scope exec is gated only by the permission record. All are opt-in/default-off; that gate is the mitigation. Windows terminates only the direct child.</span></div>
+      <div class="tile"><strong>Recent decision</strong><span>Concurrent nested <code>workflow()</code> (2026-07-16): the VM value projector moved from a shared <code>ctx</code> slot to a <strong>per-execution scope</strong>, so concurrent children marshal into their own realms and the sequential guard is removed. Child return projected on success; errors propagate raw (no double-projection).</span></div>
     </section>
 
     <h2>Service Blueprint</h2>
@@ -205,16 +205,16 @@
         <rect x="260" y="230" width="210" height="136" rx="8" fill="var(--runtime)" stroke="var(--runtime-stroke)"></rect>
         <text class="node-title" x="278" y="258">Runtime gates</text>
         <text class="node-line" x="278" y="282">model/list capability</text>
-        <text class="node-line" x="278" y="302">schema + permission</text>
-        <text class="node-line" x="278" y="322">native thread cap = 1</text>
-        <text class="node-line" x="278" y="342">retry/cancel authority</text>
+        <text class="node-line" x="278" y="302">schema, permission, budget</text>
+        <text class="node-line" x="278" y="322">concurrency pool + cap=1</text>
+        <text class="node-line" x="278" y="342">capability gates (opt-in)</text>
 
         <rect x="520" y="230" width="190" height="116" rx="8" fill="#fef3c7" stroke="#d97706"></rect>
         <text class="node-title" x="538" y="258">Bounded Codex work</text>
-        <text class="node-line" x="538" y="282">medium planning/scans</text>
-        <text class="node-line" x="538" y="302">high verification</text>
-        <text class="node-line" x="538" y="322">structured submit</text>
-        <text class="node-line" x="538" y="342">read-only by default</text>
+        <text class="node-line" x="538" y="282">plan/scan + verify</text>
+        <text class="node-line" x="538" y="302">structured submit</text>
+        <text class="node-line" x="538" y="322">read-only default</text>
+        <text class="node-line" x="538" y="342">opt-in: web/file/MCP/type</text>
 
         <rect x="760" y="64" width="160" height="116" rx="8" fill="var(--artifact)" stroke="var(--artifact-stroke)"></rect>
         <text class="node-title" x="778" y="92">Journal</text>
@@ -255,49 +255,53 @@
       <tr><td>Runtime</td><td><code>src/runtime/workflow-runtime.ts</code> owns parsing, validation, scheduling, permission, retry, cancel, resume, and progress. An agent without explicit effort inherits the run-level effort. Built-in <code>task</code> is read-only analysis: its planner is <code>medium</code> and workers inherit the run tier. <code>code-review</code> level <code>high</code> is medium/high; the default deep profile is high/xhigh. <code>max</code> is accepted, while <code>ultra</code> is structurally rejected.</td></tr>
       <tr><td>Journal</td><td><code>src/runtime/workflow-journal.ts</code> owns durable hash-chained workflow truth.</td></tr>
       <tr><td>Model catalog</td><td><code>src/codex/model-catalog.ts</code> parses paginated app-server catalog responses, selects explicit/inherited/default models, exposes only runtime-safe efforts, and fails unsupported model/effort combinations before a turn.</td></tr>
-      <tr><td>Subagent backend</td><td><code>src/codex/subagent-backend.ts</code> has no hard-coded model fallback. It prepares the live catalog before the runtime journals an agent-capable run, strips provider credentials, serves bounded workspace tools, and caps Codex multi-agent V2 at one total thread so workers cannot create unjournaled descendants. Workers are read-only unless a permission-reviewed custom script requests worktree isolation. On POSIX, app-server shutdown terminates only the backend-owned process group, including shell wrappers; Windows currently terminates the direct child.</td></tr>
+      <tr><td>Subagent backend</td><td><code>src/codex/subagent-backend.ts</code> has no hard-coded model fallback. It prepares the live catalog before the runtime journals an agent-capable run, strips provider credentials, serves bounded workspace tools, and caps Codex multi-agent V2 at one total thread so workers cannot create unjournaled descendants. Workers are read-only by default; the capability gates below add tools per run inside the same turn (accounting/journal intact). It provisions an isolated Codex home per run (web_search config, allowlisted <code>[mcp_servers.*]</code> slices, per-agent persona via <code>thread/start.developerInstructions</code>). On POSIX, shutdown terminates only the backend-owned process group; Windows terminates the direct child.</td></tr>
+      <tr><td>Orchestration primitives</td><td><code>agent()</code>, <code>parallel()</code>/<code>pipeline()</code> (native-contract: stage gets <code>(prev, item, index)</code>, 4096-item cap), and nested <code>workflow()</code>. A per-run concurrency pool bounds dispatch (<code>--agent-concurrency</code>); a per-run output-token ceiling self-paces (<code>--budget</code>). All spend is one hash-chained journal; resume replays the unchanged prefix.</td></tr>
+      <tr><td>Capability gates (opt-in, default-off)</td><td>Per-run flags that widen the worker's tool surface inside the Codex turn: <code>--agent-web-search</code> (native web_search), <code>--agent-file-write</code> (worktree-confined <code>write_file</code>/<code>str_replace</code>; the runtime path guard is the sole containment), <code>--agent-mcp &lt;s1,s2&gt;</code> (named-allowlist MCP servers sliced verbatim from <code>~/.codex/config.toml</code> + auto-approved), and <code>--agent-types</code> (per-agent model + effort + persona from <code>~/.codex/agents/*.toml</code>). Off (the default) is byte-identical; agentType is per-agent and enters the call key (resume auto-restores it).</td></tr>
+      <tr><td>Nested <code>workflow()</code></td><td>A child runs on the parent <code>ctx</code> (shared pool/budget/abort/journal chain); it emits only <code>agent.*</code>, keeping the journal single-run. Gated by <code>--nested-workflows</code>. Full-scope names (project/user/plugin) are permission-record-gated (mid-run can't prompt &rarr; fail-loud if unapproved). The value projector is per-execution, so children may run <strong>concurrently</strong>. One-level only; <code>{scriptPath}</code> deferred.</td></tr>
       <tr><td>Package</td><td>Package contents are the CLI runtime, install guide, both Codex skill command folders, docs, and public type exports. CLI <code>--version</code> and Codex <code>clientInfo.version</code> read package metadata, so packaging and npm version bumps update runtime surfaces together.</td></tr>
     </table>
 
     <h2>Current Decisions And Risks</h2>
     <table>
       <tr><th>Decision or risk</th><th>Current state</th></tr>
-      <tr><td>Native versus durable orchestration</td><td>Native Ultra is the lightweight route; Ultracode is selected when schema, journal, cache, background, or reproducibility guarantees matter.</td></tr>
-      <tr><td>Effort boundary</td><td>Packaged default is <code>medium</code> (lowered from <code>xhigh</code> 2026-07-14 after the review-quality A/B); <code>medium</code>/<code>high</code> are the balanced Sol path; <code>max</code> stays single-agent; <code>ultra</code> cannot enter a workflow agent request.</td></tr>
-      <tr><td>Implementation ownership</td><td>The built-in task analyzes but does not edit. Main-context edits are canonical; custom worktree writes remain isolated and require explicit integration.</td></tr>
-      <tr><td>Residual quality risk</td><td>Closed for review workloads: the two-arm live effort A/B (2026-07-14) shows review quality saturates at <code>medium</code> (100% detection, 0 FP, judge quality 3/3 across medium/high/xhigh) on both single-module and hard cross-file tasks; only latency scales with effort. See <code>docs/20260714-effort-quality-ab.md</code>.</td></tr>
+      <tr><td>Capability stream = worker authority</td><td>The in-turn tool classes (web/file-write/MCP/agent-types) keep provider-reported turn accounting intact, so they were the safe subset to add; fan-out escapes (shell, multi-agent delegation) stay off. Each capability is <strong>opt-in, default-off, byte-identical when unused</strong> &mdash; that gate is the mitigation for the widened egress/exfil and unsandboxed-write surface. <code>ultra</code> effort stays structurally rejected (it would escape journal/cache/cost accounting), enforced even for agentType-supplied effort.</td></tr>
+      <tr><td>Nested-child authority</td><td>A mid-run nested <code>workflow()</code> cannot show a permission prompt, so a permission-required child (project/user/plugin) runs only against an existing <code>allow</code> record &mdash; else fail-loud. A child can never exceed the parent's approved isolation review (no silent widening). <code>{scriptPath}</code> nesting deferred for lack of a clean gate.</td></tr>
+      <tr><td>Realm marshaling under concurrency</td><td>Concurrent nested children each own a per-execution projector scope; the child return projects on success while errors propagate raw (double-projecting an error strips it to <code>[object Object]</code>). The hash chain is safe &mdash; the call-key critical section is synchronous, the same concurrency top-level <code>parallel()</code> already had.</td></tr>
+      <tr><td>Effort boundary</td><td>Packaged default is <code>medium</code> (lowered from <code>xhigh</code> after the 2026-07-14 review-quality A/B; quality saturates at <code>medium</code>, only latency scales). <code>max</code> stays single-agent; <code>ultra</code> cannot enter a workflow agent request.</td></tr>
+      <tr><td>Verification method</td><td>Every capability/parity PR ran design-doc &rarr; GATE-0 real-path probe &rarr; adversarial design-verify (findings re-verified vs code) &rarr; default-off impl &rarr; falsifiability &rarr; dogfood/bot gate. Residual: no independent human review to date (self-merged after CI + design-verify); the async PR bot is inconsistent; the built-in code-review dogfood is blocked by a pre-existing Scope-phase gap.</td></tr>
     </table>
 
     <h2>Current Roadmap</h2>
+    <p class="note">The native-Workflow parity roadmap is <strong>complete</strong> and shipped in 0.6.0. No parity work is queued; what remains is optional polish.</p>
     <table>
-      <tr><th>Gate</th><th>Done when</th></tr>
-      <tr><td>Capability gate</td><td>Setup and run agree on selected model and effort; unsupported combinations fail before a turn.</td></tr>
-      <tr><td>Isolation gate</td><td>No-token prompt inspection proves the worker receives one total native thread slot.</td></tr>
-      <tr><td>Release gate</td><td>Typecheck, runtime-boundary check, full tests, installed package E2E, HTML render, and live Sol medium/high probes pass.</td></tr>
-      <tr><td>Dispatch gate</td><td>Shipped, opt-in. A per-run permit pool bounds concurrent agent dispatches however launched (bare, <code>parallel()</code>, nested); the permit is held for the real dispatch's full lifetime so an aborted/stalled retry cannot over-subscribe. Default <code>agentConcurrency: unbounded</code> is byte-identical to before; <code>auto</code> (<code>min(16, cores-2)</code>) or a positive integer enables it. Default-on flip deferred on the pool+stall-retry latency tension (O-6). See <code>docs/ultracode-p3d-dispatch-core.md</code>.</td></tr>
-      <tr><td>Spend gate</td><td>Shipped, off by default. <code>--budget &lt;+Nk|N&gt;</code> sets a per-run output-token ceiling; non-enumerable <code>budget.total</code>/<code>spent()</code>/<code>remaining()</code> let a script self-pace, and <code>runAgentInner</code> refuses to dispatch once <code>spent() &gt;= total</code> (non-retryable <code>workflow_input_invalid</code>). Per-run, best-effort by design — counts successful-agent output only and a resumed run counts from zero. The resume-deterministic variant was reviewed and dropped as unachievable by a scalar counter. See <code>docs/ultracode-p3e-spend-ceiling.md</code>.</td></tr>
+      <tr><th>Item</th><th>State</th></tr>
+      <tr><td>Contract correctness (PG-PIPE/GUARD)</td><td>Shipped. <code>pipeline()</code> passes <code>(prev, item, index)</code>; a stage returning nullish flows on (only a throw drops the item); <code>parallel()</code>/<code>pipeline()</code> reject &gt;4096 items. <code>docs/ultracode-p3f-*</code>.</td></tr>
+      <tr><td>Nested <code>workflow()</code> (PG-NEST)</td><td>Shipped in full: v1 built-in/inline, v2-A full-scope project/user/plugin names (record-gated), v2-B concurrent (per-execution projector). Default-off <code>--nested-workflows</code>. <code>docs/ultracode-p5</code>, <code>p11</code>, <code>p12</code>.</td></tr>
+      <tr><td>Edit-and-iterate (PG-ITER)</td><td>Shipped. The persisted <code>scriptPath</code> is surfaced; <code>--resume-from-run-id</code> with a selector resumes an edited script (unchanged prefix cached). <code>docs/ultracode-p6-*</code>.</td></tr>
+      <tr><td>Capability stream</td><td>Shipped (all opt-in, default-off): web search (<code>p7</code>), worktree file writes (<code>p8</code>), MCP servers (<code>p9</code>), per-agent types (<code>p10</code>). Each real-path GATE-0 probed against live Codex.</td></tr>
+      <tr><td>Dispatch / spend (earlier)</td><td>Shipped, opt-in: per-run concurrency pool (<code>--agent-concurrency</code>) and output-token ceiling (<code>--budget</code>); failure taxonomy (terminal/transient/rate_limited); worktree retention. <code>docs/ultracode-p3d/p3e</code>.</td></tr>
+      <tr><td>Optional polish (open)</td><td>ESLint tooling (no linter today, tsc only); PG-NEST follow-ons are done; agent() null-on-terminal vs fail-loud is an owner-judgment flag; concurrency default stays <code>unbounded</code> by decision.</td></tr>
     </table>
 
     <h2>Change Impact</h2>
     <table>
       <tr><th>Surface</th><th>User-visible effect</th></tr>
-      <tr><td>Setup</td><td>Reports catalog-selected model and supported Ultracode efforts.</td></tr>
-      <tr><td>Run</td><td><code>--model gpt-5.6-sol --reasoning-effort medium|high|max</code> is validated and inherited by agents without overrides.</td></tr>
-      <tr><td>Built-ins</td><td>Task execution claims are read-only and evidence-bound; high-level review avoids xhigh by using a medium/high funnel.</td></tr>
-      <tr><td>Recovery</td><td>The effective catalog model is journaled, strengthening resume cache identity and mismatch disclosure.</td></tr>
-      <tr><td>Isolation</td><td>A completed <code>isolation: "worktree"</code> agent's worktree is reclaimed when it holds no real changes; <code>git worktree remove</code> itself decides, so ignored-only build output is reclaimed while real changes are refused and preserved. Changed, stalled, and aborted worktrees are always preserved for review. <code>workflow.worktreeRetention: preserve-all</code> opts out.</td></tr>
-      <tr><td>Retry</td><td><code>recovery.retryable</code> is derived from the failure reason instead of always <code>true</code>, so a deterministic failure is no longer retried to <code>--retry-limit</code>. Backend failures carry a canonical retryable <code>workflow_agent_failed</code> reason.</td></tr>
+      <tr><td>New run flags</td><td><code>--agent-web-search</code>, <code>--agent-file-write</code>, <code>--agent-mcp &lt;s1,s2&gt;</code>, <code>--agent-types</code>, <code>--nested-workflows</code>, <code>--agent-concurrency</code>, <code>--budget</code> &mdash; all opt-in; omitting them is byte-identical to before.</td></tr>
+      <tr><td>Scripts</td><td><code>agent(prompt, {agentType})</code> resolves a named type; <code>workflow(name|{script})</code> nests, now full-scope + concurrent; <code>pipeline()</code> stages receive <code>(prev, item, index)</code>.</td></tr>
+      <tr><td>Resume</td><td>A typed run auto-restores <code>--agent-types</code> from the journal (the type name is in the call key). An edited inline script resumes via a surfaced <code>scriptPath</code> + <code>--resume-from-run-id</code>, caching the unchanged prefix.</td></tr>
+      <tr><td>Isolation</td><td>A completed <code>isolation: "worktree"</code> agent's worktree is reclaimed when it holds no real changes (<code>git worktree remove</code> decides); changed/stalled/aborted worktrees are preserved. <code>workflow.worktreeRetention: preserve-all</code> opts out.</td></tr>
+      <tr><td>Recovery</td><td><code>recovery.retryable</code> is derived from the failure reason (deterministic failures are not retried to <code>--retry-limit</code>); the effective catalog model is journaled, strengthening resume identity.</td></tr>
     </table>
 
     <h2>Verification</h2>
     <table>
       <tr><th>Check</th><th>Status</th></tr>
-      <tr><td><code>npm test</code></td><td>Pass: build, runtime boundary verification, and the full unit/integration suite.</td></tr>
-      <tr><td><code>npm run test:e2e:ultracode-for-codex</code></td><td>Pass: packaged tarball installed into an isolated consumer and exercised through the fake app-server boundary.</td></tr>
-      <tr><td><code>npm run publish:dry-run</code></td><td>Pass: 0.4.5 ran the complete prepublish test/E2E/prepack chain and produced the public npm publish projection without publishing.</td></tr>
-      <tr><td><code>codex debug prompt-input</code></td><td>Pass: medium/high both receive the no-native-delegation hint and one total concurrency slot.</td></tr>
-      <tr><td>Live Sol N=1</td><td>Pass: medium and high each read <code>package.json</code> and submitted the required schema; high also confirmed clean POSIX process-group shutdown after the lifecycle fix.</td></tr>
-      <tr><td>Comparative quality A/B</td><td>Done (2026-07-14): 2 live arms (shallow N=15/cell, depth N=6/cell) on <code>gpt-5.6-sol</code>. Review/analysis scope only (<code>task</code>). Quality tier-independent (medium=high=xhigh: ~96&ndash;100% detection, 0 FP, quality 3/3); xhigh 1.7&times; (shallow) / 2.4&times; (depth) medium latency and times out under an 8-min deadline on hard tasks. Supports lowering the review-path effort; global default left at <code>xhigh</code> (code-gen batch/custom agents unmeasured). <code>docs/20260714-effort-quality-ab.md</code>.</td></tr>
+      <tr><td><code>npm run test:all</code></td><td>Pass: build, runtime-boundary verification, 159/159 unit, and the installed-package E2E (fake app-server). CI runs it on node 22 + 24 for every PR.</td></tr>
+      <tr><td><code>npm publish</code> (0.6.0)</td><td>Published: npm <code>latest</code> = 0.6.0, tag <code>v0.6.0</code>. <code>prepublishOnly</code> re-ran <code>test:all</code>; dry-run projected the tarball (52 files, 159 kB) before publish.</td></tr>
+      <tr><td>Real-path capability probes (GATE-0)</td><td>Pass: each capability was proven against live Codex in the isolated posture before coding &mdash; web grounding on/off, contained worktree writes, MCP tool grounding, and a distinct per-agent persona visibly steering output.</td></tr>
+      <tr><td>Falsifiability</td><td>Pass: each load-bearing mechanism was broken to confirm a guarding test fails, then restored (agentType-in-call-key, the <code>ultra</code> ban, the nested permission gate, the in-flight ordering, the concurrent projector, the error-projection re-homing).</td></tr>
+      <tr><td>Adversarial design-verify</td><td>Pass: an independent lens reviewed each design doc before coding; findings (e.g. resume auto-restore, <code>{scriptPath}</code> gate-skip, the child-error double-projection) were re-verified against code and folded.</td></tr>
     </table>
   </main>
 </body>
