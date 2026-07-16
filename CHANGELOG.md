@@ -10,6 +10,25 @@ the project uses [semantic versioning](https://semver.org/).
 
 ### Added
 
+- `workflow.agentMcp` (`--agent-mcp <server1,server2,...>`): opt-in support for workflow
+  subagents to call the user's own **Codex MCP servers**, scoped to a **named allowlist**.
+  Empty (the default) provisions no MCP servers into the isolated Codex home and declines
+  every MCP tool-call approval, so existing behavior is byte-identical. When one or more
+  server names are given, exactly those `[mcp_servers.NAME]` sections are copied **verbatim**
+  from your `~/.codex/config.toml` into the isolated home, and their tool-call approvals are
+  auto-accepted (a headless run has no human to prompt; the allowlist is the decision). The
+  match is **segment-exact** — `--agent-mcp onto` never provisions `ontology-docs`. An
+  allowlisted name with no `[mcp_servers.NAME]` table header fails loud at start (never a
+  silent no-op). This is the **largest authority expansion** in the capability stream: a named
+  stdio server runs as a local **unsandboxed** subprocess (its full capability), and a named
+  streamable-http server reaches its external endpoint (an egress/exfiltration surface like
+  `--agent-web-search`) — so name only trusted, read-mostly servers for untrusted-input runs.
+  **Run-level** (applies to every agent) and, like `--budget`/`--nested-workflows`, **not
+  inherited on resume** — re-pass it. A disabled (`enabled = false`) server stays disabled even
+  when allowlisted; a broken/slow allowlisted server degrades to "its tools are absent," never a
+  hung run; a re-executed agent that calls a side-effecting server repeats the external effect.
+  See `docs/ultracode-p9-agent-mcp.md`.
+
 - `workflow.agentFileWrite` (`--agent-file-write`): opt-in file writes for **worktree-isolated**
   subagents. `disabled` (the default) offers only the read-only workspace tools, so existing
   behavior is byte-identical. When `enabled`, an agent running under `isolation: "worktree"`
@@ -37,6 +56,14 @@ the project uses [semantic versioning](https://semver.org/).
   it opens the worker's first outbound content channel (an egress/prompt-injection
   surface), which is why it is default-off and explicit. See
   `docs/ultracode-p7-agent-web-search.md`.
+
+### Fixed
+
+- `--agent-file-write` git-metadata denylist now splits paths on **both** `/` and `\`, so a
+  Windows-style relative path such as `.git\config` is refused (previously the `/`-only split let
+  it past the `.git` denylist on Windows). Windows-only, defense-in-depth — the primary
+  worktree-confinement path guard already held. Reported by the automated PR reviewer on the
+  file-write change; folded into the MCP work.
 
 ## [0.5.0] - 2026-07-15
 

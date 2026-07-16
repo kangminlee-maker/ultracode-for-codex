@@ -45,6 +45,11 @@ interface CodexSubagentBackendOptions {
   // workspace tools (byte-identical). True additionally offers write_file/str_replace to a
   // worktree-isolated agent, path-confined to that worktree. See docs/ultracode-p8-agent-file-write.md.
   readonly fileWrite?: boolean;
+  // Named allowlist of the user's Codex MCP servers a subagent may call. Empty/omitted (the default)
+  // provisions no `[mcp_servers.*]` into the isolated home and declines every MCP tool-call approval
+  // (byte-identical to today). A non-empty list provisions exactly those servers (verbatim from the
+  // user's config.toml) and auto-accepts their tool-call approvals. See docs/ultracode-p9-agent-mcp.md.
+  readonly mcpServers?: readonly string[];
 }
 
 interface PendingRequest {
@@ -235,6 +240,9 @@ export class CodexSubagentBackend implements SubagentBackend {
   private readonly verbosity: Verbosity;
   private readonly webSearch: boolean;
   private readonly fileWrite: boolean;
+  // Allowlisted MCP server names (exact membership). Empty = MCP off (no provisioning, decline every
+  // elicitation). Consulted at isolation setup (provisioning) and at the elicitation approval.
+  private readonly mcpServers: readonly string[];
   private child: ChildProcessWithoutNullStreams | null = null;
   private lineReader: readline.Interface | null = null;
   private nextId = 1;
@@ -266,6 +274,7 @@ export class CodexSubagentBackend implements SubagentBackend {
     this.verbosity = options.verbosity ?? codexDefaultVerbosity();
     this.webSearch = options.webSearch ?? false;
     this.fileWrite = options.fileWrite ?? false;
+    this.mcpServers = options.mcpServers ?? [];
   }
 
   async generate(request: SubagentRequest, signal?: AbortSignal): Promise<SubagentResult> {
@@ -379,6 +388,7 @@ export class CodexSubagentBackend implements SubagentBackend {
       reasoningEffort: this.reasoningEffort,
       verbosity: this.verbosity,
       webSearch: this.webSearch,
+      mcpServers: this.mcpServers,
     });
     this.isolation = isolation;
     const appServerArgs = [
@@ -570,6 +580,18 @@ export class CodexSubagentBackend implements SubagentBackend {
 
   private respondToServerRequest(id: number, method: string, params: unknown): void {
     void (async () => {
+      if (method === 'mcpServer/elicitation/request') {
+        // MCP tool-call approval (see docs/ultracode-p9-agent-mcp.md GATE 0). Accept ONLY an
+        // `mcp_tool_call` approval for an allowlisted server; any other elicitation kind (a
+        // data-collection form, an OAuth/login prompt) has no human here → decline, fail-closed.
+        // `mcpServers` is empty by default → always decline → byte-identical to pre-MCP behavior.
+        const record = asRecord(params);
+        const serverName = typeof record?.serverName === 'string' ? record.serverName : '';
+        const approvalKind = asRecord(record?._meta)?.codex_approval_kind;
+        const accept = approvalKind === 'mcp_tool_call' && this.mcpServers.includes(serverName);
+        this.writeResponse(id, { result: { action: accept ? 'accept' : 'decline' } });
+        return;
+      }
       if (method.includes('requestApproval')) {
         this.writeResponse(id, { result: { decision: 'decline' } });
         return;
@@ -1062,9 +1084,11 @@ async function resolveWorkspaceWritePath(
 
 // A path is git-internal if any segment is `.git` (the linked-worktree pointer file or, in a normal
 // checkout, the repo metadata dir). Writing it can corrupt worktree linkage or plant hooks, so it is
-// refused even though it stays inside the workspace root.
+// refused even though it stays inside the workspace root. Split on BOTH separators: on Windows
+// `relative()` returns backslash-separated paths, so a `/`-only split would let `.git\config` slip
+// past the denylist (Windows-only, defense in depth — worktree confinement still holds).
 function isGitInternalPath(relativePath: string): boolean {
-  return relativePath.split('/').some((segment) => segment === '.git');
+  return relativePath.split(/[\\/]/).some((segment) => segment === '.git');
 }
 
 // Write via a temp sibling + rename so a crash mid-write can never truncate/partially overwrite the
@@ -1185,6 +1209,7 @@ export async function createCodexIsolation(options: {
   readonly reasoningEffort: ReasoningEffort;
   readonly verbosity: Verbosity;
   readonly webSearch?: boolean;
+  readonly mcpServers?: readonly string[];
 }): Promise<CodexIsolation> {
   const rootDir = await mkdtemp(join(tmpdir(), 'ultracode-for-codex-codex-'));
   const homeDir = join(rootDir, 'codex-home');
@@ -1197,16 +1222,18 @@ export async function createCodexIsolation(options: {
   const sourceHome = codexSourceHome();
   const defaultModel = options.configuredModel ?? await readConfiguredCodexModel(sourceHome);
   await copyCodexAuth(sourceHome, homeDir);
-  await writeFile(
-    join(homeDir, 'config.toml'),
-    minimalCodexConfigToml({
-      model: defaultModel,
-      reasoningEffort: options.reasoningEffort,
-      verbosity: options.verbosity,
-      webSearch: options.webSearch,
-    }),
-    { mode: 0o600 },
-  );
+  // Build the whole config in memory, then write ONCE with mode 0o600. An allowlisted MCP block may
+  // carry per-server secrets (e.g. a `[mcp_servers.NAME.env]` token), so it must ride the single
+  // restricted-mode write — never a second, un-moded append (design-verify F5).
+  let configToml = minimalCodexConfigToml({
+    model: defaultModel,
+    reasoningEffort: options.reasoningEffort,
+    verbosity: options.verbosity,
+    webSearch: options.webSearch,
+  });
+  const mcpBlock = await provisionMcpServersToml(sourceHome, options.mcpServers ?? []);
+  if (mcpBlock) configToml = `${configToml}${mcpBlock}\n`;
+  await writeFile(join(homeDir, 'config.toml'), configToml, { mode: 0o600 });
 
   return {
     rootDir,
@@ -1214,6 +1241,143 @@ export async function createCodexIsolation(options: {
     workDir,
     defaultModel,
   };
+}
+
+// Read the user's config.toml and return the VERBATIM `[mcp_servers.NAME]` sections (plus their
+// subtables) for every allowlisted name, or '' when the allowlist is empty (→ byte-identical config).
+// Fails loud if an allowlisted name has no matching `[mcp_servers.NAME]` table header, so an
+// "MCP enabled but nothing provisioned" state can never pass silently (design-verify F2/F6).
+export async function provisionMcpServersToml(
+  sourceHome: string,
+  allowlist: readonly string[],
+): Promise<string> {
+  if (allowlist.length === 0) return '';
+  let configText: string;
+  try {
+    configText = await readFile(join(sourceHome, 'config.toml'), 'utf8');
+  } catch (err) {
+    throw new Error(`--agent-mcp is set but the Codex config was unreadable at ${join(sourceHome, 'config.toml')}: ${workflowToolErrorMessage(err)}`);
+  }
+  const { block, found } = sliceMcpServerSections(configText, allowlist);
+  const missing = allowlist.filter((name) => !found.has(name));
+  if (missing.length > 0) {
+    throw new Error(`Unknown MCP server(s): ${missing.join(', ')}. Declared servers must use a [mcp_servers.NAME] table header in ${join(sourceHome, 'config.toml')}.`);
+  }
+  return block;
+}
+
+// Extract, VERBATIM, the union of `[mcp_servers.NAME]` sections owned by any allowlisted name. A
+// server NAME owns its own table plus any subtables (`[mcp_servers.NAME.env]`). The match is
+// SEGMENT-EXACT (`segments[1]` equals an allowlisted name) — never a prefix/substring test — because
+// provisioning spawns the server subprocess at app-server start, so over-inclusion would launch an
+// unallowed server (its later tool calls are declined, but the process already ran). Returns the
+// concatenated raw section text and the set of names actually found. See docs/ultracode-p9-agent-mcp.md.
+export function sliceMcpServerSections(
+  configText: string,
+  allowlist: readonly string[],
+): { readonly block: string; readonly found: Set<string> } {
+  const allow = new Set(allowlist);
+  const lines = configText.split('\n');
+  // Record EVERY table header — single-bracket `[table]` AND array-of-tables `[[table]]` — as a
+  // section boundary. An array-of-tables is never an mcp_servers section, but it MUST still terminate
+  // the preceding one; missing it would swallow an unrelated `[[...]]` block into the sliced output.
+  const headers: { readonly idx: number; readonly header: TomlTableHeader }[] = [];
+  lines.forEach((line, idx) => {
+    const header = parseTomlTableHeader(line);
+    if (header) headers.push({ idx, header });
+  });
+  const sections: string[] = [];
+  const found = new Set<string>();
+  for (let h = 0; h < headers.length; h += 1) {
+    const entry = headers[h];
+    if (!entry) continue;
+    const end = h + 1 < headers.length ? (headers[h + 1]?.idx ?? lines.length) : lines.length;
+    // Array-of-tables is a boundary only, never a slice target.
+    if (entry.header.arrayOfTables) continue;
+    const [top, name] = entry.header.segments;
+    if (top !== 'mcp_servers' || name === undefined || !allow.has(name)) continue;
+    found.add(name);
+    // Trim trailing whitespace/CRLF per line block so the concatenation is stable across newlines.
+    sections.push(lines.slice(entry.idx, end).join('\n').replace(/\s+$/, ''));
+  }
+  return { block: sections.length > 0 ? `\n${sections.join('\n\n')}\n` : '', found };
+}
+
+interface TomlTableHeader {
+  readonly segments: string[];
+  readonly arrayOfTables: boolean;
+}
+
+// Parse a TOML table header into its dotted-key segments + whether it is an array-of-tables. Handles
+// BOTH single-bracket `[a.b."c.d"]` and double-bracket `[[a.b]]`, honoring bare keys and
+// basic/literal-quoted segments. Returns null for a non-header line. Comments and trailing content
+// after the closing bracket are ignored. Both bracket forms are boundaries; only single-bracket
+// `mcp_servers.NAME` tables are sliced (an array-of-tables can never be an mcp server section).
+function parseTomlTableHeader(line: string): TomlTableHeader | null {
+  const trimmed = line.replace(/^\s+/, '');
+  if (!trimmed.startsWith('[')) return null;
+  const arrayOfTables = trimmed.startsWith('[[');
+  let inner = '';
+  let inBasic = false;
+  let inLiteral = false;
+  let closed = false;
+  for (let i = arrayOfTables ? 2 : 1; i < trimmed.length; i += 1) {
+    const ch = trimmed[i] ?? '';
+    if (inBasic) {
+      inner += ch;
+      if (ch === '\\') { inner += trimmed[i + 1] ?? ''; i += 1; continue; }
+      if (ch === '"') inBasic = false;
+      continue;
+    }
+    if (inLiteral) {
+      inner += ch;
+      if (ch === "'") inLiteral = false;
+      continue;
+    }
+    if (ch === '"') { inBasic = true; inner += ch; continue; }
+    if (ch === "'") { inLiteral = true; inner += ch; continue; }
+    // The first unquoted `]` closes the header (for `[[...]]` this is the first of `]]`, which is
+    // sufficient to treat the line as a boundary).
+    if (ch === ']') { closed = true; break; }
+    inner += ch;
+  }
+  if (!closed) return null;
+  const segments = splitTomlDottedKey(inner);
+  if (!segments) return null;
+  return { segments, arrayOfTables };
+}
+
+// Split a dotted key path (`a.b."c.d".e`) into segments, honoring quoted segments; null on malformed.
+function splitTomlDottedKey(inner: string): string[] | null {
+  const segments: string[] = [];
+  let i = 0;
+  const n = inner.length;
+  while (i < n) {
+    while (i < n && /\s/.test(inner[i] ?? '')) i += 1;
+    if (i >= n) break;
+    let segment = '';
+    const ch = inner[i] ?? '';
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      i += 1;
+      while (i < n && inner[i] !== quote) {
+        if (quote === '"' && inner[i] === '\\') { segment += (inner[i + 1] ?? ''); i += 2; continue; }
+        segment += inner[i] ?? '';
+        i += 1;
+      }
+      if (i >= n) return null;
+      i += 1;
+    } else {
+      while (i < n && inner[i] !== '.' && !/\s/.test(inner[i] ?? '')) { segment += inner[i] ?? ''; i += 1; }
+    }
+    segments.push(segment);
+    while (i < n && /\s/.test(inner[i] ?? '')) i += 1;
+    if (i < n) {
+      if (inner[i] !== '.') return null;
+      i += 1;
+    }
+  }
+  return segments.length > 0 ? segments : null;
 }
 
 function withCodexThreadContext(error: unknown, threadId: string | null): Error {

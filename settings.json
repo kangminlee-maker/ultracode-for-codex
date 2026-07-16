@@ -11,6 +11,7 @@
     "nestedWorkflows": "disabled",
     "agentWebSearch": "disabled",
     "agentFileWrite": "disabled",
+    "agentMcp": [],
     "background": {
       "runDir": "{stateRoot}/background/{jobId}",
       "resultFile": "result.json",

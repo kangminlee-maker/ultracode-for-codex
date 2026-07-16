@@ -103,6 +103,28 @@ function requestWorkspaceToolWithId(id, threadId, turnId, tool, args) {
   });
 }
 
+// Mimic the app-server's MCP tool-call approval: a server->client `mcpServer/elicitation/request`
+// carrying serverName + `_meta.codex_approval_kind`. Resolves with the client's `{action}` response.
+function requestMcpElicitation(threadId, turnId, serverName, kind) {
+  const id = serverRequestSeq;
+  serverRequestSeq += 1;
+  write({
+    id,
+    method: 'mcpServer/elicitation/request',
+    params: {
+      threadId,
+      turnId,
+      serverName,
+      mode: 'form',
+      _meta: { codex_approval_kind: kind },
+      message: `Allow the ${serverName} MCP server to run a tool?`,
+    },
+  });
+  return new Promise((resolve) => {
+    pendingServerRequests.set(id, resolve);
+  });
+}
+
 function emitEarlyTurn(threadId, turnId) {
   write({
     method: 'item/agentMessage/delta',
@@ -239,6 +261,16 @@ rl.on('line', (line) => {
       result(payload.id, { turn: { id: turnId } });
       const args = JSON.parse(Buffer.from(replaceMatch[1], 'base64').toString('utf8'));
       setTimeout(() => emitWorkspaceToolTurn(threadId, turnId, 'str_replace', args), 0);
+      return;
+    }
+    const elicitMatch = input.match(/MCP_ELICIT_B64 ([A-Za-z0-9+/=]+)/);
+    if (elicitMatch) {
+      result(payload.id, { turn: { id: turnId } });
+      const { serverName, kind } = JSON.parse(Buffer.from(elicitMatch[1], 'base64').toString('utf8'));
+      void requestMcpElicitation(threadId, turnId, serverName, kind).then((response) => {
+        const action = response.result?.action ?? JSON.stringify(response.error ?? response.result ?? null);
+        emitTurn(threadId, turnId, `ELICIT_ACTION:${action}`);
+      });
       return;
     }
     const effort = payload.params?.effort;

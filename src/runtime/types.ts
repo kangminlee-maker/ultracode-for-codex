@@ -55,6 +55,37 @@ export function isAgentFileWrite(value: unknown): value is AgentFileWrite {
   return typeof value === 'string' && (AGENT_FILE_WRITE_VALUES as readonly string[]).includes(value);
 }
 
+// Named allowlist of the user's Codex MCP servers a workflow subagent may call. An empty list
+// (the current default) provisions no `[mcp_servers.*]` into the isolated home and declines every
+// MCP tool-call approval, byte-identical to today; a non-empty list provisions exactly those
+// servers (verbatim from the user's config.toml) and auto-accepts their tool-call approvals.
+// Run-level: applies to every agent in the run and is not part of the agent call key. Names must be
+// bare Codex MCP server keys; the pattern rejects shell/TOML-hostile characters. An allowlisted name
+// with no matching `[mcp_servers.NAME]` section fails loud at backend start (never a silent no-op).
+export type AgentMcpServers = readonly string[];
+const AGENT_MCP_SERVER_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
+export function isAgentMcpServerName(value: unknown): value is string {
+  return typeof value === 'string' && AGENT_MCP_SERVER_NAME_PATTERN.test(value);
+}
+// Parse a comma-separated `--agent-mcp` value into a validated, de-duplicated server-name list.
+// Trims each entry, drops empties (so a trailing comma or `""` is off, not an error), and rejects
+// any surviving entry with a hostile character. Order is preserved (first occurrence wins).
+export function parseAgentMcpServerList(raw: string): string[] {
+  const out: string[] = [];
+  for (const part of raw.split(',')) {
+    const name = part.trim();
+    if (name === '') continue;
+    if (!isAgentMcpServerName(name)) {
+      throw new Error(`agent-mcp server name "${name}" is invalid; use bare Codex MCP server names (letters, digits, '.', '_', '-').`);
+    }
+    if (!out.includes(name)) out.push(name);
+  }
+  return out;
+}
+export function isAgentMcpServerList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(isAgentMcpServerName);
+}
+
 // Backend model name used when no run-level model is configured. It is a
 // projection placeholder, never a real Codex model id.
 export const SUBAGENT_MODEL_PLACEHOLDER = 'codex-subagent';
