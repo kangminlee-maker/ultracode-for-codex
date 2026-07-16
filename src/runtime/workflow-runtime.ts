@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, lstat, mkdir, readdir, readFile, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { availableParallelism, homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { createContext, runInContext } from 'node:vm';
 import type { AgentConcurrency, NestedWorkflows, ReasoningEffort, ResolvedAgentType, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
@@ -3761,7 +3761,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       if (task.status !== 'running' || task.terminalEmitted) return workflowTaskSnapshot(task);
       try {
         await action();
-      } catch (err) {
+      } catch {
         task.error = WORKFLOW_JOURNAL_PUBLIC_FAILURE_MESSAGE;
         task.failureReason = WORKFLOW_JOURNAL_WRITE_FAILED_REASON;
         task.status = 'failed';
@@ -4431,10 +4431,6 @@ function extractMentionedWorkspacePaths(query: string): readonly string[] {
     out.add(match.replace(/:\d+$/, ''));
   }
   return [...out];
-}
-
-function pathsFromGitStatus(status: string): readonly string[] {
-  return parseGitStatusPaths(status).paths;
 }
 
 function parseGitStatusPaths(
