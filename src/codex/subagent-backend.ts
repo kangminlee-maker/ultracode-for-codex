@@ -301,7 +301,7 @@ export class CodexSubagentBackend implements SubagentBackend {
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
     try {
       const cwd = request.worktreePath ?? this.cwd;
-      threadId = await this.startThread(capability.model, reasoningEffort, this.verbosity, Boolean(structuredTool), cwd, Boolean(request.worktreePath));
+      threadId = await this.startThread(capability.model, reasoningEffort, this.verbosity, Boolean(structuredTool), cwd, Boolean(request.worktreePath), request.developerInstructions);
       const turn = await this.send('turn/start', {
         threadId,
         cwd,
@@ -455,6 +455,7 @@ export class CodexSubagentBackend implements SubagentBackend {
     structured: boolean,
     cwd: string,
     workspaceWrite: boolean,
+    personaInstructions?: string,
   ): Promise<string> {
     // Writes are offered ONLY to a worktree-isolated thread (workspaceWrite) and only when the
     // gate is on. Because our dynamic-tool handlers run unsandboxed in this process, a read-only
@@ -470,9 +471,10 @@ export class CodexSubagentBackend implements SubagentBackend {
       dynamicTools: workspaceDynamicTools(writable),
       ephemeral: true,
       baseInstructions: 'Ultracode workflow subagent. Produce only the workflow agent return value.',
-      developerInstructions: structured
-        ? 'Return exactly one JSON value matching the provided outputSchema.'
-        : 'Return exactly the raw result text for the workflow script.',
+      // A resolved agent-type persona (PG-AGENTTYPE) precedes the workflow return-value contract,
+      // which is appended last so the later instruction wins (native parity: system prompt +
+      // StructuredOutput appended). No persona → the fixed contract line alone, byte-identical.
+      developerInstructions: composeDeveloperInstructions(personaInstructions, structured),
       personality: 'none',
       experimentalRawEvents: false,
       persistExtendedHistory: false,
@@ -985,6 +987,17 @@ function workflowAgentPrompt(request: SubagentRequest): string {
 // literal "disabled" exactly; `true` enables the native Responses web_search tool.
 function webSearchConfigValue(webSearch: boolean | undefined): 'live' | 'disabled' {
   return webSearch ? 'live' : 'disabled';
+}
+
+// Compose a thread's developer instructions: an optional agent-type persona followed by the fixed
+// workflow return-value contract (appended last so it is never overridden). Absent persona yields the
+// contract line alone — byte-identical to the pre-agent-type instructions.
+export function composeDeveloperInstructions(persona: string | undefined, structured: boolean): string {
+  const returnContract = structured
+    ? 'Return exactly one JSON value matching the provided outputSchema.'
+    : 'Return exactly the raw result text for the workflow script.';
+  const trimmed = persona?.trim();
+  return trimmed ? `${trimmed}\n\n${returnContract}` : returnContract;
 }
 
 function estimatedUsage(prompt: string, text: string): SubagentUsage {

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, before, test } from 'node:test';
 import {
   CodexSubagentBackend,
+  composeDeveloperInstructions,
   usageFromCodexTokenUsage,
 } from '../dist/codex/subagent-backend.js';
 
@@ -19,6 +20,22 @@ const tempDirs = [];
 
 before(async () => {
   await chmod(fakeCodex, 0o755);
+});
+
+test('composeDeveloperInstructions appends the return contract after an agent-type persona, and is byte-identical without one', () => {
+  // No persona → the exact pre-agent-type instruction strings (byte-identical).
+  assert.equal(composeDeveloperInstructions(undefined, false), 'Return exactly the raw result text for the workflow script.');
+  assert.equal(composeDeveloperInstructions(undefined, true), 'Return exactly one JSON value matching the provided outputSchema.');
+  assert.equal(composeDeveloperInstructions('   ', false), 'Return exactly the raw result text for the workflow script.');
+  // Persona precedes the contract, which is appended last so it always wins.
+  assert.equal(
+    composeDeveloperInstructions('You are REVIEWER.', false),
+    'You are REVIEWER.\n\nReturn exactly the raw result text for the workflow script.',
+  );
+  assert.equal(
+    composeDeveloperInstructions('You are REVIEWER.\n', true),
+    'You are REVIEWER.\n\nReturn exactly one JSON value matching the provided outputSchema.',
+  );
 });
 
 afterEach(async () => {

@@ -322,6 +322,133 @@ test('workflow agents reject invalid effort and model values before spending tok
   }
 });
 
+function agentTypeRegistry(entries) {
+  return new Map(Object.entries(entries).map(([name, fields]) => [name, { name, ...fields }]));
+}
+
+test('agentType applies a resolved type model/effort/persona, and explicit opts override it', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({
+    backend,
+    runtimeOptions: {
+      agentTypes: agentTypeRegistry({
+        reviewer: { model: 'fake-model-mini', effort: 'high', developerInstructions: 'REVIEW PERSONA' },
+        scout: { model: 'fake-model-mini' }, // no persona, no effort
+      }),
+    },
+  });
+  try {
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "typed", description: "typed agents" };
+const a = await agent("review this", { agentType: "reviewer" });
+const b = await agent("review harder", { agentType: "reviewer", effort: "low", model: "fake-model" });
+const c = await agent("scout this", { agentType: "scout" });
+return { a, b, c };`,
+    });
+    const events = await collectEvents(runtime, launch.taskId);
+    assert.equal(events.at(-1).type, 'workflow.completed');
+    assert.equal(backend.requests.length, 3);
+    // Type supplies model/effort/persona.
+    assert.equal(backend.requests[0].model, 'fake-model-mini');
+    assert.equal(backend.requests[0].reasoningEffort, 'high');
+    assert.equal(backend.requests[0].developerInstructions, 'REVIEW PERSONA');
+    // Explicit opts win over the type; persona still applies.
+    assert.equal(backend.requests[1].model, 'fake-model');
+    assert.equal(backend.requests[1].reasoningEffort, 'low');
+    assert.equal(backend.requests[1].developerInstructions, 'REVIEW PERSONA');
+    // A persona-less type: model applied, no developerInstructions leaks.
+    assert.equal(backend.requests[2].model, 'fake-model-mini');
+    assert.equal(backend.requests[2].developerInstructions, undefined);
+
+    const snapshot = runtime.get(launch.taskId);
+    const journal = await readWorkflowJournal(workflowJournalPath(snapshot.transcriptDir));
+    const started = journal.entries.filter((entry) => entry.kind === 'workflow.agent.started');
+    // The type NAME (not the persona) enters semanticOpts and thus the call key.
+    assert.deepEqual(started[0].semanticOpts, { model: 'fake-model-mini', effort: 'high', agentType: 'reviewer' });
+    assert.equal(started[0].agentCallKey, computeWorkflowAgentCallKey({
+      previousAgentCallKey: WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+      prompt: 'review this',
+      semanticOpts: { model: 'fake-model-mini', effort: 'high', agentType: 'reviewer' },
+    }));
+    // Same prompt/model/effort but NO type must produce a different key (agentType is key-affecting).
+    assert.notEqual(started[0].agentCallKey, computeWorkflowAgentCallKey({
+      previousAgentCallKey: WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+      prompt: 'review this',
+      semanticOpts: { model: 'fake-model-mini', effort: 'high' },
+    }));
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('agentType fails loud when the gate is off, the name is unknown, or the type carries a banned effort', async () => {
+  const gateOff = new FakeSubagentBackend();
+  const off = await createRuntime({ backend: gateOff }); // no agentTypes option → gate off
+  try {
+    const launch = await off.runtime.launch({
+      script: 'export const meta = { name: "gate-off" };\nreturn await agent("x", { agentType: "reviewer" });',
+    });
+    const events = await collectEvents(off.runtime, launch.taskId);
+    assert.equal(events.at(-1).type, 'workflow.failed');
+    assert.equal(events.at(-1).recovery.reason, 'workflow_input_invalid');
+    assert.match(off.runtime.get(launch.taskId).error, /requires agent types to be enabled/);
+    assert.equal(gateOff.requests.length, 0);
+  } finally {
+    await off.runtime.close();
+  }
+
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({
+    backend,
+    runtimeOptions: { agentTypes: agentTypeRegistry({ reviewer: { model: 'fake-model-mini' }, danger: { effort: 'ultra' } }) },
+  });
+  try {
+    const unknown = await runtime.launch({
+      script: 'export const meta = { name: "unknown-type" };\nreturn await agent("x", { agentType: "ghost" });',
+    });
+    let events = await collectEvents(runtime, unknown.taskId);
+    assert.equal(events.at(-1).recovery.reason, 'workflow_input_invalid');
+    assert.match(runtime.get(unknown.taskId).error, /unknown agent type "ghost".*reviewer/);
+
+    // A registry file with model_reasoning_effort = "ultra" must be rejected at use-time — the banned
+    // tier must never reach dispatch (it would escape the journal/cost accounting).
+    const ultra = await runtime.launch({
+      script: 'export const meta = { name: "ultra-type" };\nreturn await agent("x", { agentType: "danger" });',
+    });
+    events = await collectEvents(runtime, ultra.taskId);
+    assert.equal(events.at(-1).recovery.reason, 'workflow_input_invalid');
+    assert.match(runtime.get(ultra.taskId).error, /unsupported model_reasoning_effort "ultra"/);
+    assert.equal(backend.requests.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('resumeSourceInfo reports whether the source run used agent types (drives --agent-types auto-restore)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({
+    backend,
+    runtimeOptions: { agentTypes: agentTypeRegistry({ reviewer: { model: 'fake-model-mini', developerInstructions: 'P' } }) },
+  });
+  try {
+    const typed = await runtime.launch({
+      script: 'export const meta = { name: "typed-run" };\nreturn await agent("t", { agentType: "reviewer" });',
+    });
+    await collectEvents(runtime, typed.taskId);
+    const typedInfo = await runtime.resumeSourceInfo(runtime.get(typed.taskId).runId);
+    assert.equal(typedInfo.usesAgentTypes, true);
+
+    const plain = await runtime.launch({
+      script: 'export const meta = { name: "plain-run" };\nreturn await agent("p");',
+    });
+    await collectEvents(runtime, plain.taskId);
+    const plainInfo = await runtime.resumeSourceInfo(runtime.get(plain.taskId).runId);
+    assert.equal(plainInfo.usesAgentTypes, false);
+  } finally {
+    await runtime.close();
+  }
+});
+
 test('workflow runtime validates workflow sources without running agents', async () => {
   const backend = new FakeSubagentBackend();
   const { runtime } = await createRuntime({ backend });
@@ -2535,6 +2662,7 @@ async function createRuntime({ backend, runtimeOptions = {} }) {
       agentConcurrency: runtimeOptions.agentConcurrency,
       budgetTotal: runtimeOptions.budgetTotal,
       nestedWorkflows: runtimeOptions.nestedWorkflows,
+      agentTypes: runtimeOptions.agentTypes,
       builtinWorkflows: runtimeOptions.builtinWorkflows,
       journalDurability: runtimeOptions.journalDurability,
     }),

@@ -39,6 +39,7 @@ test('settings.json provides Codex workflow runtime defaults', () => {
       agentWebSearch: 'disabled',
       agentFileWrite: 'disabled',
       agentMcp: [],
+      agentTypes: 'disabled',
       background: {
         runDir: '{stateRoot}/background/{jobId}',
         resultFile: 'result.json',

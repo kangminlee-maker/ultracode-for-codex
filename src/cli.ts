@@ -10,7 +10,9 @@ import { createInterface } from 'node:readline/promises';
 import { CodexSubagentBackend } from './codex/subagent-backend.js';
 import { probeCodexSetup } from './codex/setup-probe.js';
 import { WorkflowTaskRegistry, isRetryableFailureReason } from './runtime/workflow-runtime.js';
-import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, isAgentConcurrencyKeyword, isAgentFileWrite, isAgentWebSearch, isNestedWorkflows, isWorktreeRetention, parseAgentMcpServerList } from './runtime/types.js';
+import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, isAgentConcurrencyKeyword, isAgentFileWrite, isAgentTypes, isAgentWebSearch, isNestedWorkflows, isWorktreeRetention, parseAgentMcpServerList } from './runtime/types.js';
+import { loadAgentTypeRegistry } from './codex/agent-type-registry.js';
+import { codexSourceHome } from './codex/model-catalog.js';
 import { ultracodePackageVersion } from './runtime/package-info.js';
 import { defaultUltracodeStateRoot, resolveUltracodeStatePath } from './runtime/state-root.js';
 import { renderUltracodeInstallGuideNotice } from './ultracode-install-guide.js';
@@ -35,8 +37,9 @@ import {
   workflowDefaultAgentWebSearch,
   workflowDefaultAgentFileWrite,
   workflowDefaultAgentMcpServers,
+  workflowDefaultAgentTypes,
 } from './settings.js';
-import type { AgentConcurrency, AgentFileWrite, AgentMcpServers, AgentWebSearch, NestedWorkflows, ReasoningEffort, Verbosity, WorktreeRetention } from './runtime/types.js';
+import type { AgentConcurrency, AgentFileWrite, AgentMcpServers, AgentTypes, AgentWebSearch, NestedWorkflows, ReasoningEffort, ResolvedAgentType, Verbosity, WorktreeRetention } from './runtime/types.js';
 import type { WorkflowExecutionMode, WorkflowPermissionPolicy, WorkflowProgressMode } from './settings.js';
 import type {
   WorkflowEvent,
@@ -133,6 +136,15 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   const resumeModel = input.resumeFromRunId && !options.model
     ? await resolveResumeBackendModel(cwd, input.resumeFromRunId)
     : undefined;
+  // Auto-restore --agent-types on resume: the source run's typed agents baked the type name into their
+  // call keys, so resuming without the gate would abort at the first typed agent even though its result
+  // is cached. OR the requested gate with the source's usage (a fresh run keeps the requested value).
+  const agentTypesGate: AgentTypes =
+    parseAgentTypes(options.agentTypes) === 'enabled'
+    || (input.resumeFromRunId ? await resumeUsedAgentTypes(cwd, input.resumeFromRunId) : false)
+      ? 'enabled'
+      : 'disabled';
+  const agentTypes = agentTypesGate === 'enabled' ? await loadEnabledAgentTypeRegistry() : undefined;
   const reasoningEffort = parseReasoningEffort(options.reasoningEffort);
   const backend = new CodexSubagentBackend({
     command: options.command,
@@ -155,6 +167,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
     agentConcurrency,
     budgetTotal,
     nestedWorkflows,
+    agentTypes,
   });
 
   try {
@@ -243,6 +256,23 @@ async function resolveResumeBackendModel(cwd: string, runId: string): Promise<st
   return info.model && info.model !== SUBAGENT_MODEL_PLACEHOLDER ? info.model : undefined;
 }
 
+// A run that dispatched typed agents recorded the type name in each call key; because that key is
+// recomputed on resume, --agent-types must be restored (not re-typed) or a fully-cached resume would
+// abort at the first typed agent. Mirrors resolveResumeBackendModel's model adoption.
+async function resumeUsedAgentTypes(cwd: string, runId: string): Promise<boolean> {
+  const info = await withPreflightRegistry(cwd, (runtime) => runtime.resumeSourceInfo(runId));
+  return info.usesAgentTypes;
+}
+
+// Load the native Codex agent-type registry (only when --agent-types is on), surfacing any skipped
+// files on stderr. Returns a map (possibly empty) so the runtime can distinguish gate-on-empty
+// ("unknown type") from gate-off (undefined → "requires --agent-types").
+async function loadEnabledAgentTypeRegistry(): Promise<ReadonlyMap<string, ResolvedAgentType>> {
+  const { registry, warnings } = await loadAgentTypeRegistry(join(codexSourceHome(), 'agents'));
+  for (const warning of warnings) process.stderr.write(`ultracode: ${warning}\n`);
+  return registry;
+}
+
 const PREFLIGHT_BACKEND = {
   name: 'preflight',
   model: 'preflight',
@@ -281,6 +311,7 @@ interface ParsedOptions {
   readonly agentWebSearch?: string;
   readonly agentFileWrite?: string;
   readonly agentMcp?: string;
+  readonly agentTypes?: string;
   readonly budget?: string;
   readonly jobId?: string;
   readonly metadataPath?: string;
@@ -2121,6 +2152,12 @@ function parseAgentMcpServers(value: string | undefined): AgentMcpServers {
   return parseAgentMcpServerList(value);
 }
 
+function parseAgentTypes(value: string | undefined): AgentTypes {
+  if (value === undefined) return workflowDefaultAgentTypes();
+  if (isAgentTypes(value)) return value;
+  throw new Error("agent-types must be 'disabled' or 'enabled'.");
+}
+
 export function parseBudget(value: string | undefined): number | null {
   if (value === undefined) return null;
   // Strict positive-integer parse with an optional +, and a k(×1e3)/m(×1e6) suffix:
@@ -2208,6 +2245,7 @@ Options:
   --agent-web-search <disabled|enabled>  Let workflow subagents use the native web_search tool (run-level; re-pass on resume; results aren't reproducible on re-run). Default: settings.json (${workflowDefaultAgentWebSearch()}).
   --agent-file-write <disabled|enabled>  Let worktree-isolated subagents write files (write_file/str_replace, confined to the worktree; run-level; re-pass on resume). Default: settings.json (${workflowDefaultAgentFileWrite()}).
   --agent-mcp <server1,server2,...>  Let subagents call the named Codex MCP servers (allowlist; provisioned from your config.toml + auto-approved; run-level; re-pass on resume). Off when empty. Default: settings.json (${JSON.stringify(workflowDefaultAgentMcpServers())}).
+  --agent-types <disabled|enabled>  Resolve agent({agentType}) from your ~/.codex/agents/*.toml (per-agent model + reasoning effort + persona); auto-restored on resume. Default: settings.json (${workflowDefaultAgentTypes()}).
   --budget <N|Nk|Nm>                 Per-run output-token ceiling (optional +, k=×1e3, m=×1e6); agent() refuses to launch once budget.spent() reaches it. Off by default. Not inherited on resume: re-pass --budget or the resumed run is uncapped. Counts successful-agent output tokens only; best-effort under concurrency.
   --progress <jsonl|plain>           Progress format on stderr. Default: settings.json (${workflowDefaultProgressMode()}).
   --execution <background|attached>  Execution mode. Default: settings.json (${workflowDefaultExecutionMode()}).
