@@ -358,12 +358,14 @@ interface WorkflowRunContext {
   currentPhase?: string;
   announcedPlan?: WorkflowExecutionPlan;
   pendingPhasePlan?: WorkflowPlanPhase;
+}
+
+// The VM value projector for ONE execution (the top-level run or one nested child). Each
+// createVmGlobals() call owns its own scope; setVmValueProjector writes into it and every promise
+// created by that execution captures it at creation. Per-execution (not a shared ctx slot) so
+// concurrent nested children never clobber each other's realm marshaling (PG-NEST v2-B).
+interface WorkflowProjectorScope {
   toVmValue?: (value: unknown) => unknown;
-  // True while a nested workflow() child is executing. v1 runs nested children
-  // SEQUENTIALLY: the shared VM projector (toVmValue) is a single ctx slot, so two
-  // concurrent siblings would clobber each other's realm. Set/reset synchronously in
-  // runNestedWorkflow so a second concurrent workflow() is rejected before it can start.
-  nestedInFlight?: boolean;
 }
 
 interface WorkflowVmGlobals {
@@ -2821,6 +2823,9 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   }
 
   private createVmGlobals(ctx: WorkflowRunContext, frame?: WorkflowChildFrame): WorkflowVmGlobals {
+    // This execution's own projector scope. Every promise its host methods create captures this
+    // scope, so concurrent nested children never share a projector (PG-NEST v2-B).
+    const scope: WorkflowProjectorScope = {};
     const log = (message: unknown): void => {
       if (ctx.controller.signal.aborted || ctx.task.status !== 'running') return;
       this.emit(ctx.task, {
@@ -2860,23 +2865,23 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       ctx.timers.delete(handle);
     });
     const host = Object.create(null) as Record<string, unknown>;
-    host.trackPromise = hardenCallable((value: unknown): HandledWorkflowPromise<unknown> => this.trackWorkflowPromise(ctx, value));
+    host.trackPromise = hardenCallable((value: unknown): HandledWorkflowPromise<unknown> => this.trackWorkflowPromise(ctx, value, true, scope));
     host.agent = frame
       ? hardenCallable((prompt: unknown, options?: AgentOptions): HandledWorkflowPromise<unknown> =>
           // A child agent always carries an explicit phase (its composed "▸ name › phase"),
           // so runAgentInner never falls back to the shared parent ctx.currentPhase and the
           // child's agents stay grouped under the child even when the child calls phase().
-          this.runAgent(ctx, prompt, this.withChildPhase(frame, options)))
-      : hardenCallable((prompt: unknown, options?: AgentOptions): HandledWorkflowPromise<unknown> => this.runAgent(ctx, prompt, options));
+          this.runAgent(ctx, prompt, this.withChildPhase(frame, options), scope))
+      : hardenCallable((prompt: unknown, options?: AgentOptions): HandledWorkflowPromise<unknown> => this.runAgent(ctx, prompt, options, scope));
     host.parallel = hardenCallable((items: unknown): HandledWorkflowPromise<unknown[]> => {
-      return this.trackWorkflowPromise(ctx, this.parallel(ctx, items));
+      return this.trackWorkflowPromise(ctx, this.parallel(ctx, items), true, scope);
     });
     host.pipeline = hardenCallable((items: unknown, ...stages: unknown[]): HandledWorkflowPromise<unknown[]> => {
-      return this.trackWorkflowPromise(ctx, this.pipeline(ctx, items, stages));
+      return this.trackWorkflowPromise(ctx, this.pipeline(ctx, items, stages), true, scope);
     });
     host.hash = hardenCallable((value: unknown): string => workflowValueHash(value));
     host.workspaceContext = hardenCallable((options?: unknown): HandledWorkflowPromise<string> => {
-      return this.trackWorkflowPromise(ctx, this.workspaceContext(ctx, options));
+      return this.trackWorkflowPromise(ctx, this.workspaceContext(ctx, options), true, scope);
     });
     // A nested child does NOT announce plans in v1: announcePlan/announcePhasePlan mutate
     // parent-only ctx state (announcedPlan/pendingPhasePlan), which a child sharing ctx would
@@ -2903,9 +2908,11 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         })
       : this.nestedWorkflows
         ? hardenCallable((nameOrRef: unknown, childArgs?: unknown): HandledWorkflowPromise<unknown> =>
-            // runNestedWorkflow already projects the child result into the parent realm, so the
-            // wrapper must not re-project (projectResult = false); it only tracks the promise.
-            this.trackWorkflowPromise(ctx, this.runNestedWorkflow(ctx, nameOrRef, childArgs), false))
+            // runNestedWorkflow projects the child's SUCCESS result into the parent realm via this
+            // (parent) scope — so the wrapper must not re-project (projectResult = false), which would
+            // double-project and, on the rejection path, strip a child error to a bare object. The
+            // parent scope (not a shared ctx slot) keeps a concurrent sibling from misrouting it (v2-B).
+            this.trackWorkflowPromise(ctx, this.runNestedWorkflow(ctx, nameOrRef, childArgs, scope), false))
         : hardenCallable((): never => {
             throw workflowInputError('Nested workflow calls are not supported by this runtime yet.');
           });
@@ -2933,7 +2940,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       budgetTotalLiteral: ctx.budgetTotal === null ? 'null' : String(ctx.budgetTotal),
       host: Object.freeze(host),
       setVmValueProjector: (projector) => {
-        ctx.toVmValue = projector;
+        scope.toVmValue = projector;
       },
     };
   }
@@ -2941,7 +2948,8 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   private runAgent(
     ctx: WorkflowRunContext,
     prompt: unknown,
-    options?: AgentOptions,
+    options: AgentOptions | undefined,
+    scope: WorkflowProjectorScope,
   ): HandledWorkflowPromise<unknown> {
     let resolveFinalizer: () => void;
     const finalizer = new Promise<void>((resolve) => {
@@ -2955,7 +2963,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       resolveFinalizer!();
     });
     operation.catch(() => undefined);
-    return this.trackWorkflowPromise(ctx, operation);
+    return this.trackWorkflowPromise(ctx, operation, true, scope);
   }
 
   private async workspaceContext(ctx: WorkflowRunContext, options?: unknown): Promise<string> {
@@ -3675,34 +3683,29 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   // It bypasses launch/runTask, so no child run.started is journaled — the child appears only
   // as agent.* entries on the parent's single chain, keeping the journal single-run and resume
   // intact (the call key is script-agnostic). Returns the child's result as a PARENT-realm value.
-  private async runNestedWorkflow(ctx: WorkflowRunContext, nameOrRef: unknown, childArgs: unknown): Promise<unknown> {
-    // Reject a concurrent second child (v1 runs nested children sequentially — see the field
-    // comment). Resolution is now async (name resolution + record read), so the guard SET must happen
-    // synchronously BEFORE the first await, and the finally must cover resolution: otherwise two
-    // concurrent workflow() calls both pass the guard and clobber the single shared projector, and a
-    // caught unapproved/denied throw during resolution would wedge nestedInFlight stuck true.
-    if (ctx.nestedInFlight) {
-      throw workflowInputError('workflow() cannot run a nested child while another is in flight; run nested workflows sequentially.');
-    }
-    ctx.nestedInFlight = true;
-    const parentProjector = ctx.toVmValue;
-    try {
-      const child = await this.resolveNestedChild(nameOrRef);
-      await this.assertNestedChildPermitted(child);
-      const frame: WorkflowChildFrame = {
-        args: childArgs,
-        group: `▸ ${child.parsed.meta.name}`,
-        metaSource: child.parsed,
-      };
-      const childGlobals = this.createVmGlobals(ctx, frame);
-      const childResult = await executeInlineWorkflow(child.parsed, childGlobals, ctx.controller.signal);
-      return parentProjector ? parentProjector(childResult) : childResult;
-    } finally {
-      // Restore the parent's projector so parent agents created after the child marshal into
-      // the parent realm; child agents already captured the child projector at their creation.
-      ctx.toVmValue = parentProjector;
-      ctx.nestedInFlight = false;
-    }
+  private async runNestedWorkflow(
+    ctx: WorkflowRunContext,
+    nameOrRef: unknown,
+    childArgs: unknown,
+    parentScope: WorkflowProjectorScope,
+  ): Promise<unknown> {
+    // Nested children may now run CONCURRENTLY (PG-NEST v2-B): the projector is per-execution (each
+    // createVmGlobals owns its own scope), so there is no shared slot to clobber and no sequential
+    // guard. On success, project the child-realm result into the PARENT realm via the parent scope's
+    // projector (sourced from this call, not a shared ctx slot, so a concurrent sibling can't misroute
+    // it); on failure the error propagates RAW (the wrapper's projectResult=false avoids double-
+    // projecting it to a bare object). C5e (one-level) still holds — a child's host.workflow is the
+    // throwing stub, bound by frame presence, so concurrent children can't nest.
+    const child = await this.resolveNestedChild(nameOrRef);
+    await this.assertNestedChildPermitted(child);
+    const frame: WorkflowChildFrame = {
+      args: childArgs,
+      group: `▸ ${child.parsed.meta.name}`,
+      metaSource: child.parsed,
+    };
+    const childGlobals = this.createVmGlobals(ctx, frame);
+    const childResult = await executeInlineWorkflow(child.parsed, childGlobals, ctx.controller.signal);
+    return parentScope.toVmValue ? parentScope.toVmValue(childResult) : childResult;
   }
 
   private async completeTask(
@@ -3809,22 +3812,19 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     ctx: WorkflowRunContext,
     value: T | PromiseLike<T>,
     projectResult = true,
+    scope?: WorkflowProjectorScope,
   ): HandledWorkflowPromise<T> {
     const promise = Promise.resolve(value);
-    // Capture the value projector at promise-CREATION time, not live at settle. A nested
-    // workflow() runs a child in its own VM context and reassigns ctx.toVmValue for the
-    // child's duration; capturing here binds every promise to the projector of the execution
-    // that created it, so a parent agent that settles while the child projector is installed
-    // still marshals into the parent realm. For a non-nested run ctx.toVmValue never changes,
-    // so this is byte-identical to reading it live. `projectResult` is false only for the
-    // workflow() wrapper: runNestedWorkflow already projects the child result into the parent
-    // realm, and at wrap time ctx.toVmValue is the child's projector, so re-projecting here
-    // would push the parent-realm value back into the child realm.
-    const capturedProjector = projectResult ? ctx.toVmValue : undefined;
+    // Capture the value projector at promise-CREATION time from THIS execution's scope, not a shared
+    // slot: binding every promise to the projector of the execution that created it lets concurrent
+    // nested children marshal into their own realms without clobbering each other (PG-NEST v2-B).
+    // The scope's projector is installed once (setVmValueProjector) before the script runs, so a
+    // non-nested run captures a stable projector — byte-identical to the pre-v2-B single slot.
+    const capturedProjector = projectResult ? scope?.toVmValue : undefined;
     const tracking: WorkflowPromiseTracking = {
       handled: false,
       projectValue: (nextValue) => capturedProjector ? capturedProjector(nextValue) : nextValue,
-      trackPromise: <U>(nextPromise: Promise<U>) => this.trackWorkflowPromise(ctx, nextPromise, projectResult),
+      trackPromise: <U>(nextPromise: Promise<U>) => this.trackWorkflowPromise(ctx, nextPromise, projectResult, scope),
     };
     let finalizer: Promise<void>;
     const settled = promise.then(

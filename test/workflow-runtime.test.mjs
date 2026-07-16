@@ -1094,7 +1094,7 @@ return r;`,
   }
 });
 
-test('workflow() still rejects the second concurrent child even though full-scope resolution is async (v2-A, BLOCKER-1)', async () => {
+test('concurrent nested workflow() by NAME both run under async full-scope resolution (v2-B, was v2-A sequential guard)', async () => {
   const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { nestedWorkflows: 'enabled' } });
   try {
     await writeProjectWorkflow(root, 'seq-child', 'export const meta = { name: "seq-child" };\nreturn await agent("c");');
@@ -1102,12 +1102,11 @@ test('workflow() still rejects the second concurrent child even though full-scop
     const launch = await runtime.launch({
       script: `export const meta = { name: "parent" };
 const results = await parallel([() => workflow("seq-child"), () => workflow("seq-child")]);
-// parallel maps a thrown child to null; exactly one sibling must be rejected by the in-flight guard.
 return { nulls: results.filter((r) => r === null).length, ok: results.filter((r) => r !== null).length };`,
     });
     await collectEvents(runtime, launch.taskId);
-    // The set-before-await guard must reject one sibling even with async name resolution + record read.
-    assert.deepEqual(jsonValue(runtime.get(launch.taskId).result), { nulls: 1, ok: 1 });
+    // v2-B removed the sequential guard: both concurrent named children resolve (async) + run, no null.
+    assert.deepEqual(jsonValue(runtime.get(launch.taskId).result), { nulls: 0, ok: 2 });
   } finally {
     await runtime.close();
   }
@@ -1300,24 +1299,32 @@ return await workflow("greet");`,
   }
 });
 
-test('concurrent nested workflow() rejects the second child (N9, sequential-only v1 limit)', async () => {
+test('concurrent nested workflow() children BOTH run and return value-correct structured results (N9 v2-B, PG-NEST concurrent)', async () => {
   const { runtime } = await createRuntime({ backend: new FakeSubagentBackend(), runtimeOptions: { nestedWorkflows: 'enabled' } });
   try {
-    const a = 'export const meta = { name: "a" };\nreturn "A";';
-    const b = 'export const meta = { name: "b" };\nreturn "B";';
+    // v2-B removes the sequential guard: two children run CONCURRENTLY. Each runs a STRUCTURED agent
+    // (the fake returns { detail, count }) and returns it tagged. The per-execution projector scope
+    // (each createVmGlobals owns its own) is what makes this safe — the pre-v2-B single ctx.toVmValue
+    // slot would be clobbered between concurrent siblings. (The realm mismatch that would cause is not
+    // observable from inside the sandbox — no intrinsics, and projection preserves properties — so the
+    // falsifiable signal is behavioral: with the guard restored one sibling is rejected → only 1 runs.)
+    const schema = '{ type: "object", additionalProperties: false, properties: { detail: { type: "string" }, count: { type: "number" } }, required: ["detail", "count"] }';
+    const childOf = (name) => `export const meta = { name: ${JSON.stringify(name)} };\nconst r = await agent("s", { schema: ${schema} });\nreturn { tag: ${JSON.stringify(name)}, detail: r.detail, count: r.count };`;
     const launch = await runtime.launch({
       script: `export const meta = { name: "parent" };
 return await parallel([
-  () => workflow({ script: ${JSON.stringify(a)} }),
-  () => workflow({ script: ${JSON.stringify(b)} }),
+  () => workflow({ script: ${JSON.stringify(childOf('a'))} }),
+  () => workflow({ script: ${JSON.stringify(childOf('b'))} }),
 ]);`,
     });
     await collectEvents(runtime, launch.taskId);
-    // One child runs; the concurrent sibling hits the in-flight guard, throws, and parallel()
-    // converts the rejection to null. Without the guard both would run (no null).
+    assert.equal(runtime.get(launch.taskId).status, 'completed', runtime.get(launch.taskId).error);
     const result = jsonValue(runtime.get(launch.taskId).result);
-    assert.equal(result.filter((x) => x !== null).length, 1);
-    assert.equal(result.filter((x) => x === null).length, 1);
+    assert.equal(result.filter((x) => x !== null).length, 2, 'both concurrent children run (no in-flight rejection)');
+    assert.deepEqual(result.map((x) => x.tag).sort(), ['a', 'b']);
+    // Each child's structured agent result is value-correct in the parent (projected through its own
+    // scope on the way out): the fake returns { detail: 'structured', count: 2 }.
+    assert.equal(result.every((x) => x.detail === 'structured' && x.count === 2), true, 'each concurrent child returns a value-correct structured result');
   } finally {
     await runtime.close();
   }
