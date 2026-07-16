@@ -1,19 +1,20 @@
 # Provenance Audit
 
 Date: 2026-06-23
-Update 2026-07-15: version references updated to the 0.5.0 release line (workflow
-parity — dispatch core with agent concurrency, token budget, and failure taxonomy;
-worktree retention; pipeline/parallel contract correctness; nested workflow(); and
-edit-and-iterate resume with an edited script); the change set is project-authored
-source with no new third-party code, so the marker-scan evidence below is unchanged
-from the 2026-06-23 audit.
+Update 2026-07-16: version references updated to the 0.6.0 release line (the
+capability-expansion stream — opt-in agent web search, worktree-confined subagent
+file writes, named-allowlist MCP servers, and native per-agent types resolved from
+~/.codex/agents; plus nested workflow() full-scope name sources with a record-based
+permission gate and concurrent nesting via a per-execution projector scope); the
+change set is project-authored source with no new third-party code, so the
+marker-scan evidence below is unchanged from the 2026-06-23 audit.
 
 ## Scope
 
 This audit checked:
 
 - tracked repository files;
-- generated npm package contents for `ultracode-for-codex@0.5.0`;
+- generated npm package contents for `ultracode-for-codex@0.6.0`;
 - the locally installed companion Codex skill.
 
 Generated build output and package tarballs were checked as projections of the
@@ -29,7 +30,7 @@ License transition completed:
 
 - Apache-2.0 `LICENSE` file is present;
 - `package.json` and `package-lock.json` declare `Apache-2.0`;
-- audited package metadata version is `0.5.0`;
+- audited package metadata version is `0.6.0`;
 - npm publish state is verified separately during release preparation.
 
 ## Evidence
