@@ -168,6 +168,21 @@ test('sliceMcpServerSections extracts allowlisted servers verbatim and segment-e
   r = sliceMcpServerSections(MCP_FIXTURE_TOML, ['ghost']);
   assert.equal(r.found.size, 0);
   assert.equal(r.block, '');
+
+  // An array-of-tables `[[...]]` between the allowlisted section and EOF (or the next single-bracket
+  // table) must terminate the mcp section — it must NOT be swallowed into the slice (bot review P2).
+  const withArrayTable = [
+    '[mcp_servers.foo]',
+    'command = "x"',
+    '[[skills.config]]',
+    'name = "UNRELATED"',
+    'path = "/etc"',
+  ].join('\n');
+  r = sliceMcpServerSections(withArrayTable, ['foo']);
+  assert.deepEqual([...r.found], ['foo']);
+  assert.match(r.block, /\[mcp_servers\.foo\]/);
+  assert.doesNotMatch(r.block, /UNRELATED/);
+  assert.doesNotMatch(r.block, /skills\.config/);
 });
 
 test('MCP allowlist provisions verbatim sections; default-off is byte-identical; unknown fails loud (W2)', async () => {

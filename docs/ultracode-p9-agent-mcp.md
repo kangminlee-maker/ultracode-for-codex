@@ -323,6 +323,18 @@ covered here by the adversarial design-verify (F1–F8, all folded) plus the `ch
 review on the PR (merge gate). Other verification stands: W1–W6 unit + 4/4 falsifiability controls +
 L1 real-path PASS + `test:all` (unit + e2e) green + typecheck clean.
 
+## PR BOT REVIEW (2026-07-16, `chatgpt-codex-connector` on PR #12) — 1 finding, FIXED
+
+- **[P2] array-of-tables not treated as a section boundary — REAL, FIXED.** `parseTomlTableHeaderPath`
+  returned `null` for `[[...]]`, so `sliceMcpServerSections` did not record an array-of-tables header as
+  a boundary. A `[[some.table]]` sitting between an allowlisted `[mcp_servers.foo]` and the next
+  single-bracket header (or at EOF) was **swallowed into the sliced block**, carrying unrelated non-MCP
+  config into the isolated home and breaking the exact-allowlist promise. Reproduced (`foo` allowlisted
+  + trailing `[[skills.config]]` → the array table leaked). Fixed: `parseTomlTableHeader` now recognizes
+  BOTH `[table]` and `[[table]]`; every header is a boundary, but only single-bracket `mcp_servers.NAME`
+  tables are sliced. New W1 case + falsifiability (revert to boundary-blind → the case fails). Verified
+  the subtable case (`[mcp_servers.a.env]` kept, `[mcp_servers.b]` excluded) still holds.
+
 ## Open decisions (owner)
 1. Authority model — **RESOLVED: named allowlist** (owner, 2026-07-16).
 2. Include streamable-http servers (network egress) in scope, or stdio-only v1? — RECOMMEND include

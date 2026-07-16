@@ -1278,38 +1278,50 @@ export function sliceMcpServerSections(
 ): { readonly block: string; readonly found: Set<string> } {
   const allow = new Set(allowlist);
   const lines = configText.split('\n');
-  const headers: { readonly idx: number; readonly segments: string[] }[] = [];
+  // Record EVERY table header — single-bracket `[table]` AND array-of-tables `[[table]]` — as a
+  // section boundary. An array-of-tables is never an mcp_servers section, but it MUST still terminate
+  // the preceding one; missing it would swallow an unrelated `[[...]]` block into the sliced output.
+  const headers: { readonly idx: number; readonly header: TomlTableHeader }[] = [];
   lines.forEach((line, idx) => {
-    const segments = parseTomlTableHeaderPath(line);
-    if (segments) headers.push({ idx, segments });
+    const header = parseTomlTableHeader(line);
+    if (header) headers.push({ idx, header });
   });
   const sections: string[] = [];
   const found = new Set<string>();
   for (let h = 0; h < headers.length; h += 1) {
-    const header = headers[h];
-    if (!header) continue;
-    const [top, name] = header.segments;
+    const entry = headers[h];
+    if (!entry) continue;
+    const end = h + 1 < headers.length ? (headers[h + 1]?.idx ?? lines.length) : lines.length;
+    // Array-of-tables is a boundary only, never a slice target.
+    if (entry.header.arrayOfTables) continue;
+    const [top, name] = entry.header.segments;
     if (top !== 'mcp_servers' || name === undefined || !allow.has(name)) continue;
     found.add(name);
-    const end = h + 1 < headers.length ? (headers[h + 1]?.idx ?? lines.length) : lines.length;
     // Trim trailing whitespace/CRLF per line block so the concatenation is stable across newlines.
-    sections.push(lines.slice(header.idx, end).join('\n').replace(/\s+$/, ''));
+    sections.push(lines.slice(entry.idx, end).join('\n').replace(/\s+$/, ''));
   }
   return { block: sections.length > 0 ? `\n${sections.join('\n\n')}\n` : '', found };
 }
 
-// Parse a TOML single-bracket table header (`[a.b."c.d"]`) into its dotted-key segments, honoring
-// bare keys and basic/literal-quoted segments. Returns null for a non-header line or an
-// array-of-tables `[[...]]` header (mcp_servers uses single-bracket tables). Comments and trailing
-// content after the closing `]` are ignored.
-function parseTomlTableHeaderPath(line: string): string[] | null {
+interface TomlTableHeader {
+  readonly segments: string[];
+  readonly arrayOfTables: boolean;
+}
+
+// Parse a TOML table header into its dotted-key segments + whether it is an array-of-tables. Handles
+// BOTH single-bracket `[a.b."c.d"]` and double-bracket `[[a.b]]`, honoring bare keys and
+// basic/literal-quoted segments. Returns null for a non-header line. Comments and trailing content
+// after the closing bracket are ignored. Both bracket forms are boundaries; only single-bracket
+// `mcp_servers.NAME` tables are sliced (an array-of-tables can never be an mcp server section).
+function parseTomlTableHeader(line: string): TomlTableHeader | null {
   const trimmed = line.replace(/^\s+/, '');
-  if (!trimmed.startsWith('[') || trimmed.startsWith('[[')) return null;
+  if (!trimmed.startsWith('[')) return null;
+  const arrayOfTables = trimmed.startsWith('[[');
   let inner = '';
   let inBasic = false;
   let inLiteral = false;
   let closed = false;
-  for (let i = 1; i < trimmed.length; i += 1) {
+  for (let i = arrayOfTables ? 2 : 1; i < trimmed.length; i += 1) {
     const ch = trimmed[i] ?? '';
     if (inBasic) {
       inner += ch;
@@ -1324,11 +1336,15 @@ function parseTomlTableHeaderPath(line: string): string[] | null {
     }
     if (ch === '"') { inBasic = true; inner += ch; continue; }
     if (ch === "'") { inLiteral = true; inner += ch; continue; }
+    // The first unquoted `]` closes the header (for `[[...]]` this is the first of `]]`, which is
+    // sufficient to treat the line as a boundary).
     if (ch === ']') { closed = true; break; }
     inner += ch;
   }
   if (!closed) return null;
-  return splitTomlDottedKey(inner);
+  const segments = splitTomlDottedKey(inner);
+  if (!segments) return null;
+  return { segments, arrayOfTables };
 }
 
 // Split a dotted key path (`a.b."c.d".e`) into segments, honoring quoted segments; null on malformed.
