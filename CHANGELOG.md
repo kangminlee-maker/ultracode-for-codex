@@ -8,6 +8,8 @@ the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-16
+
 ### Added
 
 - **Concurrent nested `workflow()` children** (PG-NEST v2-B): nested children may now run in parallel
