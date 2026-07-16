@@ -63,7 +63,7 @@
     "smoke:live": "node scripts/live-smoke-ultracode-for-codex.mjs",
     "test:e2e:ultracode-for-codex": "node scripts/e2e-installed-ultracode-for-codex.mjs",
     "test:all": "npm test && npm run test:e2e:ultracode-for-codex",
-    "test": "npm run build && npm run verify:runtime-boundary && node --test --test-concurrency=2 test/*.test.mjs",
+    "test": "npm run lint && npm run build && npm run verify:runtime-boundary && node --test --test-concurrency=2 test/*.test.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint src",
     "run": "npm run build && node dist/cli.js run --accept-llm-guide=v1"
