@@ -10,6 +10,27 @@ the project uses [semantic versioning](https://semver.org/).
 
 ### Added
 
+- `workflow.agentTypes` (`--agent-types <disabled|enabled>`): opt-in **per-agent types**
+  (PG-AGENTTYPE). When enabled, `agent(prompt, { agentType: "reviewer" })` resolves a named type
+  from your native Codex registry (`~/.codex/agents/*.toml`, keyed by filename stem) and applies
+  that type's **model**, **model_reasoning_effort**, and **developer_instructions (persona)** to that
+  one agent call — the persona is injected as the subagent's developer instructions with the workflow
+  return-value contract appended last (native-faithful: system prompt + StructuredOutput composed).
+  Explicit `opts.model`/`opts.effort` on the call still win over the type; the type's model/effort are
+  validated through the same normalizers as the per-call opts, so a banned `ultra` effort or the
+  reserved model placeholder in a registry file is rejected at use-time and never reaches dispatch.
+  Registry parsing is **lenient** (unknown keys, `[tables]`, arrays, and non-string scalars are
+  ignored; a file that cannot be parsed is skipped with a stderr note) so an unrelated or
+  evolving-schema file never bricks a run; a script that names a missing/invalid type fails loud.
+  Disabled (the default) leaves `agentType` inert — a script that uses it fails loud — and every other
+  path is **byte-identical** to today (the type name is absent from the call key and journal, and the
+  registry is not read). Because the type name **is** part of the agent call key (unlike the run-level
+  web/file/mcp gates), a typed run **auto-restores** `--agent-types` on resume (scanned from the source
+  journal) rather than requiring you to re-pass it; editing a type's `model`/`model_reasoning_effort`
+  between runs busts that agent's cache like a script edit. `sandbox_mode` and per-type web/MCP are not
+  applied in v1 (writes stay gated by `isolation:'worktree'` + `--agent-file-write`, so a read-only
+  type cannot gain write and a write type cannot bypass the gate). See `docs/ultracode-p10-agent-type.md`.
+
 - `workflow.agentMcp` (`--agent-mcp <server1,server2,...>`): opt-in support for workflow
   subagents to call the user's own **Codex MCP servers**, scoped to a **named allowlist**.
   Empty (the default) provisions no MCP servers into the isolated Codex home and declines

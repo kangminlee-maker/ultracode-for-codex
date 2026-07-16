@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
-import type { AgentConcurrency, AgentFileWrite, AgentMcpServers, AgentWebSearch, NestedWorkflows, ReasoningEffort, Verbosity, WorktreeRetention } from './runtime/types.js';
-import { AGENT_FILE_WRITE_VALUES, AGENT_WEB_SEARCH_VALUES, NESTED_WORKFLOWS_VALUES, REASONING_EFFORTS, WORKTREE_RETENTIONS, isAgentConcurrencyKeyword, isAgentFileWrite, isAgentMcpServerList, isAgentWebSearch, isNestedWorkflows, isReasoningEffort, isWorktreeRetention } from './runtime/types.js';
+import type { AgentConcurrency, AgentFileWrite, AgentMcpServers, AgentTypes, AgentWebSearch, NestedWorkflows, ReasoningEffort, Verbosity, WorktreeRetention } from './runtime/types.js';
+import { AGENT_FILE_WRITE_VALUES, AGENT_TYPES_VALUES, AGENT_WEB_SEARCH_VALUES, NESTED_WORKFLOWS_VALUES, REASONING_EFFORTS, WORKTREE_RETENTIONS, isAgentConcurrencyKeyword, isAgentFileWrite, isAgentMcpServerList, isAgentTypes, isAgentWebSearch, isNestedWorkflows, isReasoningEffort, isWorktreeRetention } from './runtime/types.js';
 
 export { isReasoningEffort };
 
@@ -22,6 +22,7 @@ export interface UltracodeSettings {
     readonly agentWebSearch: AgentWebSearch;
     readonly agentFileWrite: AgentFileWrite;
     readonly agentMcp: AgentMcpServers;
+    readonly agentTypes: AgentTypes;
     readonly background: {
       readonly runDir: string;
       readonly resultFile: string;
@@ -106,6 +107,10 @@ export function loadSettings(): UltracodeSettings {
       agentFileWrite: readAgentFileWriteSetting(
         workflow?.agentFileWrite,
         'workflow.agentFileWrite',
+      ),
+      agentTypes: readAgentTypesSetting(
+        workflow?.agentTypes,
+        'workflow.agentTypes',
       ),
       agentMcp: readAgentMcpSetting(
         workflow?.agentMcp,
@@ -197,6 +202,10 @@ export function workflowDefaultAgentMcpServers(): AgentMcpServers {
   return loadSettings().workflow.agentMcp;
 }
 
+export function workflowDefaultAgentTypes(): AgentTypes {
+  return loadSettings().workflow.agentTypes;
+}
+
 export function workflowBackgroundDefaults(): UltracodeSettings['workflow']['background'] {
   return loadSettings().workflow.background;
 }
@@ -284,6 +293,15 @@ function readAgentFileWriteSetting(
   if (value === undefined) return 'disabled';
   if (isAgentFileWrite(value)) return value;
   throw new Error(`${key} must be one of ${AGENT_FILE_WRITE_VALUES.join(', ')}.`);
+}
+
+function readAgentTypesSetting(
+  value: unknown,
+  key: string,
+): AgentTypes {
+  if (value === undefined) return 'disabled';
+  if (isAgentTypes(value)) return value;
+  throw new Error(`${key} must be one of ${AGENT_TYPES_VALUES.join(', ')}.`);
 }
 
 function readAgentMcpSetting(

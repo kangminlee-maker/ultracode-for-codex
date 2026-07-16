@@ -86,6 +86,30 @@ export function isAgentMcpServerList(value: unknown): value is string[] {
   return Array.isArray(value) && value.every(isAgentMcpServerName);
 }
 
+// Gate for resolving a per-agent type from the user's native Codex agent registry
+// (`~/.codex/agents/*.toml`). `disabled` (the current default) leaves `agent(prompt, {agentType})`
+// inert — a script that uses it fails loud — byte-identical to today. `enabled` loads the registry
+// and applies a named type's model + reasoning effort + persona (developer_instructions) to that one
+// agent call. Per-agent (unlike the run-level web/file/mcp gates): the type name is part of the agent
+// call key, so a typed resume auto-restores this gate (it is not re-typed on resume).
+export type AgentTypes = 'disabled' | 'enabled';
+export const AGENT_TYPES_VALUES: readonly AgentTypes[] = ['disabled', 'enabled'];
+export function isAgentTypes(value: unknown): value is AgentTypes {
+  return typeof value === 'string' && (AGENT_TYPES_VALUES as readonly string[]).includes(value);
+}
+
+// Backend-neutral resolution of one named agent type. The Codex-specific registry location and TOML
+// parsing live in `codex/agent-type-registry.ts`; the runtime consumes only this projection. `model`
+// and `effort` are the raw registry strings (validated at use-time through the same normalizers as
+// the per-call opts, so a banned `ultra` effort or the reserved model placeholder cannot slip in);
+// `developerInstructions` is the persona injected into the subagent thread.
+export interface ResolvedAgentType {
+  readonly name: string;
+  readonly model?: string;
+  readonly effort?: string;
+  readonly developerInstructions?: string;
+}
+
 // Backend model name used when no run-level model is configured. It is a
 // projection placeholder, never a real Codex model id.
 export const SUBAGENT_MODEL_PLACEHOLDER = 'codex-subagent';
@@ -116,6 +140,10 @@ export interface SubagentRequest {
   readonly tools: readonly SubagentTool[];
   readonly toolChoice: SubagentToolChoice;
   readonly worktreePath?: string;
+  // Per-agent persona resolved from an agent type (PG-AGENTTYPE). When present, the backend injects it
+  // as the thread's developer instructions and appends the workflow return-value contract; absent →
+  // the backend's fixed instructions (byte-identical to pre-agent-type behavior).
+  readonly developerInstructions?: string;
   readonly raw?: unknown;
 }
 

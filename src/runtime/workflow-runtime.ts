@@ -5,7 +5,7 @@ import { availableParallelism, homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { createContext, runInContext } from 'node:vm';
-import type { AgentConcurrency, NestedWorkflows, ReasoningEffort, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
+import type { AgentConcurrency, NestedWorkflows, ReasoningEffort, ResolvedAgentType, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
 import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort, isSubagentFailure } from './types.js';
 import { AgentConcurrencyPool } from './agent-concurrency-pool.js';
 import {
@@ -417,6 +417,11 @@ interface WorkflowTaskRegistryOptions {
   // Gate for nested workflow() calls. Omitted or 'disabled' keeps the throwing stub
   // (current behavior); 'enabled' lets a workflow run built-in/inline children inline.
   readonly nestedWorkflows?: NestedWorkflows;
+  // Resolved agent-type registry (PG-AGENTTYPE). Omitted/empty leaves `agent({agentType})` inert:
+  // a script that uses it fails loud. When present (the CLI loads it only under --agent-types),
+  // runAgent resolves a named type's model/effort/persona for that one call. The map is keyed by the
+  // native filename stem; the runtime consumes only this backend-neutral projection.
+  readonly agentTypes?: ReadonlyMap<string, ResolvedAgentType>;
   readonly userWorkflowDirs?: readonly string[];
   readonly pluginWorkflows?: readonly WorkflowPluginRegistry[];
   readonly builtinWorkflows?: readonly BuiltinWorkflow[];
@@ -512,6 +517,10 @@ interface WorkflowResumeSourceInfo {
   readonly model?: string;
   readonly workspaceFingerprint?: string;
   readonly completedAgentCount: number;
+  // True when the source run dispatched at least one agent with an agentType (PG-AGENTTYPE). The CLI
+  // uses it to auto-enable --agent-types on resume, so a typed run replays without re-typing the flag
+  // (the type name is in the call key, unlike the run-level web/file/mcp gates).
+  readonly usesAgentTypes: boolean;
 }
 
 interface DurableWorkflowResultRecord {
@@ -565,6 +574,7 @@ interface AgentOptions {
   readonly phase?: string;
   readonly schema?: unknown;
   readonly isolation?: unknown;
+  readonly agentType?: unknown;
 }
 
 const MAX_SCRIPT_BYTES = 64 * 1024;
@@ -2948,6 +2958,27 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     );
   }
 
+  // Resolve an `agent({agentType})` selection (PG-AGENTTYPE). Undefined selection → undefined (no
+  // type). A selection with no registry (gate off) or an unknown name fails loud before any spend.
+  // The value is a lookup token into the filename-stem-keyed map, never a constructed path.
+  private resolveAgentType(raw: unknown): ResolvedAgentType | undefined {
+    if (raw === undefined || raw === null) return undefined;
+    if (typeof raw !== 'string' || raw.trim() === '') {
+      throw workflowInputError('agent agentType must be a non-empty string.');
+    }
+    const name = raw.trim();
+    const registry = this.options.agentTypes;
+    if (!registry) {
+      throw workflowInputError(`agent type "${name}" requires agent types to be enabled (--agent-types).`);
+    }
+    const resolved = registry.get(name);
+    if (!resolved) {
+      const known = [...registry.keys()].sort().join(', ');
+      throw workflowInputError(`unknown agent type "${name}"${known ? `; known types: ${known}` : ' (no agent types found in ~/.codex/agents)'}.`);
+    }
+    return resolved;
+  }
+
   private async runAgentInner(
     ctx: WorkflowRunContext,
     prompt: unknown,
@@ -2971,10 +3002,19 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     const schema = normalizeStructuredOutputSchema(options?.schema);
     const isolation = normalizeAgentIsolation(options?.isolation);
     const logicalKey = normalizeAgentLogicalKey(options?.key);
+    // Resolve an agent type (PG-AGENTTYPE) before model/effort so its values slot into the precedence
+    // below. Explicit opts win over the type; the type's model/effort are validated through the SAME
+    // normalizers as opts (use-time only — an unused exotic type never runs, so a banned `ultra`
+    // effort or the reserved placeholder cannot slip past the accounting boundary).
+    const resolvedType = this.resolveAgentType(options?.agentType);
     const effort = normalizeAgentEffort(options?.effort)
+      ?? normalizeAgentTypeEffort(resolvedType)
       ?? this.options.defaultReasoningEffort
       ?? 'xhigh';
-    const model = normalizeAgentModel(options?.model) ?? ctx.model;
+    const model = normalizeAgentModel(options?.model)
+      ?? normalizeAgentTypeModel(resolvedType)
+      ?? ctx.model;
+    const developerInstructions = resolvedType?.developerInstructions;
     if (logicalKey) {
       // A repeated logical key would produce duplicate agent call keys, which
       // poisons the whole journal as a resume source; fail before any spend.
@@ -2994,6 +3034,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       effort,
       schema,
       isolation,
+      agentType: resolvedType?.name,
       logicalKey,
     });
     const previousAgentCallKey = ctx.previousAgentCallKey;
@@ -3077,6 +3118,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         isolation,
         model,
         effort,
+        developerInstructions,
         onWorktreeFinalized: recordWorktreeFinalization,
       });
       const result = attempt.result;
@@ -3233,6 +3275,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       readonly isolation?: 'worktree';
       readonly model: string;
       readonly effort: ReasoningEffort;
+      readonly developerInstructions?: string;
       readonly onWorktreeFinalized: (finalization: WorkflowAgentWorktreeFinalization) => void;
     },
   ): Promise<WorkflowAgentAttemptOutcome> {
@@ -3250,6 +3293,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
           prompt: input.prompt,
           schema: input.schema,
           worktreePath: worktree?.path,
+          developerInstructions: input.developerInstructions,
         }));
         const worktreeFinalization = worktree
           ? await this.finalizeAgentWorktree(worktree, true)
@@ -3868,6 +3912,28 @@ function normalizeAgentModel(value: unknown): string | undefined {
     throw workflowInputError(`agent model must not be the reserved backend placeholder "${SUBAGENT_MODEL_PLACEHOLDER}".`);
   }
   return value;
+}
+
+// Validate a resolved agent type's `model_reasoning_effort` at use-time (only reached when opts.effort
+// did not override). Reuses the same allowlist as opts so the ultra-ban holds for registry files too.
+function normalizeAgentTypeEffort(resolved: ResolvedAgentType | undefined): ReasoningEffort | undefined {
+  if (resolved?.effort === undefined) return undefined;
+  if (!isReasoningEffort(resolved.effort)) {
+    throw workflowInputError(`agent type "${resolved.name}" has unsupported model_reasoning_effort "${resolved.effort}"; use one of none, minimal, low, medium, high, xhigh, max.`);
+  }
+  return resolved.effort;
+}
+
+// Validate a resolved agent type's `model` at use-time (only reached when opts.model did not override).
+function normalizeAgentTypeModel(resolved: ResolvedAgentType | undefined): string | undefined {
+  if (resolved?.model === undefined) return undefined;
+  if (typeof resolved.model !== 'string' || resolved.model.trim() === '') {
+    throw workflowInputError(`agent type "${resolved.name}" has an empty model.`);
+  }
+  if (resolved.model === SUBAGENT_MODEL_PLACEHOLDER) {
+    throw workflowInputError(`agent type "${resolved.name}" model must not be the reserved backend placeholder "${SUBAGENT_MODEL_PLACEHOLDER}".`);
+  }
+  return resolved.model;
 }
 
 function takeResumeCacheHit(
@@ -6210,6 +6276,7 @@ function agentRequest(input: {
   readonly prompt: string;
   readonly schema?: Record<string, unknown>;
   readonly worktreePath?: string;
+  readonly developerInstructions?: string;
 }): SubagentRequest {
   const tools = input.schema ? [{
     name: STRUCTURED_OUTPUT_TOOL_NAME,
@@ -6234,6 +6301,7 @@ function agentRequest(input: {
     tools,
     toolChoice: input.schema ? { type: 'required' } : { type: 'auto' },
     ...(input.worktreePath ? { worktreePath: input.worktreePath } : {}),
+    ...(input.developerInstructions ? { developerInstructions: input.developerInstructions } : {}),
     raw: {
       localWorkflowAgent: true,
       ...(input.schema ? { structuredOutput: true } : {}),
@@ -6702,6 +6770,7 @@ function workflowAgentSemanticOpts(input: {
   readonly effort: string;
   readonly schema?: Record<string, unknown>;
   readonly isolation?: AgentIsolation;
+  readonly agentType?: string;
   readonly logicalKey?: string;
 }): WorkflowAgentSemanticOpts {
   return {
@@ -6709,6 +6778,9 @@ function workflowAgentSemanticOpts(input: {
     model: input.model,
     effort: input.effort,
     ...(input.isolation ? { isolation: input.isolation } : {}),
+    // Conditional-spread keeps agentType absent when unused, so the call key + journal are
+    // byte-identical to pre-agent-type runs. The name (not the persona) carries the type identity.
+    ...(input.agentType ? { agentType: input.agentType } : {}),
     ...(input.logicalKey ? { logicalKey: input.logicalKey } : {}),
   };
 }
@@ -6849,6 +6921,9 @@ function workflowResumeSourceInfoFromJournal(
 ): WorkflowResumeSourceInfo {
   const terminal = sourceJournal.terminal;
   const runtime = sourceJournal.started.runtime;
+  const usesAgentTypes = sourceJournal.entries.some(
+    (entry) => entry.kind === 'workflow.agent.started' && Boolean(entry.semanticOpts?.agentType),
+  );
   return {
     runId,
     terminal: terminal ? (terminal.kind === 'workflow.run.completed' ? 'completed' : 'failed') : 'interrupted',
@@ -6856,6 +6931,7 @@ function workflowResumeSourceInfoFromJournal(
     ...(runtime.model ? { model: runtime.model } : {}),
     ...(runtime.workspaceFingerprint ? { workspaceFingerprint: runtime.workspaceFingerprint } : {}),
     completedAgentCount,
+    usesAgentTypes,
   };
 }
 
