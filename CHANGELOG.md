@@ -10,6 +10,19 @@ the project uses [semantic versioning](https://semver.org/).
 
 ### Added
 
+- Nested `workflow()` **full-scope name sources** (PG-NEST v2-A): a nested `workflow(name)` now
+  resolves a **project / user / plugin** workflow (same project→user→plugin→built-in precedence as a
+  top-level launch), not just a built-in. A nested child from a permission-required source is gated by
+  the existing permission **record**: it runs only if you have already approved that exact workflow
+  (source + path + name + content hash), else it **fails loud** (catchably) — a nested call cannot
+  prompt for approval mid-run, so it never silently runs unreviewed content. A child cannot exceed the
+  parent run's approved isolation review (no authority widening). `{ scriptPath }` nesting remains
+  deferred (a scriptPath ref is confined to runtime-owned scripts whose records live under their
+  original source, so it has no clean gate). Still one-level, still sequential (concurrent nesting is a
+  separate follow-on), still behind the default-off `--nested-workflows` gate — with it off, behavior
+  is byte-identical. Note: a built-in name now shadowed by a same-named saved workflow resolves to the
+  saved (gated) source, matching top-level semantics. See `docs/ultracode-p11-nested-full-scope.md`.
+
 - `workflow.agentTypes` (`--agent-types <disabled|enabled>`): opt-in **per-agent types**
   (PG-AGENTTYPE). When enabled, `agent(prompt, { agentType: "reviewer" })` resolves a named type
   from your native Codex registry (`~/.codex/agents/*.toml`, keyed by filename stem) and applies
