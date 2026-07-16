@@ -1,10 +1,10 @@
 name: CI
 
 # Runs the repository's standard checks on every push to main and every pull request:
-# typecheck + lint (eslint over src) + test:all (= build -> verify:runtime-boundary ->
-# node --test unit tests -> packaged installed E2E against the fake Codex app-server). The
-# E2E uses a bundled fake backend, so no Codex auth or network is required. `smoke:live` is
-# intentionally excluded (it needs a real backend).
+# typecheck + test:all. `test:all` now begins with lint (eslint over src) via `npm test`, then
+# build -> verify:runtime-boundary -> node --test unit tests -> packaged installed E2E against
+# the fake Codex app-server. The E2E uses a bundled fake backend, so no Codex auth or network is
+# required. `smoke:live` is intentionally excluded (it needs a real backend).
 
 on:
   push:
@@ -35,7 +35,5 @@ jobs:
       - run: npm ci
       - name: Typecheck
         run: npm run typecheck
-      - name: Lint
-        run: npm run lint
-      - name: Build, runtime-boundary, unit tests, and installed E2E
+      - name: Lint, build, runtime-boundary, unit tests, and installed E2E
         run: npm run test:all
