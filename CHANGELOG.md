@@ -8,6 +8,8 @@ the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-18
+
 ### Fixed
 
 - A run no longer aborts with `workflow_journal_write_failed` ("before agent start") when an agent's
