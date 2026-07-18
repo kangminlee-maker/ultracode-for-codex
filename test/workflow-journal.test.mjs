@@ -3,16 +3,38 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { createHash } from 'node:crypto';
 import {
   WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
   WorkflowJournalValidationError,
   WorkflowJournalWriter,
+  boundJournalAuditString,
   computeWorkflowAgentCallKey,
   readWorkflowJournal,
   stableJson,
   workflowJournalHash,
   workflowJournalPath,
 } from '../dist/runtime/workflow-journal.js';
+
+test('boundJournalAuditString passes small strings through and truncates oversized ones with a correlatable marker', () => {
+  const small = 'a short audit string';
+  assert.equal(boundJournalAuditString(small), small, 'strings within the cap are byte-identical');
+
+  // A ~490KiB prompt (like the real per-agent prompts) is still under the 512KiB cap → unchanged.
+  const nearCap = 'x'.repeat(490 * 1024);
+  assert.equal(boundJournalAuditString(nearCap), nearCap, 'a near-cap string is preserved in full');
+
+  // A prompt over the 512KiB cap (the coloso synthesis case) is truncated, not rejected.
+  const huge = 'y'.repeat(600 * 1024);
+  const bounded = boundJournalAuditString(huge);
+  assert.ok(Buffer.byteLength(bounded, 'utf8') < Buffer.byteLength(huge, 'utf8'), 'oversized string is shrunk');
+  assert.ok(Buffer.byteLength(bounded, 'utf8') <= 512 * 1024, 'bounded string fits under MAX_STRING_BYTES');
+  assert.match(bounded, /truncated in journal/);
+  // The marker carries the true byte length and a sha256 of the FULL value for audit correlation.
+  assert.match(bounded, new RegExp(`${600 * 1024} bytes total`));
+  assert.match(bounded, new RegExp(`sha256=${createHash('sha256').update(huge).digest('hex')}`));
+  assert.ok(bounded.startsWith('y'.repeat(1024)), 'the head of the original is preserved as a preview');
+});
 
 test('workflow journal stableJson sorts object keys and rejects nondeterministic values', () => {
   assert.equal(stableJson({ z: 1, a: [true, { b: 'x', a: null }] }), '{"a":[true,{"a":null,"b":"x"}],"z":1}');

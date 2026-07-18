@@ -14,6 +14,7 @@ import {
   WorkflowJournalError,
   WorkflowJournalValidationError,
   WorkflowJournalWriter,
+  boundJournalAuditString,
   computeWorkflowAgentCallKey,
   isWorkflowJournalError,
   normalizeJournalJsonValue,
@@ -3069,6 +3070,11 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     ctx.previousAgentCallKey = agentCallKey;
     const label = options?.label ?? preview(prompt, 48);
     const phase = options?.phase ?? ctx.currentPhase;
+    // The agent receives the full prompt (dispatch below); the journal keeps an audit copy bounded so
+    // an oversized prompt can never abort the run. agentCallKey is already computed from the full
+    // prompt, and resume recomputes it from the live prompt — never from this stored text. When
+    // bounded, the entry is marked so journal validation skips the prompt-vs-key re-derivation.
+    const journaledPrompt = boundJournalAuditString(prompt);
     try {
       await ctx.task.journal.append({
         kind: 'workflow.agent.started',
@@ -3076,7 +3082,8 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         agentId,
         previousAgentCallKey,
         agentCallKey,
-        prompt,
+        prompt: journaledPrompt,
+        ...(journaledPrompt !== prompt ? { promptBounded: true } : {}),
         semanticOpts,
       });
     } catch (err) {

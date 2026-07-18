@@ -288,6 +288,48 @@ test('isRetryableFailureReason classifies transient reasons retryable and determ
   }
 });
 
+test('an oversized agent prompt no longer aborts the run: full prompt dispatched, journal copy bounded, resume intact (coloso journal-write regression)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend });
+  try {
+    // 600KiB prompt > the journal's 512KiB MAX_STRING_BYTES cap — the exact shape that killed the
+    // coloso synthesis agent with workflow_journal_write_failed "before agent start". A STRUCTURED
+    // agent mirrors the real synthesis case: a huge aggregating prompt but a small structured result
+    // (results stay load-bearing and capped; only the audit prompt is bounded).
+    const schema = '{ type: "object", additionalProperties: false, properties: { detail: { type: "string" }, count: { type: "number" } }, required: ["detail", "count"] }';
+    const launch = await runtime.launch({
+      script: `export const meta = { name: "big-prompt" };\nconst big = "z".repeat(600 * 1024);\nreturn await agent(big, { schema: ${schema} });`,
+    });
+    const events = await collectEvents(runtime, launch.taskId);
+    // The run COMPLETES rather than failing with workflow_journal_write_failed.
+    assert.equal(events.at(-1).type, 'workflow.completed', runtime.get(launch.taskId).error);
+    assert.equal(runtime.get(launch.taskId).status, 'completed');
+
+    // The FULL prompt reached the backend — only the journaled copy is bounded, not the dispatch.
+    assert.equal(backend.requests.length, 1);
+    assert.equal(backend.requests[0].messages[0].content.length, 600 * 1024);
+
+    // The journaled started-entry prompt is truncated (marker present) and safely under the cap.
+    const snapshot = runtime.get(launch.taskId);
+    const journal = await readWorkflowJournal(workflowJournalPath(snapshot.transcriptDir));
+    const started = journal.entries.find((e) => e.kind === 'workflow.agent.started');
+    assert.match(started.prompt, /truncated in journal/);
+    assert.ok(Buffer.byteLength(started.prompt, 'utf8') <= 512 * 1024);
+
+    // Resume works despite the truncated journaled prompt: the call key was computed from the live
+    // full prompt, so the resumed agent is a cache hit with no re-dispatch.
+    const resumed = await runtime.launch({ resumeFromRunId: snapshot.runId });
+    const resumedEvents = await collectEvents(runtime, resumed.taskId);
+    assert.equal(resumedEvents.at(-1).type, 'workflow.completed');
+    const completions = resumedEvents.filter((e) => e.type === 'workflow.agent.completed');
+    assert.equal(completions.length, 1);
+    assert.equal(completions[0].cached, true, 'resumed oversized-prompt agent is a cache hit');
+    assert.equal(backend.requests.length, 1, 'no re-dispatch on resume');
+  } finally {
+    await runtime.close();
+  }
+});
+
 test('workflow agents reject invalid effort and model values before spending tokens', async () => {
   const backend = new FakeSubagentBackend();
   const { runtime } = await createRuntime({ backend });
