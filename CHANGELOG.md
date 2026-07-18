@@ -20,6 +20,15 @@ the project uses [semantic versioning](https://semver.org/).
   the call key from the live prompt (never from the stored copy), so the call-key value and cache
   identity are byte-identical. Load-bearing strings (results, keys) remain exact and capped.
 
+- The workspace context's `### Git Status` section is now byte-bounded (~32 KiB, keeping the leading
+  material entries + an omitted-count note). Previously only the included-file blocks respected the
+  context byte cap, so a repo with a large `git status --untracked-files=all` (many untracked files)
+  produced a status list of hundreds of KiB embedded into **every** agent prompt — the dominant driver
+  (384 of 461 KiB in the observed coloso run) of prompts that ballooned toward model/journal limits and
+  inflated cost. Complements the journal audit-bound above: the journal no longer dies on a big prompt,
+  and prompts no longer balloon at the source. The evidence-ref list that `code-review` validates is
+  unaffected (it comes from the separate change-evidence section, which was already diff-bounded).
+
 ## [0.6.0] - 2026-07-16
 
 ### Added
