@@ -1461,6 +1461,43 @@ return await workspaceContext({
   }
 });
 
+test('workspaceContext bounds a huge git-status list so it cannot balloon every agent prompt (coloso scale fix)', async () => {
+  const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend() });
+  const oldPath = process.env.PATH;
+  try {
+    await initializeGitRepo(root);
+    // Emit a 5000-entry `git status --short` (~140KiB) — the coloso shape: many untracked files.
+    await withFakeGit(root, `
+if (args[0] === 'status' && args.includes('--short')) {
+  let out = '';
+  for (let i = 0; i < 5000; i += 1) out += '?? untracked-file-' + i + '.txt\\n';
+  process.stdout.write(out);
+  process.exit(0);
+}
+`);
+    const launch = await runtime.launch({
+      script: 'export const meta = { name: "status-bound" };\nreturn await workspaceContext({ query: "scale" });',
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed', snapshot.error);
+
+    // The Git Status section is bounded, not the full 140KiB.
+    const ctx = snapshot.result;
+    const statusStart = ctx.indexOf('### Git Status');
+    const statusEnd = ctx.indexOf('### Included Files');
+    const statusSection = ctx.slice(statusStart, statusEnd);
+    assert.match(statusSection, /more status entries omitted/);
+    assert.ok(Buffer.byteLength(statusSection, 'utf8') <= 40 * 1024, `status section should be bounded, got ${Buffer.byteLength(statusSection, 'utf8')} bytes`);
+    // The leading (material) entries are preserved; the tail is dropped.
+    assert.match(statusSection, /untracked-file-0\.txt/);
+    assert.doesNotMatch(statusSection, /untracked-file-4999\.txt/);
+  } finally {
+    process.env.PATH = oldPath;
+    await runtime.close();
+  }
+});
+
 test('workspaceContext fallback git status rejects leading control-character paths', async () => {
   const { runtime, root } = await createRuntime({ backend: new FakeSubagentBackend() });
   const oldPath = process.env.PATH;

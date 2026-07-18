@@ -599,6 +599,11 @@ const DEFAULT_AGENT_STALL_RETRY_LIMIT = 5;
 const DEFAULT_WORKSPACE_CONTEXT_MAX_FILES = 24;
 const DEFAULT_WORKSPACE_CONTEXT_MAX_FILE_BYTES = 12_000;
 const DEFAULT_WORKSPACE_CONTEXT_MAX_BYTES = 80_000;
+// Byte budget for the `### Git Status` section of the workspace context. Unlike the included-file
+// blocks (bounded by maxBytes), the status list was previously unbounded — a repo with many untracked
+// files (e.g. a large `git status --untracked-files=all`) could produce hundreds of KiB embedded into
+// EVERY agent prompt, ballooning prompts and, before the journal audit-bound, aborting the run.
+const WORKSPACE_CONTEXT_STATUS_MAX_BYTES = 32 * 1024;
 const DEFAULT_WORKSPACE_CONTEXT_MAX_DIFF_BYTES = 60_000;
 const execFileAsync = promisify(execFile);
 const PROJECT_WORKFLOW_DIRS = ['.codex/workflows'];
@@ -4032,7 +4037,7 @@ async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptio
   }
   const gitStatus = statusUnavailableEvidence.length
     ? `(unavailable: ${statusUnavailableEvidence[0]})`
-    : formatGitStatusDisplay(gitStatusRaw, runtimeStateExcludedPaths);
+    : boundWorkspaceStatusDisplay(formatGitStatusDisplay(gitStatusRaw, runtimeStateExcludedPaths));
   const gitStatusPaths = await gitOutputRaw(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.']).catch((err) => {
     statusUnavailableEvidence.push(`unavailable:git-status-raw:${gitFailureToken(err)}`);
     return gitStatusRaw;
@@ -4518,6 +4523,24 @@ function parseGitStatusPathsZ(
     }
   }
   return { paths, excludedPaths, unavailableEvidence };
+}
+
+// Bound the `### Git Status` display to a byte budget, keeping whole leading lines (git lists staged
+// and modified entries before untracked ones, so the material changes are preserved) and appending a
+// count of omitted entries. Prevents a huge untracked-file list from ballooning every agent prompt.
+function boundWorkspaceStatusDisplay(status: string): string {
+  if (Buffer.byteLength(status, 'utf8') <= WORKSPACE_CONTEXT_STATUS_MAX_BYTES) return status;
+  const lines = status.split('\n');
+  const kept: string[] = [];
+  let usedBytes = 0;
+  for (const line of lines) {
+    const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
+    if (usedBytes + lineBytes > WORKSPACE_CONTEXT_STATUS_MAX_BYTES) break;
+    kept.push(line);
+    usedBytes += lineBytes;
+  }
+  const omitted = lines.length - kept.length;
+  return `${kept.join('\n')}\n(… ${omitted} more status ${omitted === 1 ? 'entry' : 'entries'} omitted to bound the workspace context; run \`git status\` locally for the full list)`;
 }
 
 function formatGitStatusDisplay(
