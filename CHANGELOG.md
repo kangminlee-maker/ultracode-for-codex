@@ -8,6 +8,18 @@ the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A run no longer aborts with `workflow_journal_write_failed` ("before agent start") when an agent's
+  prompt exceeds the journal's 512 KiB per-string cap. This bit large-input `task`/`code-review` runs
+  at the aggregating synthesis agent, whose prompt (all prior evidence + findings) crossed the cap —
+  deterministically, so retries and the `--name task` path recurred. The journal now stores an
+  **audit-bounded** copy of an oversized prompt (head preview + total byte length + sha256 of the full
+  prompt) and marks the entry `promptBounded`; validation skips the prompt-vs-key re-derivation for such
+  entries. Correctness is unchanged: the agent still receives the **full** prompt, and resume recomputes
+  the call key from the live prompt (never from the stored copy), so the call-key value and cache
+  identity are byte-identical. Load-bearing strings (results, keys) remain exact and capped.
+
 ## [0.6.0] - 2026-07-16
 
 ### Added

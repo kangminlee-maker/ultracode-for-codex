@@ -61,6 +61,11 @@ export interface WorkflowAgentStartedEntry extends WorkflowJournalEntryEnvelope 
   readonly agentCallKey: string;
   readonly previousAgentCallKey: string;
   readonly prompt: string;
+  // True when `prompt` is a bounded audit preview of an oversized prompt (see boundJournalAuditString),
+  // not the verbatim prompt. The agentCallKey was still derived from the FULL prompt, so validation
+  // skips the prompt-vs-key re-derivation cross-check for such entries (the key stays hash-chain
+  // protected, and resume recomputes it from the live prompt).
+  readonly promptBounded?: boolean;
   readonly semanticOpts: WorkflowAgentSemanticOpts;
 }
 
@@ -277,6 +282,7 @@ const ENTRY_KEYS: Record<WorkflowJournalEntry['kind'], readonly string[]> = {
     'agentCallKey',
     'previousAgentCallKey',
     'prompt',
+    'promptBounded',
     'semanticOpts',
   ],
   'workflow.agent.completed': [
@@ -463,13 +469,18 @@ function validateWorkflowJournal(entries: readonly WorkflowJournalEntry[]): void
       if (entry.previousAgentCallKey !== expectedAgentPreviousKey) {
         throw new WorkflowJournalValidationError(`agent call key chain mismatch at seq ${entry.seq}.`);
       }
-      const expectedAgentCallKey = computeWorkflowAgentCallKey({
-        previousAgentCallKey: entry.previousAgentCallKey,
-        prompt: entry.prompt,
-        semanticOpts: entry.semanticOpts,
-      });
-      if (entry.agentCallKey !== expectedAgentCallKey) {
-        throw new WorkflowJournalValidationError(`agent call key derivation mismatch at seq ${entry.seq}.`);
+      // A bounded prompt is a truncated audit preview, so it cannot reproduce the key that was
+      // derived from the full prompt; skip the prompt-vs-key cross-check for it. The agentCallKey is
+      // still chain-verified above (previousAgentCallKey) and covered by the entry hash.
+      if (!entry.promptBounded) {
+        const expectedAgentCallKey = computeWorkflowAgentCallKey({
+          previousAgentCallKey: entry.previousAgentCallKey,
+          prompt: entry.prompt,
+          semanticOpts: entry.semanticOpts,
+        });
+        if (entry.agentCallKey !== expectedAgentCallKey) {
+          throw new WorkflowJournalValidationError(`agent call key derivation mismatch at seq ${entry.seq}.`);
+        }
       }
       if (agentCallKeys.has(entry.agentCallKey)) {
         throw new WorkflowJournalValidationError(`duplicate agentCallKey at seq ${entry.seq}.`);
@@ -558,6 +569,7 @@ function assertAgentStarted(record: Record<string, unknown>): void {
   assertAgentCommon(record);
   if (!isHash(record.previousAgentCallKey)) throw new WorkflowJournalValidationError('previousAgentCallKey must be sha256 hex.');
   if (typeof record.prompt !== 'string' || record.prompt.trim() === '') throw new WorkflowJournalValidationError('prompt must be a non-empty string.');
+  if (record.promptBounded !== undefined && typeof record.promptBounded !== 'boolean') throw new WorkflowJournalValidationError('promptBounded must be a boolean.');
   assertWorkflowAgentSemanticOpts(record.semanticOpts);
 }
 
@@ -810,4 +822,21 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
+}
+
+// Head-preview size kept when an audit-only string is bounded. Small (audit convenience only) and
+// far under MAX_STRING_BYTES so the surrounding entry can never approach the line cap.
+const JOURNAL_AUDIT_PREVIEW_BYTES = 16 * 1024;
+
+// Bound an AUDIT-only journal string (currently an agent prompt) so an oversized value can never make
+// an entry exceed MAX_STRING_BYTES and abort an otherwise-healthy run. This is NOT for load-bearing
+// strings (results, keys, hashes) — those must stay exact and remain capped. Correctness is preserved:
+// the agent receives the full prompt (this only shapes the journaled copy), and resume recomputes the
+// agentCallKey from the live prompt, never from this stored text. When truncated, the journal keeps a
+// head preview + the full byte length + a sha256 of the full value for audit correlation.
+export function boundJournalAuditString(value: string): string {
+  if (Buffer.byteLength(value, 'utf8') <= MAX_STRING_BYTES) return value;
+  const totalBytes = Buffer.byteLength(value, 'utf8');
+  const head = Buffer.from(value, 'utf8').subarray(0, JOURNAL_AUDIT_PREVIEW_BYTES).toString('utf8');
+  return `${head}\n\n[ultracode: prompt truncated in journal — ${totalBytes} bytes total, sha256=${sha256(value)}; the full prompt was sent to the agent]`;
 }
