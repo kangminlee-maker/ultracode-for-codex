@@ -36,8 +36,14 @@ the project uses [semantic versioning](https://semver.org/).
   into the built-in script text, so the two policies have different script hashes and are
   distinguishable in run records. Built-in workflows are not permission-gated, so a policy
   switch is not confirmed by a prompt — a non-default policy is announced on stderr at
-  launch instead. Resume-cache reuse is not yet bound to the policy; see the known-gaps
-  note below.
+  launch instead. A resume whose source run executed a built-in under a different ref
+  policy is refused, because the source's cached agent results carry different failure
+  semantics and the agent call keys do not record the policy.
+- A resumed built-in is validated against its request contract. Resume hands back the
+  persisted script path, so a resumed run classifies as `script_path`; the built-in
+  identity is now recovered from the run's journal (workflow name + script hash) and the
+  contract applied, closing a hole where a resumed review accepted a mistyped `--args`
+  key or an unsupported `level` and silently ran the script's fallback.
 - Evidence context discloses `#### Dropped From Evidence` (paths the reviewer can see
   in git status but may not cite) and `#### Evidence Ref Grammar`.
 

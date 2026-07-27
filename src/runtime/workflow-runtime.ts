@@ -6,7 +6,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import { promisify } from 'node:util';
 import { createContext, runInContext } from 'node:vm';
 import type { AgentConcurrency, EvidenceScope, NestedWorkflows, ReasoningEffort, RefPolicy, ResolvedAgentType, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
-import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort, isSubagentFailure } from './types.js';
+import { REF_POLICY_VALUES, SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort, isSubagentFailure } from './types.js';
 import { AgentConcurrencyPool } from './agent-concurrency-pool.js';
 import {
   WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
@@ -776,6 +776,33 @@ return await parallel(prompts.map((prompt, index) => () => agent(
 const BUILTIN_WORKFLOWS_BY_REF_POLICY = new Map<RefPolicy, readonly BuiltinWorkflow[]>([
   ['strict', DEFAULT_BUILTIN_WORKFLOWS],
 ]);
+
+// Which built-in a resumed run came from, and — only for a built-in whose script actually varies by
+// ref policy — which policy produced it. Resume classifies a source run as `script_path`
+// (prepareResumePlan hands back the persisted scriptPath), so without this the built-in's request
+// contract and its policy binding are both lost. `policy` stays undefined for a built-in that
+// generates the same script under every policy (task, batch); reporting one there would flag every
+// cross-policy resume of those as a mismatch that does not exist.
+interface BuiltinResumeIdentity {
+  readonly name: string;
+  readonly policy?: RefPolicy;
+}
+
+function builtinResumeIdentity(
+  name: string | undefined,
+  matchesScript: (script: string) => boolean,
+): BuiltinResumeIdentity | undefined {
+  if (!name) return undefined;
+  const variants: { readonly policy: RefPolicy; readonly script: string }[] = [];
+  for (const policy of REF_POLICY_VALUES) {
+    const workflow = defaultBuiltinWorkflows(policy).find((entry) => entry.name === name);
+    if (workflow) variants.push({ policy, script: workflow.script });
+  }
+  const matched = variants.find((variant) => matchesScript(variant.script));
+  if (!matched) return undefined;
+  const policySensitive = variants.some((variant) => variant.script !== variants[0].script);
+  return policySensitive ? { name, policy: matched.policy } : { name };
+}
 
 function defaultBuiltinWorkflows(refPolicy: RefPolicy): readonly BuiltinWorkflow[] {
   const cached = BUILTIN_WORKFLOWS_BY_REF_POLICY.get(refPolicy);
@@ -2156,9 +2183,10 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     // Before the permission gate and before any journal or spend: a built-in's request contract is
     // decidable from the args alone, so reject an unreadable request loudly here instead of letting
     // the script's silent fallbacks run someone else's review.
-    if (resolved.workflowSource === 'built_in' && resolved.name) {
+    const builtinContractName = await this.resumeAwareBuiltinContractName(resolved, resumePlan);
+    if (builtinContractName) {
       await validateBuiltinRequestArgs(
-        resolved.name,
+        builtinContractName,
         resumePlan.launchInput.args,
         this.options.cwd ?? process.cwd(),
       );
@@ -2413,6 +2441,47 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       .length;
     const { workspaceFingerprint: _internal, ...info } = workflowResumeSourceInfoFromJournal(runId, sourceJournal, completedAgentCount);
     return info;
+  }
+
+  // The built-in whose request contract governs this launch, including a resumed run that classifies
+  // as script_path. Also the one place that refuses a resume whose source ran under a different ref
+  // policy: the source's cached agent results were produced under different failure semantics, and
+  // the agent call keys do not carry the policy, so replaying them across policies is silent drift.
+  private async resumeAwareBuiltinContractName(
+    resolved: ResolvedWorkflowLaunchInput,
+    resumePlan: WorkflowResumePlan,
+  ): Promise<string | undefined> {
+    const currentPolicy = this.options.refPolicy ?? 'strict';
+    if (resumePlan.sourceTask) {
+      const identity = await this.resumeSourceBuiltinIdentity(resumePlan.sourceTask);
+      if (identity?.policy !== undefined && identity.policy !== currentPolicy) {
+        throw requestContractError(
+          `resume of run ${resumePlan.sourceTask.runId} under --ref-policy ${currentPolicy}`,
+          `the source run executed built-in "${identity.name}" under --ref-policy ${identity.policy}, whose cached agent results were produced under different failure semantics and whose call keys do not record the policy`,
+          `resume with --ref-policy ${identity.policy}, or start a fresh run under ${currentPolicy} without --resume-from-run-id`,
+        );
+      }
+      if (identity) return identity.name;
+    }
+    return resolved.workflowSource === 'built_in' ? resolved.name : undefined;
+  }
+
+  // Journal-first discovery records workflowName + scriptHash but no `name` in retryInput, so the
+  // identity comes from those; the script text is read only when a source carries no hash.
+  private async resumeSourceBuiltinIdentity(
+    sourceTask: WorkflowResumeSource,
+  ): Promise<BuiltinResumeIdentity | undefined> {
+    const name = sourceTask.workflowName ?? sourceTask.retryInput.name;
+    if (!name) return undefined;
+    if (sourceTask.scriptHash) {
+      const sourceHash = sourceTask.scriptHash;
+      return builtinResumeIdentity(name, (script) => workflowScriptHash(script) === sourceHash);
+    }
+    const scriptPath = sourceTask.retryInput.scriptPath;
+    if (typeof scriptPath !== 'string' || !scriptPath) return undefined;
+    const script = await readFile(scriptPath, 'utf8').catch(() => undefined);
+    if (script === undefined) return undefined;
+    return builtinResumeIdentity(name, (candidate) => candidate === script);
   }
 
   private async prepareResumePlan(input: WorkflowLaunchInput): Promise<WorkflowResumePlan> {

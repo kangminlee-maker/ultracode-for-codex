@@ -837,6 +837,121 @@ test('refPolicy lenient still fails when every candidate is dropped (no vacuous 
   assert.match(snapshot.error, /includes unsupported evidence ref file:outside\.md/);
 });
 
+test('a resumed built-in still validates its request contract', async () => {
+  // Resume hands back the persisted scriptPath, so the run classifies as script_path and the built-in
+  // contract used to be skipped entirely — a resumed review accepted a mistyped key and silently ran
+  // the script's fallback.
+  const backend = new FakeSubagentBackend();
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-contract-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  await initializeGitRepo(root);
+  await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
+  const runtime = new WorkflowTaskRegistry({ backend, cwd: root, stateDir, requestTimeoutMs: 30_000 });
+  let runId;
+  try {
+    const first = await runtime.launch({ name: 'code-review', args: { prompt: 'Review pending.ts' } });
+    await collectEvents(runtime, first.taskId);
+    runId = runtime.get(first.taskId).runId;
+    assert.ok(runId);
+
+    await assert.rejects(
+      () => runtime.launch({ resumeFromRunId: runId, args: { promt: 'typo on resume' } }),
+      /unknown workflow arg "promt" for built-in "code-review"/,
+    );
+    await assert.rejects(
+      () => runtime.launch({ resumeFromRunId: runId, args: { prompt: 'Review pending.ts', level: 'medium' } }),
+      /has an unsupported value "medium"/,
+    );
+
+    // Control: valid args resume normally, so the contract is applied rather than the resume blocked.
+    const resumed = await runtime.launch({ resumeFromRunId: runId, args: { prompt: 'Review pending.ts' } });
+    await collectEvents(runtime, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(runtime.get(resumed.taskId).status));
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a resume under a different ref policy is refused', async () => {
+  const backend = new FakeSubagentBackend();
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-policy-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  await initializeGitRepo(root);
+  await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
+  const strictRuntime = new WorkflowTaskRegistry({ backend, cwd: root, stateDir, requestTimeoutMs: 30_000 });
+  let runId;
+  try {
+    const first = await strictRuntime.launch({ name: 'code-review', args: { prompt: 'Review pending.ts' } });
+    await collectEvents(strictRuntime, first.taskId);
+    runId = strictRuntime.get(first.taskId).runId;
+  } finally {
+    await strictRuntime.close();
+  }
+
+  const lenientRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'lenient',
+  });
+  try {
+    // The source run's cached agent results were produced under strict failure semantics and the call
+    // keys do not record the policy, so replaying them under lenient would be silent drift.
+    await assert.rejects(
+      () => lenientRuntime.launch({ resumeFromRunId: runId }),
+      /the source run executed built-in "code-review" under --ref-policy strict/,
+    );
+    await assert.rejects(
+      () => lenientRuntime.launch({ resumeFromRunId: runId }),
+      /resume with --ref-policy strict, or start a fresh run under lenient/,
+    );
+  } finally {
+    await lenientRuntime.close();
+  }
+
+  // Control: the same policy resumes, so the check keys on the mismatch rather than on resuming at all.
+  const sameRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'strict',
+  });
+  try {
+    const resumed = await sameRuntime.launch({ resumeFromRunId: runId });
+    await collectEvents(sameRuntime, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(sameRuntime.get(resumed.taskId).status));
+  } finally {
+    await sameRuntime.close();
+  }
+});
+
+test('a policy-insensitive built-in resumes across policies (false-positive control)', async () => {
+  // `task` generates the same script under every ref policy, so a cross-policy resume of it is not a
+  // mismatch. Without the policy-sensitivity guard the identity check would match the first variant
+  // and reject every such resume.
+  const backend = new FakeSubagentBackend();
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-insensitive-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  const strictRuntime = new WorkflowTaskRegistry({ backend, cwd: root, stateDir, requestTimeoutMs: 30_000 });
+  let runId;
+  try {
+    const first = await strictRuntime.launch({ name: 'task', args: { prompt: 'FAIL_AGENT analyze the package' } });
+    await collectEvents(strictRuntime, first.taskId);
+    runId = strictRuntime.get(first.taskId).runId;
+    assert.ok(runId);
+  } finally {
+    await strictRuntime.close();
+  }
+
+  const lenientRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'lenient',
+  });
+  try {
+    const resumed = await lenientRuntime.launch({ resumeFromRunId: runId });
+    await collectEvents(lenientRuntime, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(lenientRuntime.get(resumed.taskId).status));
+  } finally {
+    await lenientRuntime.close();
+  }
+});
+
 test('validation preview carries git-status failures like the run does', async () => {
   const backend = new FakeSubagentBackend();
   const { runtime } = await createRuntime({ backend });
