@@ -837,6 +837,33 @@ test('refPolicy lenient still fails when every candidate is dropped (no vacuous 
   assert.match(snapshot.error, /includes unsupported evidence ref file:outside\.md/);
 });
 
+test('the vacuous-pass guard covers sweep-only drops and does not pre-empt a sweep rescue', async () => {
+  // The guard used to run before the sweep, so a sweep-only drop completed with an empty report while
+  // a lens drop failed a run the sweep could still have rescued. Both directions are asserted here.
+  const swept = await runCodeReview({ marker: 'SWEEP_ONLY_DROP', refPolicy: 'lenient' });
+  assert.equal(swept.snapshot.status, 'failed');
+  assert.match(swept.snapshot.error, /no candidate survived 1 unsupported-evidence drop\(s\)/);
+  assert.match(swept.snapshot.error, /inconclusive, not clean/);
+
+  const rescued = await runCodeReview({ marker: 'SWEEP_RESCUE', refPolicy: 'lenient' });
+  assert.equal(rescued.snapshot.status, 'completed', rescued.snapshot.error ?? '');
+  assert.equal(rescued.snapshot.result.stats.refDrops, 1);
+  assert.ok(rescued.snapshot.result.findings.length >= 1);
+
+  // Control: strict still fails both fixtures on the ref itself, not on the vacuous-pass rule.
+  const strict = await runCodeReview({ marker: 'SWEEP_ONLY_DROP', refPolicy: 'strict' });
+  assert.equal(strict.snapshot.status, 'failed');
+  assert.match(strict.snapshot.error, /includes unsupported evidence ref file:outside\.md/);
+});
+
+test('a drive-relative name is not a structural violation', async () => {
+  const { snapshot } = await runCodeReview({ marker: 'DRIVE_RELATIVE_REF', refPolicy: 'lenient' });
+  assert.equal(snapshot.status, 'failed');
+  // It is refused as unsupported evidence, but "C:foo.md" is a legal POSIX filename, not an escape.
+  assert.doesNotMatch(snapshot.error, /structural/);
+  assert.match(snapshot.error, /no candidate survived/);
+});
+
 test('a resumed built-in still validates its request contract', async () => {
   // Resume hands back the persisted scriptPath, so the run classifies as script_path and the built-in
   // contract used to be skipped entirely — a resumed review accepted a mistyped key and silently ran
@@ -868,6 +895,16 @@ test('a resumed built-in still validates its request contract', async () => {
     const resumed = await runtime.launch({ resumeFromRunId: runId, args: { prompt: 'Review pending.ts' } });
     await collectEvents(runtime, resumed.taskId);
     assert.ok(['completed', 'failed'].includes(runtime.get(resumed.taskId).status));
+
+    // Edit-and-iterate: a co-supplied selector executes a DIFFERENT workflow, so its own contract
+    // governs. Validating `prompts` against code-review's contract would break a shipped feature.
+    const replaced = await runtime.launch({
+      resumeFromRunId: runId,
+      name: 'batch',
+      args: { prompts: ['first', 'second'] },
+    });
+    await collectEvents(runtime, replaced.taskId);
+    assert.ok(['completed', 'failed'].includes(runtime.get(replaced.taskId).status));
   } finally {
     await runtime.close();
   }
@@ -918,6 +955,97 @@ test('a resume under a different ref policy is refused', async () => {
     assert.ok(['completed', 'failed'].includes(sameRuntime.get(resumed.taskId).status));
   } finally {
     await sameRuntime.close();
+  }
+});
+
+test('a built-in whose recorded script no longer matches any variant fails closed on a policy switch', async () => {
+  // Simulates a source run created by an older generator: provenance still says built_in and the name
+  // is known, but the script matches neither current variant, so its policy cannot be proven.
+  const legacyReview = { name: 'code-review', script: 'export const meta = { name: "code-review", description: "legacy" };\nreturn { legacy: true };' };
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-legacy-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  const legacyRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    builtinWorkflows: [legacyReview],
+  });
+  let runId;
+  try {
+    const first = await legacyRuntime.launch({ name: 'code-review', args: {} });
+    await collectEvents(legacyRuntime, first.taskId);
+    runId = legacyRuntime.get(first.taskId).runId;
+    assert.ok(runId);
+  } finally {
+    await legacyRuntime.close();
+  }
+
+  const lenientRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'lenient',
+  });
+  try {
+    await assert.rejects(
+      () => lenientRuntime.launch({ resumeFromRunId: runId }),
+      /with a script this version no longer generates/,
+    );
+  } finally {
+    await lenientRuntime.close();
+  }
+
+  // Control: the default policy resumes, so the refusal keys on the unprovable switch.
+  const strictRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+  });
+  try {
+    const resumed = await strictRuntime.launch({ resumeFromRunId: runId });
+    await collectEvents(strictRuntime, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(strictRuntime.get(resumed.taskId).status));
+  } finally {
+    await strictRuntime.close();
+  }
+});
+
+test('an unidentifiable source is refused for a policy switch only when nesting is enabled', async () => {
+  const script = `export const meta = { name: "inline-parent", description: "parent" };\nreturn { ok: true };`;
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-nested-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  const first = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+  });
+  let runId;
+  try {
+    const launched = await first.launch({ script, args: {} });
+    await collectEvents(first, launched.taskId);
+    runId = first.get(launched.taskId).runId;
+  } finally {
+    await first.close();
+  }
+
+  // A nested built-in child is journaled only as script-agnostic agent entries, so a cross-policy
+  // replay could hide inside a parent this check cannot identify.
+  const nested = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    refPolicy: 'lenient', nestedWorkflows: 'enabled',
+  });
+  try {
+    await assert.rejects(
+      () => nested.launch({ resumeFromRunId: runId }),
+      /not identifiable as a built-in/,
+    );
+  } finally {
+    await nested.close();
+  }
+
+  // Control: the same policy switch without nesting is allowed, so the refusal is not blanket.
+  const notNested = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'lenient',
+  });
+  try {
+    const resumed = await notNested.launch({ resumeFromRunId: runId });
+    await collectEvents(notNested, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(notNested.get(resumed.taskId).status));
+  } finally {
+    await notNested.close();
   }
 });
 
@@ -3697,6 +3825,11 @@ function fakeReviewScope(prompt = '') {
       ? ['docs/client-package-plan.md', 'outside.md']
       : ['docs/client-package-plan.md'];
   const decisionRef = /SCOPE_DECISION_INVALID/.test(prompt) ? 'file:outside.md' : 'file:docs/client-package-plan.md';
+  // The sweep finder's prompt carries the scope block but not the user prompt, so a sweep marker has
+  // to travel through scope.instructions.
+  const sweepMarker = /SWEEP_ONLY_DROP/.test(prompt)
+    ? 'SWEEP_ONLY_DROP'
+    : /SWEEP_RESCUE/.test(prompt) ? 'SWEEP_RESCUE' : '';
   // A scope that selects no lens at all reaches the early return, which must obey the same
   // vacuous-pass rule as candidate verification.
   if (/SCOPE_NO_LENSES/.test(prompt)) {
@@ -3711,7 +3844,7 @@ function fakeReviewScope(prompt = '') {
   return {
     files,
     summary: 'Review the client package plan and authority binding claims.',
-    instructions: 'Prioritize material runtime contract and boundary risks.',
+    instructions: `Prioritize material runtime contract and boundary risks. ${sweepMarker}`.trim(),
     lensDecisions: [
       {
         seedId: 'cross-file-contract',
@@ -3748,7 +3881,51 @@ function fakeReviewScope(prompt = '') {
 }
 
 function fakeReviewFinder(prompt) {
-  if (/Code-review Sweep Finder/.test(prompt) || /Lens key: security-boundary/.test(prompt)) {
+  const sweep = /Code-review Sweep Finder/.test(prompt);
+  // Lens finders stay empty and only the sweep emits, so a drop can appear after the point where the
+  // vacuous-pass guard used to run.
+  if (/SWEEP_ONLY_DROP/.test(prompt)) {
+    return sweep
+      ? {
+        candidates: [{
+          file: 'docs/client-package-plan.md',
+          line: 1,
+          summary: 'Sweep candidate citing evidence that does not exist.',
+          failureScenario: 'A sweep-only drop must not produce a completed review.',
+          evidenceRefs: ['file:outside.md'],
+          kind: 'coverage',
+        }],
+      }
+      : { candidates: [] };
+  }
+  // A lens candidate drops and the sweep then supplies a usable one: the guard must not have failed
+  // the run before the sweep had its chance.
+  if (/SWEEP_RESCUE/.test(prompt)) {
+    // Only the first lens emits, so exactly one drop is expected.
+    if (!sweep && /Lens key: security-boundary/.test(prompt)) return { candidates: [] };
+    return sweep
+      ? {
+        candidates: [{
+          file: 'docs/client-package-plan.md',
+          line: 3,
+          summary: 'Sweep candidate citing evidence that exists.',
+          failureScenario: 'It must survive and be reported.',
+          evidenceRefs: ['file:docs/client-package-plan.md'],
+          kind: 'coverage',
+        }],
+      }
+      : {
+        candidates: [{
+          file: 'docs/client-package-plan.md',
+          line: 1,
+          summary: 'Lens candidate citing evidence that does not exist.',
+          failureScenario: 'It is dropped under lenient policy.',
+          evidenceRefs: ['file:outside.md'],
+          kind: 'contract',
+        }],
+      };
+  }
+  if (sweep || /Lens key: security-boundary/.test(prompt)) {
     return { candidates: [] };
   }
   if (/INVALID_EVIDENCE_REF/.test(prompt)) {
@@ -3785,6 +3962,18 @@ function fakeReviewFinder(prompt) {
           kind: 'coverage',
         },
       ],
+    };
+  }
+  if (/DRIVE_RELATIVE_REF/.test(prompt)) {
+    return {
+      candidates: [{
+        file: 'docs/client-package-plan.md',
+        line: 1,
+        summary: 'This candidate cites a drive-RELATIVE name, which is a legal POSIX filename.',
+        failureScenario: 'It must be an ordinary unsupported-evidence drop, not a structural violation.',
+        evidenceRefs: ['file:C:foo.md'],
+        kind: 'contract',
+      }],
     };
   }
   if (/DRIVE_ABSOLUTE_REF/.test(prompt)) {

@@ -511,6 +511,9 @@ interface WorkflowPermissionStore {
 interface WorkflowResumePlan {
   readonly launchInput: WorkflowLaunchInput;
   readonly sourceTask?: WorkflowResumeSource;
+  // Edit-and-iterate: a co-supplied selector replaces what the source ran, so the source's request
+  // contract does not govern the args of the workflow that will actually execute.
+  readonly replacedSource?: boolean;
 }
 
 interface WorkflowResumeSource {
@@ -786,6 +789,21 @@ const BUILTIN_WORKFLOWS_BY_REF_POLICY = new Map<RefPolicy, readonly BuiltinWorkf
 interface BuiltinResumeIdentity {
   readonly name: string;
   readonly policy?: RefPolicy;
+  // A built-in this version still knows by name, whose recorded script matches no generated variant.
+  // Its contract still applies; its policy cannot be proven.
+  readonly policyUnproven?: boolean;
+}
+
+// A built-in identified by provenance and name but not by script text. Only policy-sensitive built-ins
+// report an unproven policy: for one that generates the same script under every policy there is
+// nothing to prove.
+function builtinUnprovenPolicyIdentity(name: string): BuiltinResumeIdentity | undefined {
+  const scripts = REF_POLICY_VALUES
+    .map((policy) => defaultBuiltinWorkflows(policy).find((entry) => entry.name === name)?.script)
+    .filter((script): script is string => script !== undefined);
+  if (scripts.length === 0) return undefined;
+  const policySensitive = scripts.some((script) => script !== scripts[0]);
+  return policySensitive ? { name, policyUnproven: true } : { name };
 }
 
 function builtinResumeIdentity(
@@ -1166,9 +1184,11 @@ function failUnsupportedRef(prefix, value, refSet) {
 // Exact match first, then a trailing numeric index, then the path. A path that is not in evidence
 // still fails: the anti-fabrication property is unchanged.
 let normalizedRefCount = 0;
-// Verifier agents that ran and consumed tokens, including ones whose result a lenient policy dropped.
-// Deriving this from the surviving list under-reported real spend.
-let verifierDispatchCount = 0;
+// Verifier results processed in this run, including ones a lenient policy dropped. NOT a token-spend
+// figure: a resumed run's cached verifier results return through the same loop without reaching the
+// backend, and a script cannot see which agent() calls were cache hits. Fresh-vs-cached is available
+// in the journal and the agent.completed events (cached: true).
+let verifierResultCount = 0;
 // Ref policy (R6). "strict" fails the run on a ref that normalization cannot resolve to a path in
 // evidence. "lenient" drops the one candidate that cited it and lets the rest of the review stand.
 // What stays fatal at every policy: lens decisions (the review's premises, not its items) and any
@@ -1192,8 +1212,11 @@ function assertPathSafe(value, label) {
   // A drive-letter absolute path (C:/x, or a backslash form once normalized) escapes the workspace
   // exactly like a POSIX absolute path. Without this it read as an ordinary unresolvable ref and a
   // lenient policy downgraded it to a drop, contradicting "absolute paths stay fatal at every policy".
-  const driveAbsolute = normalized.length > 1
+  // Drive-ABSOLUTE requires the separator: "C:/foo" escapes the workspace, while "C:foo.ts" is a legal
+  // POSIX filename that must stay an ordinary path.
+  const driveAbsolute = normalized.length > 2
     && normalized.charAt(1) === ":"
+    && normalized.charAt(2) === "/"
     && /[A-Za-z]/.test(normalized.charAt(0));
   if (
     normalized.indexOf("../") === 0
@@ -1470,7 +1493,7 @@ function reviewLensStage(lens) {
       if (verifierResults.length !== envelopes.length) fail("verifier count mismatch for " + lens.lensKey);
       const verified = [];
       for (let index = 0; index < envelopes.length; index += 1) {
-        verifierDispatchCount += 1;
+        verifierResultCount += 1;
         if (verifierResults[index] == null) fail("missing verifier result for " + envelopes[index].candidateId);
         let verifier;
         try {
@@ -1566,7 +1589,7 @@ function reviewSweepCandidates(lens, rawCandidates) {
     if (verifierResults.length !== envelopes.length) fail("sweep verifier count mismatch");
     const verified = [];
     for (let index = 0; index < envelopes.length; index += 1) {
-      verifierDispatchCount += 1;
+      verifierResultCount += 1;
       if (verifierResults[index] == null) fail("missing sweep verifier result");
       let sweepVerifier;
       try {
@@ -1815,7 +1838,7 @@ for (let lensIndex = 0; lensIndex < lensResults.length; lensIndex += 1) {
 }
 // Vacuous-pass guard: drops with nothing left to verify is "could not judge", not "found nothing",
 // so it fails instead of completing with an empty, reassuring report.
-assertNoVacuousPass(verifiedCandidates.length, "candidate verification");
+
 const nonRefuted = [];
 let refuted = 0;
 for (let index = 0; index < verifiedCandidates.length; index += 1) {
@@ -1838,6 +1861,10 @@ if (caps.sweep) {
     else nonRefuted.push(sweepResults[index]);
   }
 }
+// After the sweep, not before it: a sweep can still produce the candidate that makes a dropped run
+// reviewable, so checking earlier both missed sweep-only drops and failed runs the sweep could rescue.
+// One call site keeps the rule declared once.
+assertNoVacuousPass(verifiedCandidates.length, "candidate verification");
 let synthesis = { mode: "script_fallback", summary: "No confirmed or plausible candidates.", fallbackReason: "no reportable candidates", decisions: [] };
 if (nonRefuted.length > 0) {
   announcePhasePlan({
@@ -1928,7 +1955,7 @@ return {
   stats: {
     finders: activeLenses.length + (caps.sweep ? 1 : 0),
     candidates: verifiedCandidates.length,
-    verifierAttempts: verifierDispatchCount,
+    verifierAttempts: verifierResultCount,
     verified: verifiedCandidates.length,
     refuted: refuted,
     invalid: 0,
@@ -2454,34 +2481,57 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     const currentPolicy = this.options.refPolicy ?? 'strict';
     if (resumePlan.sourceTask) {
       const identity = await this.resumeSourceBuiltinIdentity(resumePlan.sourceTask);
+      const runId = resumePlan.sourceTask.runId;
       if (identity?.policy !== undefined && identity.policy !== currentPolicy) {
         throw requestContractError(
-          `resume of run ${resumePlan.sourceTask.runId} under --ref-policy ${currentPolicy}`,
+          `resume of run ${runId} under --ref-policy ${currentPolicy}`,
           `the source run executed built-in "${identity.name}" under --ref-policy ${identity.policy}, whose cached agent results were produced under different failure semantics and whose call keys do not record the policy`,
           `resume with --ref-policy ${identity.policy}, or start a fresh run under ${currentPolicy} without --resume-from-run-id`,
         );
       }
-      if (identity) return identity.name;
+      // Fail closed when the source is a policy-sensitive built-in whose script matches no current
+      // variant (an older generator): its policy cannot be proven, so it must not be replayed under a
+      // non-default one.
+      if (identity?.policyUnproven && currentPolicy !== 'strict') {
+        throw requestContractError(
+          `resume of run ${runId} under --ref-policy ${currentPolicy}`,
+          `the source run executed built-in "${identity.name}" with a script this version no longer generates, so the ref policy it ran under cannot be proven and its cached results cannot be shown to match ${currentPolicy}`,
+          `resume with the default --ref-policy strict, or start a fresh run under ${currentPolicy} without --resume-from-run-id`,
+        );
+      }
+      // A nested built-in child is journaled only as the parent's agent entries with script-agnostic
+      // call keys, so a cross-policy replay can hide inside a parent this check cannot identify.
+      // Refuse that combination rather than let it through unproven; all three conditions are opt-in.
+      if (!identity && currentPolicy !== 'strict' && this.nestedWorkflows) {
+        throw requestContractError(
+          `resume of run ${runId} under --ref-policy ${currentPolicy} with nested workflows enabled`,
+          `the source run is not identifiable as a built-in, and a nested built-in child it may have run is journaled only as script-agnostic agent entries, so cached results cannot be shown to match ${currentPolicy}`,
+          `resume with the default --ref-policy strict, run without --nested-workflows, or start a fresh run under ${currentPolicy} without --resume-from-run-id`,
+        );
+      }
+      // The contract must describe the workflow that will actually execute.
+      if (identity && !resumePlan.replacedSource) return identity.name;
     }
     return resolved.workflowSource === 'built_in' ? resolved.name : undefined;
   }
 
-  // Journal-first discovery records workflowName + scriptHash but no `name` in retryInput, so the
-  // identity comes from those; the script text is read only when a source carries no hash.
+  // Identity comes from the source journal's run.started entry, which is the only place that records
+  // provenance: a name and a matching script hash alone would misclassify a project or user workflow
+  // that copies a built-in, and would silently skip the contract for a genuine built-in whose script
+  // an upgrade changed. Requiring workflowSource === 'built_in' fixes the first; policyUnproven
+  // reports the second instead of ignoring it.
   private async resumeSourceBuiltinIdentity(
     sourceTask: WorkflowResumeSource,
   ): Promise<BuiltinResumeIdentity | undefined> {
-    const name = sourceTask.workflowName ?? sourceTask.retryInput.name;
-    if (!name) return undefined;
-    if (sourceTask.scriptHash) {
-      const sourceHash = sourceTask.scriptHash;
-      return builtinResumeIdentity(name, (script) => workflowScriptHash(script) === sourceHash);
-    }
-    const scriptPath = sourceTask.retryInput.scriptPath;
-    if (typeof scriptPath !== 'string' || !scriptPath) return undefined;
-    const script = await readFile(scriptPath, 'utf8').catch(() => undefined);
-    if (script === undefined) return undefined;
-    return builtinResumeIdentity(name, (candidate) => candidate === script);
+    const started = await this.readResumeSourceJournal(sourceTask)
+      .then((journal) => journal.started)
+      .catch(() => undefined);
+    if (!started || started.workflowSource !== 'built_in') return undefined;
+    const name = started.workflowName;
+    const sourceHash = started.scriptHash;
+    const identity = builtinResumeIdentity(name, (script) => workflowScriptHash(script) === sourceHash);
+    if (identity) return identity;
+    return builtinUnprovenPolicyIdentity(name);
   }
 
   private async prepareResumePlan(input: WorkflowLaunchInput): Promise<WorkflowResumePlan> {
@@ -2512,6 +2562,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       assertSingleWorkflowSourceSelector(input);
       return {
         sourceTask,
+        replacedSource: true,
         launchInput: {
           ...(input.script !== undefined ? { script: input.script } : {}),
           ...(input.scriptPath !== undefined ? { scriptPath: input.scriptPath } : {}),
