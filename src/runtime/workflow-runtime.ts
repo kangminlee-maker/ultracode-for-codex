@@ -2275,7 +2275,14 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         runtime: {
           schemaVersion: 1,
           cwd: this.options.cwd ?? process.cwd(),
-          refPolicy: this.options.refPolicy ?? 'strict',
+          // Recorded only when it differs from the legacy default. A reader from before this field
+          // rejects unknown runtime keys, so emitting it unconditionally would make every new journal
+          // unreadable after a downgrade; this way only an opt-in lenient run loses that compatibility.
+          // Absence therefore means strict, which is sound: no released version could produce a lenient
+          // run, because the policy did not exist.
+          ...(this.options.refPolicy && this.options.refPolicy !== 'strict'
+            ? { refPolicy: this.options.refPolicy }
+            : {}),
           ...(this.options.backend.model !== SUBAGENT_MODEL_PLACEHOLDER
             ? { model: this.options.backend.model }
             : {}),
@@ -2487,21 +2494,31 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     if (resumePlan.sourceTask) {
       const runId = resumePlan.sourceTask.runId;
       const started = await this.resumeSourceStartedEntry(resumePlan.sourceTask);
-      const identity = started.workflowSource === 'built_in'
+      const sourceIsBuiltin = started.workflowSource === 'built_in';
+      const identity = sourceIsBuiltin
         ? builtinResumeIdentity(started.workflowName, (script) => workflowScriptHash(script) === started.scriptHash)
         : undefined;
-      // The journal is the proof; the script-derived policy is the fallback for runs journaled before
-      // the field existed. `strict` being today's default proves nothing about what the source ran, so
-      // an unprovable policy is refused in BOTH directions rather than assumed to match.
+      // The journal is the proof. An ABSENT field means strict — sound because no released version could
+      // produce a lenient run, and this version omits the field only for strict. An explicitly recorded
+      // value this version does not recognize (a newer policy, or tampering the chain would catch) is
+      // NOT downgraded to a script-hash guess: it is unprovable and refused.
       const journaledPolicy = started.runtime?.refPolicy;
-      const sourcePolicy = isRefPolicy(journaledPolicy) ? journaledPolicy : identity?.policy;
-      // Policy matters for an identified policy-sensitive built-in, and for an unidentified source only
+      const sourcePolicy = journaledPolicy === undefined
+        ? identity?.policy ?? 'strict'
+        : isRefPolicy(journaledPolicy) ? journaledPolicy : undefined;
+      // Policy matters for an identified policy-sensitive built-in; for a built-in this version no
+      // longer recognizes (removed, renamed, or supplied through builtinWorkflows) it matters too —
+      // treating it as irrelevant ignored even a journaled mismatch; and for a non-built-in source only
       // when nesting could have run a built-in child whose call keys are script-agnostic.
-      const policyRelevant = identity ? identity.policySensitive : this.nestedWorkflows;
+      const policyRelevant = identity
+        ? identity.policySensitive
+        : sourceIsBuiltin || this.nestedWorkflows;
       if (policyRelevant && sourcePolicy !== currentPolicy) {
         const subject = identity
           ? `built-in "${identity.name}"`
-          : 'a workflow that is not identifiable as a built-in, whose nested built-in child (if any) is journaled only as script-agnostic agent entries';
+          : sourceIsBuiltin
+            ? `built-in "${started.workflowName}", which this version does not recognize`
+            : 'a workflow that is not identifiable as a built-in, whose nested built-in child (if any) is journaled only as script-agnostic agent entries';
         throw sourcePolicy === undefined
           ? requestContractError(
             `resume of run ${runId} under --ref-policy ${currentPolicy}`,

@@ -1137,6 +1137,83 @@ test('an unidentifiable source is refused for a policy switch only when nesting 
   }
 });
 
+test('a built-in this version no longer recognizes is still policy-checked', async () => {
+  // The journal says built_in but the name is not a built-in here (removed, renamed, or supplied
+  // through builtinWorkflows). Treating that as "not a built-in" made policy irrelevant with nesting
+  // off, so a journaled mismatch was ignored and a lenient source could resume as strict.
+  const gone = { name: 'gone-review', script: 'export const meta = { name: "gone-review", description: "gone" };\nreturn { gone: true };' };
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-gone-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  const source = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    builtinWorkflows: [gone], refPolicy: 'lenient',
+  });
+  let runId;
+  try {
+    const first = await source.launch({ name: 'gone-review', args: {} });
+    await collectEvents(source, first.taskId);
+    runId = source.get(first.taskId).runId;
+    assert.ok(runId);
+  } finally {
+    await source.close();
+  }
+
+  // Nesting is OFF here, which is exactly the combination that used to slip through.
+  const strictRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+  });
+  try {
+    await assert.rejects(
+      () => strictRuntime.launch({ resumeFromRunId: runId }),
+      /which this version does not recognize/,
+    );
+  } finally {
+    await strictRuntime.close();
+  }
+
+  // Control: the same policy resumes, so the refusal keys on the mismatch.
+  const lenientRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    builtinWorkflows: [gone], refPolicy: 'lenient',
+  });
+  try {
+    const resumed = await lenientRuntime.launch({ resumeFromRunId: runId });
+    await collectEvents(lenientRuntime, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(lenientRuntime.get(resumed.taskId).status));
+  } finally {
+    await lenientRuntime.close();
+  }
+});
+
+test('the journal records the ref policy only when it is not the legacy default', async () => {
+  // A reader from before this field rejects unknown runtime keys, so a default run must keep writing a
+  // journal that an older version can still parse. Only an opt-in lenient run records the field.
+  for (const [refPolicy, expected] of [[undefined, false], ['strict', false], ['lenient', true]]) {
+    const root = await mkdtemp(join(tmpdir(), 'workflow-journal-policy-'));
+    tempDirs.push(root);
+    const runtime = new WorkflowTaskRegistry({
+      backend: new FakeSubagentBackend(), cwd: root, stateDir: join(root, '.ultracode-for-codex'),
+      requestTimeoutMs: 30_000, ...(refPolicy ? { refPolicy } : {}),
+    });
+    try {
+      const launch = await runtime.launch({ script: 'export const meta = { name: "policy-journal", description: "d" };\nreturn { ok: true };', args: {} });
+      await collectEvents(runtime, launch.taskId);
+      const snapshot = runtime.get(launch.taskId);
+      const journal = await readWorkflowJournal(workflowJournalPath(snapshot.transcriptDir));
+      const started = journal.entries.find((entry) => entry.kind === 'workflow.run.started');
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(started.runtime, 'refPolicy'),
+        expected,
+        `refPolicy=${String(refPolicy)}`,
+      );
+      if (expected) assert.equal(started.runtime.refPolicy, 'lenient');
+    } finally {
+      await runtime.close();
+    }
+  }
+});
+
 test('a policy-insensitive built-in resumes across policies (false-positive control)', async () => {
   // `task` generates the same script under every ref policy, so a cross-policy resume of it is not a
   // mismatch. Without the policy-sensitivity guard the identity check would match the first variant
