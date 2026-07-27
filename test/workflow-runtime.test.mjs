@@ -1284,6 +1284,90 @@ test('a committed path containing a space survives into the evidence gate', asyn
     assert.equal(report.evidence.gated, false);
     assert.equal(report.evidence.allowedEvidenceRefs.includes('file:foo bar.ts'), true,
       JSON.stringify(report.evidence.allowedEvidenceRefs));
+    // Opening the gate is not enough: agents would spend without seeing the change. The committed diff
+    // and hunk refs must survive too, and the file must reach an included-file block.
+    assert.equal(report.evidence.allowedEvidenceRefs.includes('diff:committed:foo bar.ts'), true,
+      JSON.stringify(report.evidence.allowedEvidenceRefs));
+    assert.equal(report.evidence.allowedEvidenceRefs.includes('hunk:committed:foo bar.ts:1'), true,
+      JSON.stringify(report.evidence.allowedEvidenceRefs));
+
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a committed-range path is prioritized for an included-file block', async () => {
+  // Opening the gate is not enough — agents would spend without seeing the change. In a repository
+  // with more files than maxFiles, a committed-only path loses to the directory walk unless the
+  // evidence file paths are prioritized ahead of it.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    // Root-level fillers whose names sort before the reviewed file, so they compete for the same
+    // included-file budget (maxFiles is 24 by default).
+    for (let index = 0; index < 40; index += 1) {
+      const name = `a${String(index).padStart(2, '0')}.ts`;
+      await writeFile(join(root, name), `export const filler${index} = ${index};\n`);
+    }
+    await gitLines(root, ['add', '-A']);
+    await gitLines(root, ['commit', '-m', 'filler']);
+    await writeFile(join(root, 'reviewed.ts'), 'export const reviewed = 1;\n');
+    await gitLines(root, ['add', '--', 'reviewed.ts']);
+    await gitLines(root, ['commit', '-m', 'the one under review']);
+
+    const launch = await runtime.launch({
+      name: 'code-review',
+      args: { prompt: 'Review the last commit.', diffBaseRef: 'HEAD~1' },
+    });
+    await collectEvents(runtime, launch.taskId);
+    assert.ok(backend.requests.length >= 1);
+    const prompt = backend.requests[0].messages.map((message) => message.content).join('\n');
+    assert.match(prompt, /--- reviewed\.ts \(/, 'the committed path must reach an included-file block');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a nested built-in child is validated against its request contract', async () => {
+  // The contract applied only at top-level launch, so a parent could run the default review with a
+  // mistyped key — the silent spend the contract exists to stop.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({
+    backend, runtimeOptions: { nestedWorkflows: 'enabled' },
+  });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
+    const script = `export const meta = { name: "nested-parent", description: "calls a built-in" };
+return await workflow("code-review", { promt: "typo reaches the child" });`;
+    const launch = await runtime.launch({ script, args: {} });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.match(snapshot.error, /unknown workflow arg "promt" for built-in "code-review"/);
+    assert.equal(backend.requests.length, 0, 'the child must not spend before its contract is checked');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a nested built-in child with valid args still runs (control)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({
+    backend, runtimeOptions: { nestedWorkflows: 'enabled' },
+  });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'docs'), { recursive: true });
+    await writeFile(join(root, 'docs', 'client-package-plan.md'), 'The platform token owns authority.\n');
+    const script = `export const meta = { name: "nested-parent", description: "calls a built-in" };
+return await workflow("code-review", { prompt: "Review docs/client-package-plan.md." });`;
+    const launch = await runtime.launch({ script, args: {} });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed', snapshot.error ?? '');
+    assert.ok(backend.requests.length >= 1);
   } finally {
     await runtime.close();
   }

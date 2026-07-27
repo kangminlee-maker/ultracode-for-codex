@@ -4338,6 +4338,18 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     // projecting it to a bare object). C5e (one-level) still holds — a child's host.workflow is the
     // throwing stub, bound by frame presence, so concurrent children can't nest.
     const child = await this.resolveNestedChild(nameOrRef);
+    // The request contract applied only at top-level launch, so a parent could call
+    // workflow("code-review", { promt: "…" }) and silently run the default review — the same silent
+    // spend the contract exists to stop. A mid-run rejection fails the parent loudly, which is the
+    // same shape a nested permission failure already has.
+    if (child.workflowSource === 'built_in') {
+      await validateBuiltinRequestArgs(
+        child.parsed.meta.name,
+        childArgs,
+        this.options.cwd ?? process.cwd(),
+      );
+    }
+
     await this.assertNestedChildPermitted(child);
     const frame: WorkflowChildFrame = {
       args: childArgs,
@@ -4716,6 +4728,7 @@ async function buildWorkspaceContext(
   const candidates = uniqueStrings([
     ...explicitPaths,
     ...changedPaths,
+    ...(changeEvidence?.filePaths ?? []),
     ...WORKSPACE_CONTEXT_PRIORITY_FILES,
     ...listedPaths,
   ]).filter((path) => shouldIncludeWorkspaceContextPath(path, runtimeStateExcludedPaths) && !excludedWorkspacePaths.has(workspacePathKey(path)));
@@ -4773,6 +4786,9 @@ interface ChangeEvidenceContext {
   // Structured projection of the same values the prompt text carries, so `--validate` can report the
   // request's satisfiability without spending an agent and without re-deriving the gate rule.
   readonly allowedFileRefs: readonly string[];
+  // Paths behind the file refs. buildWorkspaceContext prioritizes these for included-file blocks, so a
+  // committed-range path — which never appears in git status — is still shown to the reviewer.
+  readonly filePaths: readonly string[];
   readonly droppedPaths: readonly EvidenceDroppedPath[];
   readonly gateOpen: boolean;
   readonly gateReason: string;
@@ -4978,6 +4994,7 @@ async function buildChangeEvidenceContext(
     unavailableEvidence,
     text: sections.join('\n'),
     allowedFileRefs: fileRefs,
+    filePaths: uniqueStrings([...changedPaths, ...committedPaths]),
     droppedPaths: callerReportableDrops,
     gateOpen,
     gateReason,
@@ -5152,14 +5169,31 @@ interface GitDiffHeader {
 
 function parseGitDiffHeader(line: string): GitDiffHeader | undefined {
   if (!line.startsWith('diff --git ')) return undefined;
-  const first = readGitDiffHeaderToken(line.slice('diff --git '.length));
-  if (!first) return undefined;
-  const second = readGitDiffHeaderToken(first.rest.trimStart());
-  if (!second || second.rest.trim()) return undefined;
-  const oldPath = gitDiffHeaderTokenPath(first.token, 'a/');
-  const newPath = gitDiffHeaderTokenPath(second.token, 'b/');
-  if (oldPath === undefined || newPath === undefined) return undefined;
-  return { oldPath, newPath };
+  const rest = line.slice('diff --git '.length);
+  const first = readGitDiffHeaderToken(rest);
+  if (first) {
+    const second = readGitDiffHeaderToken(first.rest.trimStart());
+    if (second && !second.rest.trim()) {
+      const oldPath = gitDiffHeaderTokenPath(first.token, 'a/');
+      const newPath = gitDiffHeaderTokenPath(second.token, 'b/');
+      if (oldPath !== undefined && newPath !== undefined) return { oldPath, newPath };
+    }
+  }
+  return parseSymmetricGitDiffHeader(rest);
+}
+
+// Git does not quote a plain space, so `diff --git a/foo bar.ts b/foo bar.ts` cannot be split on
+// whitespace. For a same-path change the two halves are `a/P` and `b/P` with identical P, which
+// disambiguates it. A rename whose paths both contain spaces stays ambiguous at the header level —
+// git itself relies on the rename from/to lines there — so it is left unparsed rather than guessed.
+function parseSymmetricGitDiffHeader(rest: string): GitDiffHeader | undefined {
+  if (!rest.startsWith('a/')) return undefined;
+  for (let index = rest.indexOf(' b/'); index >= 0; index = rest.indexOf(' b/', index + 1)) {
+    const oldPath = rest.slice('a/'.length, index);
+    const newPath = rest.slice(index + ' b/'.length);
+    if (oldPath && oldPath === newPath) return { oldPath, newPath };
+  }
+  return undefined;
 }
 
 function readGitDiffHeaderToken(value: string): { readonly token: string; readonly rest: string } | undefined {

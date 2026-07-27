@@ -49,6 +49,8 @@ the project uses [semantic versioning](https://semver.org/).
   **unprovable** and refused rather than guessed from script bytes. Policy relevance is judged from the
   registry actually in use, so a `builtinWorkflows`-injected workflow — one static script for every
   policy — is never refused, while a built-in this version does not ship is refused on a mismatch.
+- A nested `workflow("code-review", …)` child is validated against its request contract before it
+  executes, so a parent cannot silently run the default review with a mistyped key.
 - A resumed built-in is validated against its request contract. Resume hands back the
   persisted script path, so a resumed run classifies as `script_path`; the built-in
   identity is now recovered from the run's journal (workflow name + script hash) and the
