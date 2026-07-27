@@ -723,6 +723,11 @@ const DYNAMIC_WORKFLOW_PATTERN_GUIDANCE = [
   '- loop-until-done: iterate repair and verification only when there is a clear stop condition.',
   'Prefer pipelines when later phases need earlier summaries; prefer parallel agents when independent evidence can be gathered at the same time.',
 ].join('\n');
+// The accepted `level` values live here only. The contract validates against this list and the
+// built-in script interpolates the same values, so the two cannot drift into disagreeing about which
+// values a caller may pass. Order matters: the last entry is the value an omitted `level` selects.
+const CODE_REVIEW_LEVELS = ['high', 'xhigh'] as const;
+
 const DEFAULT_BUILTIN_WORKFLOWS: readonly BuiltinWorkflow[] = [
   {
     name: 'task',
@@ -814,7 +819,7 @@ const BUILTIN_REQUEST_CONTRACTS: Readonly<Record<string, BuiltinRequestContract>
     nonEmptyStrings: ['prompt', 'diffBaseRef'],
     // "xhigh" names the previously unnamed default: omitting `level` still selects it, but a caller
     // could not say so explicitly. Compared case-insensitively here and in the built-in script.
-    enums: { level: ['high', 'xhigh'] },
+    enums: { level: CODE_REVIEW_LEVELS },
     gitCommitRefs: ['diffBaseRef'],
     consumesChangeEvidence: true,
   },
@@ -953,7 +958,7 @@ const workflowInput = args && typeof args === "object" ? args : {};
 const prompt = typeof workflowInput.prompt === "string" && workflowInput.prompt.trim()
   ? workflowInput.prompt
   : "Review the current repository for correctness risks.";
-const level = String(workflowInput.level == null ? "" : workflowInput.level).trim().toLowerCase() === "high" ? "high" : "xhigh";
+const level = String(workflowInput.level == null ? "" : workflowInput.level).trim().toLowerCase() === ${JSON.stringify(CODE_REVIEW_LEVELS[0])} ? ${JSON.stringify(CODE_REVIEW_LEVELS[0])} : ${JSON.stringify(CODE_REVIEW_LEVELS[1])};
 const scopeEffort = level === "high" ? "medium" : "xhigh";
 const verdictEffort = level === "high" ? "high" : "xhigh";
 const caps = level === "high"
@@ -1154,14 +1159,29 @@ function assertPathSafe(value, label) {
   const raw = text(value);
   // fromCharCode(92) avoids a backslash escape inside this generated script.
   const normalized = raw.split(String.fromCharCode(92)).join("/");
+  // A drive-letter absolute path (C:/x, or a backslash form once normalized) escapes the workspace
+  // exactly like a POSIX absolute path. Without this it read as an ordinary unresolvable ref and a
+  // lenient policy downgraded it to a drop, contradicting "absolute paths stay fatal at every policy".
+  const driveAbsolute = normalized.length > 1
+    && normalized.charAt(1) === ":"
+    && /[A-Za-z]/.test(normalized.charAt(0));
   if (
     normalized.indexOf("../") === 0
     || normalized.indexOf("/../") >= 0
     || normalized === ".."
     || normalized.charAt(0) === "/"
+    || driveAbsolute
   ) {
     failStructural(label + " references a path outside the workspace: " + raw);
   }
+}
+// One declaration of the vacuous-pass rule, called at EVERY terminal point. Drops with nothing
+// verified is "could not judge", not "found nothing", so it fails instead of returning a report a
+// reader would take for a clean review. The no-active-lenses return used to bypass this.
+function assertNoVacuousPass(survivingCount, stage) {
+  if (refDrops.length === 0 || survivingCount > 0) return;
+  fail("no candidate survived " + refDrops.length + " unsupported-evidence drop(s) at " + stage
+    + "; this review is inconclusive, not clean; first: " + refDrops[0].reason);
 }
 function recordRefDrop(stage, label, err) {
   const reason = text(err && err.message ? err.message : err);
@@ -1712,6 +1732,7 @@ const scopeBlock = {
 };
 const scopeDigest = hash({ sourceSnapshotId: sourceSnapshotId, contextHash: contextHash, scope: scopeBlock });
 if (activeLenses.length === 0) {
+  assertNoVacuousPass(0, "scope selection (no active lenses)");
   return {
     level: level,
     provenance: {
@@ -1762,9 +1783,7 @@ for (let lensIndex = 0; lensIndex < lensResults.length; lensIndex += 1) {
 }
 // Vacuous-pass guard: drops with nothing left to verify is "could not judge", not "found nothing",
 // so it fails instead of completing with an empty, reassuring report.
-if (refDrops.length > 0 && verifiedCandidates.length === 0) {
-  fail("every candidate was dropped as unsupported evidence (" + refDrops.length + " drop(s)); first: " + refDrops[0].reason);
-}
+assertNoVacuousPass(verifiedCandidates.length, "candidate verification");
 const nonRefuted = [];
 let refuted = 0;
 for (let index = 0; index < verifiedCandidates.length; index += 1) {

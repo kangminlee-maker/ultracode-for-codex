@@ -36,7 +36,7 @@ export function isNestedWorkflows(value: unknown): value is NestedWorkflows {
 }
 
 // Which changed paths may become citable evidence. `default` (the current default) keeps the
-// extension allowlist on the evidence path, byte-identical to today. `all` forgives ONLY the
+// extension allowlist on the evidence path, so which paths are admissible is unchanged. `all` forgives ONLY the
 // extension rule, so a repository whose sources are .java/.rb/.sql/.kt is reviewable; excluded
 // directories, runtime state, and unsafe paths stay excluded, and the prompt-budget file selection
 // keeps its own allowlist either way.
@@ -47,7 +47,7 @@ export function isEvidenceScope(value: unknown): value is EvidenceScope {
 }
 
 // What happens to a cited evidence ref that survives normalization but still resolves to no path in
-// the evidence snapshot. `strict` (the current default) fails the run, byte-identical to today.
+// the evidence snapshot. `strict` (the current default) fails the run, as before.
 // `lenient` drops that one candidate, records it, and lets the rest of the review stand — while the
 // premises of the review (lens decisions) and structural violations stay hard failures.
 export type RefPolicy = 'strict' | 'lenient';

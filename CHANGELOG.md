@@ -40,6 +40,14 @@ the project uses [semantic versioning](https://semver.org/).
 
 ### Changed
 
+- **The evidence context sent to agents changed for every run, including `default`/`strict`.** What
+  the opt-in flags preserve is the *decisions* — which paths are admissible, which runs are gated,
+  which refs are rejected — not the bytes of the prompt. The context gained `evidenceScope`,
+  `evidenceGate`, `evidenceGateReason`, `#### Evidence Ref Grammar`, and `#### Dropped From Evidence`,
+  so `contextHash` and the agent cache keys derived from it differ from previous releases: a
+  `--resume-from-run-id` of a run started before this change re-runs its agents instead of reusing
+  cached results. With a resolvable `diffBaseRef`, `allowedEvidenceIndexDigest` also changes because
+  the range now contributes file refs.
 - The evidence-gate failure message now names the cause and remediation: how many
   paths git status reported, which rule dropped each one, and what to change. It no
   longer reports the runtime's own state files as caller changes.

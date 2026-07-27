@@ -832,8 +832,33 @@ test('refPolicy strict fails the same run (lenient flag is wired, not inert)', a
 test('refPolicy lenient still fails when every candidate is dropped (no vacuous pass)', async () => {
   const { snapshot } = await runCodeReview({ marker: 'INVALID_EVIDENCE_REF', refPolicy: 'lenient' });
   assert.equal(snapshot.status, 'failed');
-  assert.match(snapshot.error, /every candidate was dropped as unsupported evidence \(1 drop\(s\)\)/);
+  assert.match(snapshot.error, /no candidate survived 1 unsupported-evidence drop\(s\) at candidate verification/);
+  assert.match(snapshot.error, /this review is inconclusive, not clean/);
   assert.match(snapshot.error, /includes unsupported evidence ref file:outside\.md/);
+});
+
+test('the vacuous-pass rule also covers the no-active-lenses return', async () => {
+  // A scope-file drop plus a scope that selects no lens used to complete with an empty report and the
+  // scope agent's own summary — a degraded review that read as a clean one.
+  const dropped = await runCodeReview({ marker: 'SCOPE_NO_LENSES', refPolicy: 'lenient' });
+  assert.equal(dropped.snapshot.status, 'failed');
+  assert.match(dropped.snapshot.error, /no candidate survived 1 unsupported-evidence drop\(s\) at scope selection \(no active lenses\)/);
+  assert.match(dropped.snapshot.error, /inconclusive, not clean/);
+
+  // Control: no drop and no lens still completes, so the guard keys on drops rather than on emptiness.
+  const clean = await runCodeReview({ marker: 'SCOPE_NO_LENSES_CLEAN', refPolicy: 'lenient' });
+  assert.equal(clean.snapshot.status, 'completed', clean.snapshot.error ?? '');
+  assert.equal(clean.snapshot.result.degraded, null);
+  assert.equal(clean.snapshot.result.findings.length, 0);
+});
+
+test('a drive-letter absolute cited path is structural at every policy', async () => {
+  for (const refPolicy of ['lenient', 'strict']) {
+    const { snapshot } = await runCodeReview({ marker: 'DRIVE_ABSOLUTE_REF', refPolicy });
+    assert.equal(snapshot.status, 'failed', refPolicy);
+    assert.match(snapshot.error, /structural/, refPolicy);
+    assert.match(snapshot.error, /references a path outside the workspace: C:\/Users\/someone\/outside\.md/, refPolicy);
+  }
 });
 
 test('refPolicy lenient leaves a clean run unchanged (degraded absent)', async () => {
@@ -3425,6 +3450,17 @@ function fakeReviewScope(prompt = '') {
       ? ['docs/client-package-plan.md', 'outside.md']
       : ['docs/client-package-plan.md'];
   const decisionRef = /SCOPE_DECISION_INVALID/.test(prompt) ? 'file:outside.md' : 'file:docs/client-package-plan.md';
+  // A scope that selects no lens at all reaches the early return, which must obey the same
+  // vacuous-pass rule as candidate verification.
+  if (/SCOPE_NO_LENSES/.test(prompt)) {
+    return {
+      files: /SCOPE_NO_LENSES_CLEAN/.test(prompt) ? ['docs/client-package-plan.md'] : ['docs/client-package-plan.md', 'outside.md'],
+      summary: 'No lens applies to this change.',
+      instructions: '',
+      lensDecisions: [],
+      lenses: [],
+    };
+  }
   return {
     files,
     summary: 'Review the client package plan and authority binding claims.',
@@ -3482,6 +3518,18 @@ function fakeReviewFinder(prompt) {
   }
   // The two ref shapes observed in real rejected runs: a file: ref with a line number appended, and
   // a diff:unstaged: guess for a path that exists only as file: (an untracked file).
+  if (/DRIVE_ABSOLUTE_REF/.test(prompt)) {
+    return {
+      candidates: [{
+        file: 'docs/client-package-plan.md',
+        line: 1,
+        summary: 'This candidate cites a drive-letter absolute path.',
+        failureScenario: 'A drive-absolute path escapes the workspace exactly like a POSIX absolute path.',
+        evidenceRefs: ['file:C:/Users/someone/outside.md'],
+        kind: 'contract',
+      }],
+    };
+  }
   if (/TRAVERSAL_REF/.test(prompt)) {
     return {
       candidates: [{
