@@ -831,7 +831,13 @@ test('refPolicy lenient drops the unusable candidate and keeps the rest of the r
   const dropRow = snapshot.result.synthesis.decisions.find((row) => row.reasonCategory === 'unsupported_evidence');
   assert.ok(dropRow, JSON.stringify(snapshot.result.synthesis.decisions));
   assert.equal(dropRow.action, 'drop');
-  assert.match(dropRow.candidateId, /^candidate:/);
+  assert.equal(dropRow.droppedSubject, 'candidate');
+  // A degraded result must say WHAT was lost, or the reader cannot judge the omission or target a rerun.
+  const entry = snapshot.result.degraded.entries[0];
+  assert.equal(entry.subject, 'candidate');
+  assert.equal(entry.dropped.file, 'docs/client-package-plan.md');
+  assert.ok(entry.dropped.claim.length > 0, JSON.stringify(entry));
+  assert.equal(dropRow.droppedFile, 'docs/client-package-plan.md');
 });
 
 test('a cited path that ends in a colon and digits is not read as an appended index', async () => {
@@ -1286,6 +1292,20 @@ test('a direct scriptPath launch of a persisted built-in is refused across ref p
     await strictRuntime.close();
   }
 
+  // --validate promotes the same scriptPath, so it must answer the same question. A preflight that
+  // approves what launch deterministically rejects is worse than no preflight.
+  const strictPreflight = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'strict',
+  });
+  try {
+    await assert.rejects(
+      () => strictPreflight.validateWorkflowInput({ scriptPath: lenientScriptPath, args: { prompt: 'Review pending.ts' } }),
+      /the persisted script was generated under --ref-policy lenient/,
+    );
+  } finally {
+    await strictPreflight.close();
+  }
+
   // Control: the policy that actually generated the script launches it, so the check keys on the
   // mismatch rather than on passing a scriptPath at all. What matters is that the launch is ACCEPTED —
   // how the review then turns out depends on the fixture's evidence, not on this rule.
@@ -1459,6 +1479,36 @@ test('a filename ending in whitespace is not admitted as evidence', async () => 
       withLeading.evidence.allowedEvidenceRefs.some((ref) => ref.includes('app.ts')),
       false,
       'the unrepresentable path stays out even once the gate opens',
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('two paths that share a normalized key do not lend each other readability', async () => {
+  // `sub/a.ts` and `sub\\a.ts` are two different legal POSIX files whose comparison keys collide. When the
+  // readable one authorized the unreadable one, the runtime published a citation licence for content it
+  // had never shown — the exact failure the readability rule exists to prevent.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'sub'), { recursive: true });
+    await writeFile(join(root, 'sub', 'a.ts'), 'export const shown = 1;\n');
+    // Same normalized key, over maxFileBytes (12,000) so no content block, untracked so no hunk.
+    await writeFile(join(root, 'sub\\a.ts'), `export const hidden = "${'x'.repeat(20000)}";\n`);
+
+    const report = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.equal(report.evidence.gated, false, 'the readable sibling still opens the gate');
+    assert.equal(report.evidence.allowedEvidenceRefs.includes('file:sub/a.ts'), true);
+    assert.equal(
+      report.evidence.allowedEvidenceRefs.includes('file:sub\\a.ts'),
+      false,
+      'an unreadable path must not inherit its key-twin\'s readability',
+    );
+    assert.ok(
+      report.evidence.unavailableEvidence.includes('unavailable:file-evidence:1:no-content-block-or-hunk'),
+      JSON.stringify(report.evidence.unavailableEvidence),
     );
   } finally {
     await runtime.close();
@@ -2050,6 +2100,18 @@ test('refPolicy lenient drops one scope file, and fails when every scope file dr
   // The second scope file is the one that dropped; the first survived and the review proceeded.
   assert.match(partial.snapshot.result.degraded.entries[0].label, /scope\.files\[1\]/);
   assert.ok(partial.snapshot.result.findings.length >= 1);
+  // Scope narrowing is not a candidate decision. Recording it as one made stats.dropped and
+  // synthesis.decisions claim a candidate was rejected when review scope was trimmed instead.
+  assert.equal(partial.snapshot.result.degraded.entries[0].subject, 'scope_file');
+  assert.equal(partial.snapshot.result.degraded.entries[0].dropped.file, 'outside.md');
+  assert.equal(partial.snapshot.result.stats.dropped.unsupportedEvidence, 0);
+  assert.equal(
+    partial.snapshot.result.synthesis.decisions.some((row) => row.droppedSubject === 'scope_file'),
+    false,
+    'a scope drop must not appear as a candidate decision row',
+  );
+  // …while stats.refDrops stays the authoritative all-drops counter.
+  assert.equal(partial.snapshot.result.stats.refDrops, 1);
 
   const all = await runCodeReview({ marker: 'SCOPE_FILE_ALL_INVALID', refPolicy: 'lenient' });
   assert.equal(all.snapshot.status, 'failed');
@@ -2288,6 +2350,32 @@ test('validateWorkflowInput reports the evidence precondition and rejects unread
     const task = await runtime.validateWorkflowInput({ name: 'task', args: { prompt: 'Analyze.' } });
     assert.equal(task.evidence, undefined);
     assert.equal(backend.requests.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a batch prompts array with an unusable element is rejected before spend', async () => {
+  // Container shape is not the contract: a null or blank element used to be string-coerced into an agent
+  // prompt, so a deterministically meaningless request reached spend.
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend });
+  try {
+    for (const [prompts, pattern] of [
+      [['ok', null], /"prompts\[1\]".*not a usable string/s],
+      [['ok', '   '], /empty or whitespace-only string/],
+      [['ok', { text: 'x' }], /coerce to text before sending it to an agent/],
+    ]) {
+      await assert.rejects(
+        () => runtime.validateWorkflowInput({ name: 'batch', args: { prompts } }),
+        pattern,
+        JSON.stringify(prompts),
+      );
+    }
+    // Control: a well-formed array still validates, so the rule keys on the element and not on arrays.
+    const ok = await runtime.validateWorkflowInput({ name: 'batch', args: { prompts: ['one', 'two'] } });
+    assert.equal(ok.workflowName, 'batch');
+    assert.equal(backend.requests.length, 0, 'validation must not spend');
   } finally {
     await runtime.close();
   }

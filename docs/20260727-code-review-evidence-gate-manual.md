@@ -229,7 +229,7 @@ npm exec -- ultracode-for-codex result <jobId> --cwd /path/to/project
 | `--evidence-scope <default\|all>` | `default` (`settings.json: workflow.evidenceScope`) | `all`은 **확장자 허용목록만** 완화합니다. 제외 디렉터리·런타임 상태·안전하지 않은 경로는 어떤 scope에서도 인정되지 않습니다 |
 | `--ref-policy <strict\|lenient>` | `strict` (`settings.json: workflow.refPolicy`) | `lenient`는 증거에서 경로를 찾을 수 없는 인용 하나만 드롭하고 결과에 `degraded` + `stats.refDrops`를 남깁니다. 후보가 **전부** 드롭되면 그 실행은 여전히 실패합니다(깨끗한 리뷰로 위장할 수 없음). 렌즈 판단과 구조 위반은 모든 정책에서 치명적 |
 
-`--ref-policy`가 기본값이 아니면 실행 시 공지가 나갑니다 — 사람이 보는 터미널에는 평문으로, `--progress jsonl`로 stderr가 이벤트 스트림인 경우에는 `workflow.notice` 이벤트로 나가므로 `progress.jsonl`은 유효한 JSONL로 유지됩니다. 정책은 빌트인 스크립트 본문에 박히므로 두 정책의 스크립트 해시가 다르고, **정책이 다른 실행을 resume하는 것은 거부됩니다**. 같은 이유로 이미 저장된 스크립트를 `--script-path`로 직접 실행할 때도 정책이 다르면 거부됩니다 — 그러지 않으면 스크립트에 박힌 옛 정책으로 실행되면서 stderr와 저널에는 요청한 정책이 기록되고, 이후 resume이 그 잘못된 기록을 신뢰합니다.
+`--ref-policy`가 기본값이 아니면 실행 시 공지가 나갑니다 — 사람이 보는 터미널에는 평문으로, `--progress jsonl`로 stderr가 이벤트 스트림인 경우에는 `workflow.notice` 이벤트로 나가므로 `progress.jsonl`은 유효한 JSONL로 유지됩니다. 정책은 빌트인 스크립트 본문에 박히므로 두 정책의 스크립트 해시가 다르고, **정책이 다른 실행을 resume하는 것은 거부됩니다**. 같은 이유로 이미 저장된 스크립트를 `--script-path`로 직접 실행할 때도 정책이 다르면 거부되고, **`--validate`도 같은 거부를 그대로 보고합니다**(사전 확인이 통과시킨 것을 실행이 거부하면 사전 확인의 의미가 없습니다) — 그러지 않으면 스크립트에 박힌 옛 정책으로 실행되면서 stderr와 저널에는 요청한 정책이 기록되고, 이후 resume이 그 잘못된 기록을 신뢰합니다.
 
 ### 4.3 `--args` 스펙 (`code-review`)
 
@@ -341,7 +341,17 @@ ref는 줄 단위로 전달되고, 그 프로토콜의 모든 소비자는 줄�
 
 **(6) `--ref-policy`가 실패의 의미를 바꿉니다**
 
-`strict`(기본)에서는 증거에 없는 ref를 인용한 후보가 실행 전체를 실패시킵니다. `lenient`에서는 그 후보만 드롭되고 결과에 `degraded`가 붙습니다. 따라서 **`lenient` 결과를 "발견 없음 = 깨끗함"으로 읽으면 안 됩니다** — `stats.refDrops`, `stats.dropped.unsupportedEvidence`, `degraded`를 먼저 보십시오(드롭된 후보는 `synthesis.decisions`에도 사유와 함께 남습니다). 후보가 전부 드롭되면 실행은 실패하므로, 드롭된 리뷰가 깨끗한 리뷰로 위장하는 경로는 없습니다.
+`strict`(기본)에서는 증거에 없는 ref를 인용한 후보가 실행 전체를 실패시킵니다. `lenient`에서는 그 후보만 드롭되고 결과에 `degraded`가 붙습니다. 따라서 **`lenient` 결과를 "발견 없음 = 깨끗함"으로 읽으면 안 됩니다** — `stats.refDrops`(모든 드롭의 권위 있는 개수)와 `degraded`를 먼저 보십시오.
+
+드롭은 **생애주기가 다릅니다.** 각 항목의 `subject`가 무엇이 일어났는지 말합니다:
+
+| `subject` | 의미 | `stats.dropped.unsupportedEvidence`에 집계 |
+| --- | --- | --- |
+| `scope_file` | 리뷰 범위가 좁아짐 (후보가 거부된 게 아님) | 아니오 |
+| `candidate` | 후보가 거부됨 | 예 (`synthesis.decisions`에도 행이 남음) |
+| `verifier_result` | 검증 결과가 유실됨 | 예 |
+
+각 항목의 `dropped`에는 사라진 것의 경계된 투영(`candidateId`/`file`/`claim`)이 들어 있어, **무엇이 빠졌는지**를 보고 재실행 여부를 판단할 수 있습니다. 후보가 전부 드롭되면 실행은 실패하므로, 드롭된 리뷰가 깨끗한 리뷰로 위장하는 경로는 없습니다.
 
 ### 4.7 `code-review`가 막힐 때의 대안
 
