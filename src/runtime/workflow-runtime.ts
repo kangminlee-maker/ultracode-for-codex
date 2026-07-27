@@ -1690,6 +1690,7 @@ const context = await workspaceContext({
   includeDiff: true,
   diffBaseRef: workflowInput.diffBaseRef
 });
+const diffBaseRef = firstLineValue(context, "diffBaseRef: ");
 const allowedEvidenceRefs = sectionLines(context, "### Allowed Evidence Refs", ["### Unavailable Evidence", "### Git Status"]);
 const unavailableEvidenceRefs = sectionLines(context, "### Unavailable Evidence", ["### Git Status"]);
 const allowedEvidenceRefMap = objectMap(allowedEvidenceRefs);
@@ -1714,8 +1715,12 @@ const decisionRefSet = {
 const fileRefSet = {
   name: "allowed file refs",
   size: allowedFileRefs.length,
-  source: "file: entries in the evidence context (git status changed/untracked paths)",
-  populatedBy: "uncommitted or untracked paths in the working tree"
+  source: diffBaseRef
+    ? "file: entries in the evidence context (git status changed/untracked paths and the diffBaseRef commit range)"
+    : "file: entries in the evidence context (git status changed/untracked paths)",
+  populatedBy: diffBaseRef
+    ? "uncommitted or untracked paths in the working tree, plus paths the " + diffBaseRef + "..HEAD range touched"
+    : "uncommitted or untracked paths in the working tree, or paths in a commit range when diffBaseRef is supplied"
 };
 if (firstLineValue(context, "evidenceGate: ") === "closed") {
   fail(firstLineValue(context, "evidenceGateReason: "));
@@ -1723,7 +1728,6 @@ if (firstLineValue(context, "evidenceGate: ") === "closed") {
 const sourceSnapshotId = firstLineValue(context, "Source Snapshot: ") || firstLineValue(context, "sourceSnapshotId: ") || hash(context);
 const contextHash = firstLineValue(context, "Context Hash: ") || firstLineValue(context, "contextHash: ") || hash({ context: context });
 const allowedEvidenceIndexDigest = firstLineValue(context, "allowedEvidenceIndexDigest: ") || hash(allowedEvidenceRefs);
-const diffBaseRef = firstLineValue(context, "diffBaseRef: ");
 const truncation = firstLineValue(context, "truncation: ") || "{}";
 const sourceSnapshotHashKey = hash({ sourceSnapshotId: sourceSnapshotId, contextHash: contextHash, allowedEvidenceIndexDigest: allowedEvidenceIndexDigest }).slice(7, 39);
 announcePhasePlan({
@@ -4725,13 +4729,25 @@ async function buildWorkspaceContext(
   ];
   const changedPaths = gitStatusPathParse.paths.filter((path) => shouldIncludeWorkspaceContextPath(path, runtimeStateExcludedPaths));
   const listedPaths = await listWorkspaceContextCandidates(root);
+  // Two admission rules, deliberately different. A path the EVIDENCE scope admitted must be shown:
+  // an untracked .java under --evidence-scope all has no unstaged patch, so if the budget allowlist
+  // also removed it from the included files the reviewer would see a path and a status and nothing
+  // else — the gate would open and agents would spend blind. Everything else (the directory walk,
+  // priority files, query mentions) keeps the prompt-budget allowlist.
+  const evidenceFilePaths = new Set((changeEvidence?.filePaths ?? []).map(workspacePathKey));
   const candidates = uniqueStrings([
     ...explicitPaths,
     ...changedPaths,
     ...(changeEvidence?.filePaths ?? []),
     ...WORKSPACE_CONTEXT_PRIORITY_FILES,
     ...listedPaths,
-  ]).filter((path) => shouldIncludeWorkspaceContextPath(path, runtimeStateExcludedPaths) && !excludedWorkspacePaths.has(workspacePathKey(path)));
+  ]).filter((path) => {
+    const key = workspacePathKey(path);
+    if (excludedWorkspacePaths.has(key)) return false;
+    return evidenceFilePaths.has(key)
+      ? evidencePathAllowed(key, runtimeStateExcludedPaths, evidenceScope)
+      : shouldIncludeWorkspaceContextPath(path, runtimeStateExcludedPaths);
+  });
   const fileBlocks: string[] = [];
   let usedBytes = 0;
   for (const candidate of candidates) {
@@ -4894,7 +4910,20 @@ async function buildChangeEvidenceContext(
         `${baseCommit}..HEAD`,
         '--',
       ]).then(
-        (text) => uniqueStrings(text.split('\0').filter(Boolean).map(workspacePathKey)),
+        (text) => {
+          const names: string[] = [];
+          let unsafe = 0;
+          for (const raw of text.split('\0').filter(Boolean)) {
+            const path = workspacePathKey(raw);
+            // Same predicate the git-status parser applies. A committed name carrying a newline, an
+            // escape, or a bidi control would otherwise reach a file: ref and be interpolated into the
+            // structured prompt, where it can break section and ref boundaries.
+            if (isWorkspaceEvidencePathSafe(path)) names.push(path);
+            else unsafe += 1;
+          }
+          if (unsafe > 0) unavailableEvidence.push(`unavailable:diff-committed-name:${unsafe}:unsafe-path`);
+          return uniqueStrings(names);
+        },
         (err: unknown) => {
           unavailableEvidence.push(unavailableGitEvidence('diff-committed-names', err, options.diffBaseRef));
           return [];
@@ -5191,7 +5220,10 @@ function parseSymmetricGitDiffHeader(rest: string): GitDiffHeader | undefined {
   for (let index = rest.indexOf(' b/'); index >= 0; index = rest.indexOf(' b/', index + 1)) {
     const oldPath = rest.slice('a/'.length, index);
     const newPath = rest.slice(index + ' b/'.length);
-    if (oldPath && oldPath === newPath) return { oldPath, newPath };
+    // Symmetry alone is not proof: renaming `foo.ts` to `bar.ts b/foo.ts b/bar.ts` also yields a
+    // symmetric split, whose halves would then be published as a path that does not exist. A candidate
+    // containing the separator is exactly that ambiguous case, so it stays unparsed.
+    if (oldPath && oldPath === newPath && !oldPath.includes(' b/')) return { oldPath, newPath };
   }
   return undefined;
 }
@@ -5667,6 +5699,9 @@ function workspaceContextPathVerdict(
 ): WorkspaceContextDropRule | undefined {
   const normalized = path.replaceAll('\\', '/').replace(/^\.\/+/, '');
   if (!normalized || normalized.startsWith('../') || normalized.includes('/../')) return 'unsafe-path';
+  if (!isWorkspaceEvidencePathSafe(normalized)) return 'unsafe-path';
+  // A name carrying a newline, an escape, or a bidi control would break the structured prompt's section
+  // and ref boundaries wherever it is interpolated, so it is inadmissible at every evidence scope.
   if (workspacePathExcludedBySet(normalized, runtimeStateExcludedPaths)) return 'runtime-state';
   const parts = normalized.split('/');
   if (parts.some((part) => WORKSPACE_CONTEXT_EXCLUDED_DIRS.has(part))) return 'excluded-dir';

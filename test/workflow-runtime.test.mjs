@@ -1296,6 +1296,91 @@ test('a committed path containing a space survives into the evidence gate', asyn
   }
 });
 
+test('evidenceScope all shows the admitted file contents, not just its path', async () => {
+  // An untracked .java has no unstaged patch, so if the budget allowlist also removed it from the
+  // included files the gate would open and agents would spend with a path and a status and nothing
+  // else — a blind review of the repositories this scope exists to support.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { evidenceScope: 'all' } });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src', 'App.java'), 'class App { void authority() {} }\n');
+
+    const launch = await runtime.launch({ name: 'code-review', args: { prompt: 'Review src/App.java' } });
+    await collectEvents(runtime, launch.taskId);
+    assert.ok(backend.requests.length >= 1, 'the gate must open under evidenceScope all');
+    const prompt = backend.requests[0].messages.map((message) => message.content).join('\n');
+    assert.match(prompt, /--- src\/App\.java \(/, 'the admitted file must reach an included-file block');
+    assert.match(prompt, /void authority\(\)/, 'its contents must be present, not only its path');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('an ambiguous rename header is left unparsed rather than misattributed', async () => {
+  // Renaming into a name that contains the header separator produces a symmetric split whose halves
+  // are a path that does not exist. Publishing a diff ref for it would let findings cite evidence
+  // attributed to the wrong file, so the header stays unparsed.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'foo.ts'), 'export const foo = 1;\n');
+    await gitLines(root, ['add', '--', 'foo.ts']);
+    await gitLines(root, ['commit', '-m', 'add foo']);
+    await mkdir(join(root, 'bar.ts b', 'foo.ts b'), { recursive: true });
+    await gitLines(root, ['mv', '--', 'foo.ts', join('bar.ts b', 'foo.ts b', 'bar.ts')]);
+    await gitLines(root, ['commit', '-m', 'rename into an ambiguous name']);
+
+    const report = await runtime.validateWorkflowInput({
+      name: 'code-review',
+      args: { prompt: 'Review the rename.', diffBaseRef: 'HEAD~1' },
+    });
+    const refs = report.evidence.allowedEvidenceRefs;
+    // Positive control: the real (renamed) path is published from the NUL name listing.
+    assert.equal(refs.includes('file:bar.ts b/foo.ts b/bar.ts'), true, JSON.stringify(refs));
+    // The fabricated symmetric path — the halves of the ambiguous header — must appear nowhere.
+    const fabricated = 'foo.ts b/bar.ts';
+    for (const ref of refs) {
+      const path = ref.startsWith('file:')
+        ? ref.slice('file:'.length)
+        : ref.replace(/^(diff|hunk):[a-z]+:/, '').replace(/:\d+$/, '');
+      assert.notEqual(path, fabricated, `misattributed ref published: ${ref}`);
+    }
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('an unsafe committed filename is excluded and reported', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'safe.ts'), 'export const safe = 1;\n');
+    // A newline in the name is exactly what the git-status parser already refuses.
+    await writeFile(join(root, 'un\nsafe.ts'), 'export const unsafe = 1;\n');
+    await gitLines(root, ['add', '-A']);
+    await gitLines(root, ['commit', '-m', 'both']);
+
+    const report = await runtime.validateWorkflowInput({
+      name: 'code-review',
+      args: { prompt: 'Review the last commit.', diffBaseRef: 'HEAD~1' },
+    });
+    assert.equal(report.evidence.allowedEvidenceRefs.includes('file:safe.ts'), true);
+    for (const ref of report.evidence.allowedEvidenceRefs) {
+      assert.ok(!ref.includes('\n'), `unsafe name reached a ref: ${JSON.stringify(ref)}`);
+    }
+    assert.ok(
+      report.evidence.unavailableEvidence.some((token) => token.includes('diff-committed-name')),
+      JSON.stringify(report.evidence.unavailableEvidence),
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
 test('a committed-range path is prioritized for an included-file block', async () => {
   // Opening the gate is not enough — agents would spend without seeing the change. In a repository
   // with more files than maxFiles, a committed-only path loses to the directory walk unless the
