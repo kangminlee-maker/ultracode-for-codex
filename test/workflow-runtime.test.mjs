@@ -741,10 +741,333 @@ test('built-in code-review fails before spawning agents when the working tree ha
     const snapshot = runtime.get(launch.taskId);
     assert.equal(snapshot.status, 'failed');
     assert.match(snapshot.error, /no reviewable change evidence in the working tree/);
-    assert.match(snapshot.error, /allowed file refs is empty \(0 entries\) derived from /);
-    assert.match(snapshot.error, /; populated by /);
+    // Cause and remediation, not just the fact of failure.
+    assert.match(snapshot.error, /git status reported no changed or untracked paths/);
+    assert.match(snapshot.error, /change a file whose extension is in the evidence allowlist/);
+    assert.match(snapshot.error, /re-run `--validate` to confirm before spending/);
     assert.equal(backend.requests.length, 0);
     assert.equal(snapshot.events.some((event) => event.type === 'workflow.agent.started'), false);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('code-review normalizes ref grammar mistakes instead of discarding the run', async () => {
+  for (const marker of ['LINE_SUFFIX_REF', 'KIND_MISMATCH_REF']) {
+    const backend = new FakeSubagentBackend();
+    const { runtime, root } = await createRuntime({ backend });
+    try {
+      await initializeGitRepo(root);
+      await mkdir(join(root, 'docs'), { recursive: true });
+      await writeFile(join(root, 'docs', 'client-package-plan.md'), 'The platform token owns authority.\n');
+
+      const launch = await runtime.launch({
+        name: 'code-review',
+        args: { prompt: `${marker} Review docs/client-package-plan.md.` },
+      });
+      await collectEvents(runtime, launch.taskId);
+      const snapshot = runtime.get(launch.taskId);
+      assert.equal(snapshot.status, 'completed', `${marker}: ${snapshot.error ?? ''}`);
+      assert.ok(snapshot.result.stats.normalizedRefs >= 1, marker);
+      const refs = snapshot.result.findings.flatMap((finding) => finding.evidenceRefs);
+      // Every surviving ref is a string the runtime actually published.
+      for (const ref of refs) {
+        assert.ok(
+          ref === 'file:docs/client-package-plan.md' || /^(diff|hunk):/.test(ref),
+          `${marker} normalized to an unpublished ref: ${ref}`,
+        );
+      }
+      for (const finding of snapshot.result.findings) {
+        assert.equal(finding.file, 'docs/client-package-plan.md', marker);
+      }
+    } finally {
+      await runtime.close();
+    }
+  }
+});
+
+test('code-review still fails closed on a ref whose path is not in evidence (normalization control)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'docs'), { recursive: true });
+    await writeFile(join(root, 'docs', 'client-package-plan.md'), 'The platform token owns authority.\n');
+
+    const launch = await runtime.launch({
+      name: 'code-review',
+      args: { prompt: 'INVALID_EVIDENCE_REF Review docs/client-package-plan.md.' },
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.match(snapshot.error, /includes unsupported evidence ref file:outside\.md/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('built-in code-review gate names the rule that dropped each changed path', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await mkdir(join(root, 'dist'), { recursive: true });
+    await writeFile(join(root, 'src', 'App.java'), 'class App {}\n');
+    await writeFile(join(root, 'Dockerfile'), 'FROM scratch\n');
+    await writeFile(join(root, 'dist', 'bundle.js'), 'export const built = 1;\n');
+
+    const launch = await runtime.launch({
+      name: 'code-review',
+      args: { prompt: 'Review the pending change.' },
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.match(snapshot.error, /git status reported 3 changed path\(s\), all dropped before becoming evidence/);
+    assert.match(snapshot.error, /2 by extension-not-allowed/);
+    assert.match(snapshot.error, /src\/App\.java/);
+    assert.match(snapshot.error, /Dockerfile/);
+    assert.match(snapshot.error, /1 by excluded-dir/);
+    assert.match(snapshot.error, /dist\/bundle\.js/);
+    assert.equal(backend.requests.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workspace evidence discloses dropped paths and the ref grammar to the reviewer', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src', 'App.java'), 'class App {}\n');
+    await writeFile(join(root, 'notes.md'), 'A pending note.\n');
+
+    const launch = await runtime.launch({
+      name: 'code-review',
+      args: { prompt: 'Review the pending change.' },
+    });
+    await collectEvents(runtime, launch.taskId);
+    // The gate opened on notes.md, so the scope agent ran and received the evidence context.
+    assert.ok(backend.requests.length >= 1);
+    const prompt = backend.requests[0].messages.map((message) => message.content).join('\n');
+    assert.match(prompt, /#### Dropped From Evidence/);
+    assert.match(prompt, /src\/App\.java \(extension-not-allowed: not citable, contents withheld\)/);
+    assert.match(prompt, /#### Evidence Ref Grammar/);
+    assert.match(prompt, /Do not append a line/);
+    assert.match(prompt, /per-file hunk index, not a line number/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('built-in code-review reviews a committed range when diffBaseRef resolves on a clean tree', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'shipped.ts'), 'export const shipped = 1;\n');
+    await gitLines(root, ['add', 'shipped.ts']);
+    await gitLines(root, ['commit', '-m', 'ship']);
+
+    const launch = await runtime.launch({
+      name: 'code-review',
+      args: { prompt: 'Review the last commit.', diffBaseRef: 'HEAD~1' },
+    });
+    await collectEvents(runtime, launch.taskId);
+    // Gate opened from the committed range alone: the working tree is clean.
+    assert.ok(backend.requests.length >= 1);
+    const prompt = backend.requests[0].messages.map((message) => message.content).join('\n');
+    assert.match(prompt, /evidenceGate: open/);
+    assert.match(prompt, /file:shipped\.ts/);
+    assert.match(prompt, /diff:committed:shipped\.ts/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a clean tree without diffBaseRef stays gated (negative control for committed-range review)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'shipped.ts'), 'export const shipped = 1;\n');
+    await gitLines(root, ['add', 'shipped.ts']);
+    await gitLines(root, ['commit', '-m', 'ship']);
+
+    const launch = await runtime.launch({ name: 'code-review', args: { prompt: 'Review.' } });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.match(snapshot.error, /no reviewable change evidence in the working tree/);
+    assert.equal(backend.requests.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('evidenceScope all admits extension-excluded sources and only those (both directions)', async () => {
+  for (const scope of ['default', 'all']) {
+    const backend = new FakeSubagentBackend();
+    const { runtime, root } = await createRuntime({ backend, runtimeOptions: { evidenceScope: scope } });
+    try {
+      await initializeGitRepo(root);
+      await mkdir(join(root, 'src'), { recursive: true });
+      await mkdir(join(root, 'dist'), { recursive: true });
+      await writeFile(join(root, 'src', 'App.java'), 'class App {}\n');
+      await writeFile(join(root, 'dist', 'bundle.js'), 'export const built = 1;\n');
+
+      const report = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review.' } });
+      if (scope === 'default') {
+        assert.equal(report.evidence.gated, true);
+        assert.equal(report.evidence.allowedFileRefs, 0);
+      } else {
+        assert.equal(report.evidence.gated, false);
+        assert.equal(report.evidence.allowedEvidenceRefs.includes('file:src/App.java'), true);
+        // 'all' forgives the extension rule and nothing else.
+        assert.equal(report.evidence.allowedEvidenceRefs.some((ref) => ref.includes('dist/bundle.js')), false);
+        assert.deepEqual(report.evidence.dropped, [{ path: 'dist/bundle.js', rule: 'excluded-dir' }]);
+      }
+      // A preflight preview never spends an agent.
+      assert.equal(backend.requests.length, 0);
+    } finally {
+      await runtime.close();
+    }
+  }
+});
+
+test('validateWorkflowInput reports the evidence precondition and rejects unreadable args', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src', 'App.java'), 'class App {}\n');
+
+    const gated = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review.' } });
+    assert.equal(gated.evidence.gated, true);
+    assert.match(gated.evidence.reason, /1 by extension-not-allowed \(src\/App\.java\)/);
+    assert.deepEqual(gated.evidence.dropped, [{ path: 'src/App.java', rule: 'extension-not-allowed' }]);
+
+    await writeFile(join(root, 'src', 'app.ts'), 'export const app = 1;\n');
+    const ready = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review.' } });
+    assert.equal(ready.evidence.gated, false);
+    assert.equal(ready.evidence.allowedFileRefs, 1);
+    assert.equal(ready.evidence.reason, undefined);
+
+    // The free pre-check also answers the request-contract question.
+    await assert.rejects(
+      () => runtime.validateWorkflowInput({ name: 'code-review', args: { promt: 'typo' } }),
+      /unknown workflow arg "promt"/,
+    );
+    // A non-evidence built-in reports no evidence section at all.
+    const task = await runtime.validateWorkflowInput({ name: 'task', args: { prompt: 'Analyze.' } });
+    assert.equal(task.evidence, undefined);
+    assert.equal(backend.requests.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('built-in request contract rejects unreadable args at launch with value, cause, and remediation', async () => {
+  const rejections = [
+    {
+      label: 'unknown key with a near match',
+      args: { promt: 'review the auth path' },
+      value: /unknown workflow arg "promt" for built-in "code-review"/,
+      cause: /would be silently ignored \(3 accepted keys: prompt, level, diffBaseRef\)/,
+      remediation: /did you mean "prompt"\?/,
+    },
+    {
+      label: 'unknown key with a prefix match',
+      args: { diffBase: 'HEAD~1' },
+      value: /unknown workflow arg "diffBase"/,
+      cause: /3 accepted keys/,
+      remediation: /did you mean "diffBaseRef"\?/,
+    },
+    {
+      label: 'unknown key with no near match',
+      args: { reviewDepth: 'max' },
+      value: /unknown workflow arg "reviewDepth"/,
+      cause: /would be silently ignored/,
+      remediation: /remove it, or use one of the accepted keys/,
+    },
+    {
+      label: 'unsupported enum value',
+      args: { level: 'medium' },
+      value: /workflow arg "level" for built-in "code-review" has an unsupported value "medium"/,
+      cause: /not one of the 2 supported values \("high", "xhigh"\), and an unrecognized value silently selects "xhigh"/,
+      remediation: /pass one of "high" or "xhigh" \(case-insensitive\)/,
+    },
+    {
+      label: 'wrong prompt type',
+      args: { prompt: 123 },
+      value: /workflow arg "prompt" for built-in "code-review" is not a non-empty string/,
+      cause: /received number, which the workflow would silently replace with its default/,
+      remediation: /omit "prompt" to accept the default deliberately/,
+    },
+    {
+      label: 'args that are not an object',
+      args: [],
+      value: /workflow args for built-in "code-review" must be a JSON object/,
+      cause: /received an array/,
+      remediation: /pass an object with the 3 accepted keys/,
+    },
+    {
+      label: 'unresolvable diffBaseRef',
+      args: { diffBaseRef: 'no-such-ref' },
+      value: /workflow arg "diffBaseRef" for built-in "code-review" does not resolve to a commit: "no-such-ref"/,
+      cause: /git rev-parse --verify rejected it in /,
+      remediation: /omit "diffBaseRef" to review only the working tree/,
+    },
+  ];
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
+    for (const rejection of rejections) {
+      let message = '';
+      try {
+        await runtime.launch({ name: 'code-review', args: rejection.args });
+        assert.fail(`expected rejection for ${rejection.label}`);
+      } catch (err) {
+        message = err.message;
+      }
+      assert.match(message, rejection.value, rejection.label);
+      assert.match(message, rejection.cause, rejection.label);
+      assert.match(message, rejection.remediation, rejection.label);
+    }
+    // Rejections happen before any journal or spend.
+    assert.equal(backend.requests.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('built-in request contract accepts documented args (negative control) and honors level case-insensitively', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
+
+    const accepted = [
+      { args: { prompt: 'Review pending.ts', level: 'high' }, effort: 'medium' },
+      { args: { prompt: 'Review pending.ts', level: 'HIGH' }, effort: 'medium' },
+      { args: { prompt: 'Review pending.ts', level: 'xhigh' }, effort: 'xhigh' },
+      { args: { prompt: 'Review pending.ts' }, effort: 'xhigh' },
+    ];
+    for (const entry of accepted) {
+      backend.requests.length = 0;
+      const launch = await runtime.launch({ name: 'code-review', args: entry.args });
+      await collectEvents(runtime, launch.taskId);
+      assert.ok(backend.requests.length >= 1, JSON.stringify(entry.args));
+      assert.equal(backend.requests[0].reasoningEffort, entry.effort, JSON.stringify(entry.args));
+    }
   } finally {
     await runtime.close();
   }
@@ -2845,6 +3168,7 @@ async function createRuntime({ backend, runtimeOptions = {} }) {
       nestedWorkflows: runtimeOptions.nestedWorkflows,
       agentTypes: runtimeOptions.agentTypes,
       builtinWorkflows: runtimeOptions.builtinWorkflows,
+      evidenceScope: runtimeOptions.evidenceScope,
       journalDurability: runtimeOptions.journalDurability,
     }),
   };
@@ -3050,6 +3374,32 @@ function fakeReviewFinder(prompt) {
         summary: 'This candidate intentionally references unsupported evidence.',
         failureScenario: 'The workflow should fail before verification.',
         evidenceRefs: ['file:outside.md'],
+        kind: 'contract',
+      }],
+    };
+  }
+  // The two ref shapes observed in real rejected runs: a file: ref with a line number appended, and
+  // a diff:unstaged: guess for a path that exists only as file: (an untracked file).
+  if (/LINE_SUFFIX_REF/.test(prompt)) {
+    return {
+      candidates: [{
+        file: 'docs/client-package-plan.md:1',
+        line: 1,
+        summary: 'This candidate cites a file ref with a line number appended.',
+        failureScenario: 'A caller reading the report needs the cited path to resolve.',
+        evidenceRefs: ['file:docs/client-package-plan.md:1'],
+        kind: 'contract',
+      }],
+    };
+  }
+  if (/KIND_MISMATCH_REF/.test(prompt)) {
+    return {
+      candidates: [{
+        file: 'docs/client-package-plan.md',
+        line: 1,
+        summary: 'This candidate guesses a diff ref kind that this snapshot never produced.',
+        failureScenario: 'A caller reading the report needs the cited path to resolve.',
+        evidenceRefs: ['diff:unstaged:docs/client-package-plan.md'],
         kind: 'contract',
       }],
     };

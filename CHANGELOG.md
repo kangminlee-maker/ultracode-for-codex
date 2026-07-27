@@ -8,6 +8,39 @@ the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Per-built-in request contracts validated at launch, before the permission gate and
+  any spend: unknown or mistyped `--args` keys (with a suggestion), non-string
+  `prompt`, unsupported `level`, non-array `prompts`, and a `diffBaseRef` that does
+  not resolve to a commit are rejected. Every rejection names the rejected value,
+  the cause, and the remediation. `level` now accepts `"xhigh"` explicitly (the
+  previously unnamed default) and is compared case-insensitively.
+- `run --validate` reports the change-evidence precondition for `code-review` with
+  no agent and no token: whether the gate would open, the allowed evidence refs, and
+  each dropped path with the rule that dropped it. It also runs the request-contract
+  validation, so it is a complete pre-check.
+- `--evidence-scope <default|all>` (settings: `workflow.evidenceScope`, default
+  `default`). `all` forgives only the evidence extension allowlist, making
+  `.java`/`.rb`/`.sql`/`.kt` repositories reviewable; excluded directories, runtime
+  state, and unsafe paths stay inadmissible at every scope, and prompt-budget file
+  selection keeps its own allowlist.
+- `code-review` reviews a committed range on a clean tree: a resolvable `diffBaseRef`
+  now contributes file refs, so `diffBaseRef..HEAD` alone can open the evidence gate.
+- Evidence context discloses `#### Dropped From Evidence` (paths the reviewer can see
+  in git status but may not cite) and `#### Evidence Ref Grammar`.
+
+### Changed
+
+- The evidence-gate failure message now names the cause and remediation: how many
+  paths git status reported, which rule dropped each one, and what to change. It no
+  longer reports the runtime's own state files as caller changes.
+- Cited evidence refs are normalized before rejection — a trailing line number is
+  stripped from a `file:` ref, and a mismatched ref kind resolves through the cited
+  path — so a grammar slip no longer discards a whole run's agent results. A path
+  that is not in the evidence snapshot still fails closed. `stats.normalizedRefs`
+  counts the normalizations.
+
 ## [0.6.1] - 2026-07-18
 
 ### Fixed

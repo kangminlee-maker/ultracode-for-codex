@@ -328,10 +328,21 @@ Useful controls:
   read-only phase-wise analysis subagents; the main orchestrator owns edits.
   Built-in `code-review` uses deterministic
   review evidence, allowed evidence refs, dynamic lenses, candidate verification,
-  and bounded final synthesis. It reviews pending working-tree changes: on a
-  clean tree it fails before spawning any agent with `no reviewable change
-  evidence in the working tree`, and ref rejections name the allowed set, its
-  size, its source, and what populates it.
+  and bounded final synthesis. It reviews pending working-tree changes plus the
+  `diffBaseRef..HEAD` range when one resolves; with neither it fails before
+  spawning any agent with `no reviewable change evidence in the working tree`,
+  naming which rule dropped which path, and ref rejections name the allowed set,
+  its size, its source, and what populates it. Built-in args are validated at
+  launch against a per-built-in contract, so an unknown key, a mistyped key, an
+  unsupported `level`, or an unresolvable `diffBaseRef` is rejected before any
+  spend with the rejected value, the cause, and the remediation. Cited refs are
+  normalized before rejection (a trailing line number is stripped, and a
+  mismatched ref kind resolves through the cited path), so only a path that is
+  not in the evidence snapshot still fails closed.
+- `run --validate` is the zero-token pre-check: it validates the request contract
+  and, for `code-review`, reports the change-evidence precondition — whether the
+  gate would open, the allowed evidence refs, and every dropped path with its
+  rule. Use it before launching a run.
 - Install consumers from a packaged artifact.
 - Keep `journalPath`, `journal.jsonl`, and journal contents out of CLI output.
   Local runtime state may still contain runtime-owned

@@ -36,6 +36,7 @@ test('settings.json provides Codex workflow runtime defaults', () => {
       worktreeRetention: 'remove-clean',
       agentConcurrency: 'unbounded',
       nestedWorkflows: 'disabled',
+      evidenceScope: 'default',
       agentWebSearch: 'disabled',
       agentFileWrite: 'disabled',
       agentMcp: [],

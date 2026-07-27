@@ -10,7 +10,7 @@ import { createInterface } from 'node:readline/promises';
 import { CodexSubagentBackend } from './codex/subagent-backend.js';
 import { probeCodexSetup } from './codex/setup-probe.js';
 import { WorkflowTaskRegistry, isRetryableFailureReason } from './runtime/workflow-runtime.js';
-import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, isAgentConcurrencyKeyword, isAgentFileWrite, isAgentTypes, isAgentWebSearch, isNestedWorkflows, isWorktreeRetention, parseAgentMcpServerList } from './runtime/types.js';
+import { EVIDENCE_SCOPE_VALUES, SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, isAgentConcurrencyKeyword, isAgentFileWrite, isAgentTypes, isAgentWebSearch, isEvidenceScope, isNestedWorkflows, isWorktreeRetention, parseAgentMcpServerList } from './runtime/types.js';
 import { loadAgentTypeRegistry } from './codex/agent-type-registry.js';
 import { codexSourceHome } from './codex/model-catalog.js';
 import { ultracodePackageVersion } from './runtime/package-info.js';
@@ -35,11 +35,12 @@ import {
   workflowDefaultAgentConcurrency,
   workflowDefaultNestedWorkflows,
   workflowDefaultAgentWebSearch,
+  workflowDefaultEvidenceScope,
   workflowDefaultAgentFileWrite,
   workflowDefaultAgentMcpServers,
   workflowDefaultAgentTypes,
 } from './settings.js';
-import type { AgentConcurrency, AgentFileWrite, AgentMcpServers, AgentTypes, AgentWebSearch, NestedWorkflows, ReasoningEffort, ResolvedAgentType, Verbosity, WorktreeRetention } from './runtime/types.js';
+import type { AgentConcurrency, AgentFileWrite, AgentMcpServers, AgentTypes, AgentWebSearch, EvidenceScope, NestedWorkflows, ReasoningEffort, ResolvedAgentType, Verbosity, WorktreeRetention } from './runtime/types.js';
 import type { WorkflowExecutionMode, WorkflowPermissionPolicy, WorkflowProgressMode } from './settings.js';
 import type {
   WorkflowEvent,
@@ -119,6 +120,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   const agentConcurrency = parseAgentConcurrency(options.agentConcurrency);
   const budgetTotal = parseBudget(options.budget);
   const nestedWorkflows = parseNestedWorkflows(options.nestedWorkflows);
+  const evidenceScope = parseEvidenceScope(options.evidenceScope);
   const agentWebSearch = parseAgentWebSearch(options.agentWebSearch);
   const agentFileWrite = parseAgentFileWrite(options.agentFileWrite);
   const agentMcpServers = parseAgentMcpServers(options.agentMcp);
@@ -167,6 +169,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
     agentConcurrency,
     budgetTotal,
     nestedWorkflows,
+    evidenceScope,
     agentTypes,
   });
 
@@ -210,11 +213,13 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
 async function withPreflightRegistry<T>(
   cwd: string,
   fn: (runtime: WorkflowTaskRegistry) => Promise<T>,
+  evidenceScope?: EvidenceScope,
 ): Promise<T> {
   const runtime = new WorkflowTaskRegistry({
     backend: PREFLIGHT_BACKEND,
     cwd,
     requestTimeoutMs: 0,
+    ...(evidenceScope ? { evidenceScope } : {}),
   });
   try {
     return await fn(runtime);
@@ -228,11 +233,22 @@ async function validateWorkflowCommand(
   cwd: string,
   options: ParsedOptions,
 ): Promise<number> {
-  const report = await withPreflightRegistry(cwd, (runtime) => runtime.validateWorkflowInput(input));
+  const report = await withPreflightRegistry(
+    cwd,
+    (runtime) => runtime.validateWorkflowInput(input),
+    parseEvidenceScope(options.evidenceScope),
+  );
   if (wantsPlain(options)) {
     process.stdout.write(`[validate] ${report.workflowName} (${report.workflowSource}) agents=${report.agentCallSites} schema=${report.schemaCallSites} keyed=${report.keyedCallSites}\n`);
     for (const warning of report.warnings) {
       process.stdout.write(`[validate] warning: ${warning}\n`);
+    }
+    if (report.evidence) {
+      process.stdout.write(`[validate] evidence: ${report.evidence.gated ? 'gated' : 'ready'} fileRefs=${report.evidence.allowedFileRefs} evidenceRefs=${report.evidence.allowedEvidenceRefs.length}\n`);
+      if (report.evidence.reason) process.stdout.write(`[validate] evidence: ${report.evidence.reason}\n`);
+      for (const dropped of report.evidence.dropped) {
+        process.stdout.write(`[validate] dropped: ${dropped.path} (${dropped.rule})\n`);
+      }
     }
   } else {
     process.stdout.write(`${JSON.stringify({
@@ -309,6 +325,7 @@ interface ParsedOptions {
   readonly agentConcurrency?: string;
   readonly nestedWorkflows?: string;
   readonly agentWebSearch?: string;
+  readonly evidenceScope?: string;
   readonly agentFileWrite?: string;
   readonly agentMcp?: string;
   readonly agentTypes?: string;
@@ -2141,6 +2158,13 @@ function parseAgentWebSearch(value: string | undefined): AgentWebSearch {
   throw new Error("agent-web-search must be 'disabled' or 'enabled'.");
 }
 
+function parseEvidenceScope(value: string | undefined): EvidenceScope {
+  if (value === undefined) return workflowDefaultEvidenceScope();
+  const normalized = value.trim();
+  if (isEvidenceScope(normalized)) return normalized;
+  throw new Error(`evidence-scope must be one of ${EVIDENCE_SCOPE_VALUES.join(', ')}.`);
+}
+
 function parseAgentFileWrite(value: string | undefined): AgentFileWrite {
   if (value === undefined) return workflowDefaultAgentFileWrite();
   if (isAgentFileWrite(value)) return value;
@@ -2242,6 +2266,7 @@ Options:
   --worktree-retention <preserve-all|remove-clean>  Reclaim unchanged completed isolated worktrees. Default: settings.json (${workflowDefaultWorktreeRetention()}).
   --agent-concurrency <unbounded|auto|N>  Bound concurrent agent dispatches per run. 'auto' = min(16, cores-2). Default: settings.json (${String(workflowDefaultAgentConcurrency())}).
   --nested-workflows <disabled|enabled>  Let a workflow run a built-in or inline child via workflow(). Default: settings.json (${workflowDefaultNestedWorkflows()}).
+  --evidence-scope <default|all>      Which changed paths may become citable review evidence. 'all' forgives only the extension allowlist (so .java/.rb/.sql projects are reviewable); excluded dirs, runtime state, and unsafe paths stay out. Run-level; re-pass on resume. Default: settings.json (${workflowDefaultEvidenceScope()}).
   --agent-web-search <disabled|enabled>  Let workflow subagents use the native web_search tool (run-level; re-pass on resume; results aren't reproducible on re-run). Default: settings.json (${workflowDefaultAgentWebSearch()}).
   --agent-file-write <disabled|enabled>  Let worktree-isolated subagents write files (write_file/str_replace, confined to the worktree; run-level; re-pass on resume). Default: settings.json (${workflowDefaultAgentFileWrite()}).
   --agent-mcp <server1,server2,...>  Let subagents call the named Codex MCP servers (allowlist; provisioned from your config.toml + auto-approved; run-level; re-pass on resume). Off when empty. Default: settings.json (${JSON.stringify(workflowDefaultAgentMcpServers())}).

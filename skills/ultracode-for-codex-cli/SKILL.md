@@ -107,10 +107,18 @@ CLI behavior:
   other agents inherit the run-level effort, and the main Codex context owns
   edits; `code-review` level `high` uses medium/high while the default uses
   high/xhigh;
-- built-in `code-review` requires pending working-tree change evidence: on a
-  clean tree it fails before spawning any agent with `no reviewable change
-  evidence in the working tree`, and its ref rejections name the allowed set,
-  its size, its source, and what populates it;
+- built-in `code-review` requires change evidence — pending working-tree changes,
+  or the `diffBaseRef..HEAD` range when `--args '{"diffBaseRef":"…"}'` resolves:
+  with neither it fails before spawning any agent with `no reviewable change
+  evidence in the working tree`, naming which rule dropped which path, and its
+  ref rejections name the allowed set, its size, its source, and what populates it;
+- `run --validate --name code-review` is the zero-token pre-check: it validates the
+  request contract (accepted keys `prompt`, `level`, `diffBaseRef`; unknown or
+  mistyped keys and unsupported values are rejected at launch) and reports whether
+  the evidence gate would open, with each dropped path and the rule that dropped it;
+- `--evidence-scope all` forgives only the evidence extension allowlist, making
+  `.java`/`.rb`/`.sql` repositories reviewable; excluded directories, runtime state,
+  and unsafe paths stay out at every scope;
 - after a completed run, `workflow.summary.ready` reports phase-level agent
   counts and angles, then `workflow.review.recommended` asks the current
   session LLM to critically re-check the final result before acting on it;

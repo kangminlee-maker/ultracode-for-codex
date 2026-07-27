@@ -35,6 +35,17 @@ export function isNestedWorkflows(value: unknown): value is NestedWorkflows {
   return typeof value === 'string' && (NESTED_WORKFLOWS_VALUES as readonly string[]).includes(value);
 }
 
+// Which changed paths may become citable evidence. `default` (the current default) keeps the
+// extension allowlist on the evidence path, byte-identical to today. `all` forgives ONLY the
+// extension rule, so a repository whose sources are .java/.rb/.sql/.kt is reviewable; excluded
+// directories, runtime state, and unsafe paths stay excluded, and the prompt-budget file selection
+// keeps its own allowlist either way.
+export type EvidenceScope = 'default' | 'all';
+export const EVIDENCE_SCOPE_VALUES: readonly EvidenceScope[] = ['default', 'all'];
+export function isEvidenceScope(value: unknown): value is EvidenceScope {
+  return typeof value === 'string' && (EVIDENCE_SCOPE_VALUES as readonly string[]).includes(value);
+}
+
 // Gate for the subagent web_search tool. `disabled` (the current default) keeps
 // `web_search="disabled"` at every Codex config site, byte-identical to today; `enabled`
 // flips it to `"live"` so workflow subagents can use the native Responses web_search tool.

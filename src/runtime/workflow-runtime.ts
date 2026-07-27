@@ -5,7 +5,7 @@ import { availableParallelism, homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { createContext, runInContext } from 'node:vm';
-import type { AgentConcurrency, NestedWorkflows, ReasoningEffort, ResolvedAgentType, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
+import type { AgentConcurrency, EvidenceScope, NestedWorkflows, ReasoningEffort, ResolvedAgentType, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
 import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort, isSubagentFailure } from './types.js';
 import { AgentConcurrencyPool } from './agent-concurrency-pool.js';
 import {
@@ -430,6 +430,9 @@ interface WorkflowTaskRegistryOptions {
   // Gate for nested workflow() calls. Omitted or 'disabled' keeps the throwing stub
   // (current behavior); 'enabled' lets a workflow run built-in/inline children inline.
   readonly nestedWorkflows?: NestedWorkflows;
+  // Which changed paths may become citable evidence. Omitted or 'default' keeps the extension
+  // allowlist on the evidence path (current behavior); 'all' forgives only that rule.
+  readonly evidenceScope?: EvidenceScope;
   // Resolved agent-type registry (PG-AGENTTYPE). Omitted/empty leaves `agent({agentType})` inert:
   // a script that uses it fails loud. When present (the CLI loads it only under --agent-types),
   // runAgent resolves a named type's model/effort/persona for that one call. The map is keyed by the
@@ -757,6 +760,168 @@ return await parallel(prompts.map((prompt, index) => () => agent(
   },
 ];
 
+// Per-built-in request contract. Built-in scripts read `args` ad hoc with silent fallbacks, so an
+// unknown or mistyped key used to be swallowed: `{"promt":"…"}` ran the DEFAULT prompt and reported
+// success, and `{"level":"medium"}` silently selected the most expensive profile. A request error is
+// deterministically decidable before any agent spend, so the runtime hard-fails it at launch. Every
+// rejection carries three parts — rejected value, cause, remediation — via requestContractError.
+interface BuiltinRequestContract {
+  readonly keys: readonly string[];
+  readonly nonEmptyStrings?: readonly string[];
+  readonly enums?: Readonly<Record<string, readonly string[]>>;
+  readonly arrays?: readonly string[];
+  readonly gitCommitRefs?: readonly string[];
+  // Whether `--validate` should also report this built-in's change-evidence precondition.
+  readonly consumesChangeEvidence?: boolean;
+}
+
+// What `--validate` reports about a change-evidence-consuming built-in: whether the run would be
+// gated, why, and exactly what it would be allowed to cite.
+export interface ChangeEvidencePreview {
+  readonly gated: boolean;
+  readonly reason?: string;
+  readonly allowedFileRefs: number;
+  readonly allowedEvidenceRefs: readonly string[];
+  readonly dropped: readonly EvidenceDroppedPath[];
+  readonly unavailableEvidence: readonly string[];
+}
+
+const BUILTIN_REQUEST_CONTRACTS: Readonly<Record<string, BuiltinRequestContract>> = {
+  'code-review': {
+    keys: ['prompt', 'level', 'diffBaseRef'],
+    nonEmptyStrings: ['prompt', 'diffBaseRef'],
+    // "xhigh" names the previously unnamed default: omitting `level` still selects it, but a caller
+    // could not say so explicitly. Compared case-insensitively here and in the built-in script.
+    enums: { level: ['high', 'xhigh'] },
+    gitCommitRefs: ['diffBaseRef'],
+    consumesChangeEvidence: true,
+  },
+  task: {
+    keys: ['prompt'],
+    nonEmptyStrings: ['prompt'],
+  },
+  batch: {
+    keys: ['prompts'],
+    arrays: ['prompts'],
+  },
+};
+
+// The one formatter for fail-loud request rejections: "<rejected>: <cause>; <remediation>". Mirrors
+// the built-in scripts' failUnsupportedRef shape so a caller reads the same three parts wherever a
+// request is refused, and so the shape cannot drift between rejection kinds.
+function requestContractError(rejected: string, cause: string, remediation: string): UltracodeRequestError {
+  return workflowInputError(`${rejected}: ${cause}; ${remediation}`);
+}
+
+function acceptedKeyList(contract: BuiltinRequestContract): string {
+  return `${contract.keys.length} accepted ${contract.keys.length === 1 ? 'key' : 'keys'}: ${contract.keys.join(', ')}`;
+}
+
+// Suggestion source for a rejected key: exact-but-miscased, a prefix relation (diffBase →
+// diffBaseRef), then a bounded edit distance (promt → prompt). Suggestion only — the rejection
+// stands either way, and the accepted set is always named.
+function nearestContractKey(key: string, accepted: readonly string[]): string | undefined {
+  const lower = key.toLowerCase();
+  for (const candidate of accepted) {
+    if (candidate.toLowerCase() === lower) return candidate;
+  }
+  for (const candidate of accepted) {
+    const candidateLower = candidate.toLowerCase();
+    if (candidateLower.startsWith(lower) || lower.startsWith(candidateLower)) return candidate;
+  }
+  for (const candidate of accepted) {
+    if (withinEditDistance(lower, candidate.toLowerCase(), 2)) return candidate;
+  }
+  return undefined;
+}
+
+function withinEditDistance(a: string, b: string, limit: number): boolean {
+  if (Math.abs(a.length - b.length) > limit) return false;
+  let previous = Array.from({ length: b.length + 1 }, (_unused, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j += 1) {
+      current[j] = a[i - 1] === b[j - 1]
+        ? previous[j - 1]
+        : 1 + Math.min(previous[j - 1], previous[j], current[j - 1]);
+    }
+    previous = current;
+  }
+  return previous[b.length] <= limit;
+}
+
+async function validateBuiltinRequestArgs(name: string, args: unknown, cwd: string): Promise<void> {
+  const contract = BUILTIN_REQUEST_CONTRACTS[name];
+  if (!contract || args === undefined || args === null) return;
+  if (typeof args !== 'object' || Array.isArray(args)) {
+    throw requestContractError(
+      `workflow args for built-in "${name}" must be a JSON object`,
+      `received ${Array.isArray(args) ? 'an array' : typeof args}, whose keys the workflow cannot read`,
+      `pass an object with the ${acceptedKeyList(contract)}`,
+    );
+  }
+  const record = args as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (contract.keys.includes(key)) continue;
+    const nearest = nearestContractKey(key, contract.keys);
+    throw requestContractError(
+      `unknown workflow arg "${key}" for built-in "${name}"`,
+      `it is not read by this workflow and would be silently ignored (${acceptedKeyList(contract)})`,
+      nearest ? `did you mean "${nearest}"?` : `remove it, or use one of the accepted keys`,
+    );
+  }
+  for (const key of contract.nonEmptyStrings ?? []) {
+    if (record[key] === undefined) continue;
+    const value = record[key];
+    if (typeof value !== 'string' || !value.trim()) {
+      throw requestContractError(
+        `workflow arg "${key}" for built-in "${name}" is not a non-empty string`,
+        `received ${typeof value === 'string' ? 'an empty or whitespace-only string' : typeof value}, which the workflow would silently replace with its default`,
+        `pass a non-empty string, or omit "${key}" to accept the default deliberately`,
+      );
+    }
+  }
+  for (const [key, allowed] of Object.entries(contract.enums ?? {})) {
+    if (record[key] === undefined) continue;
+    const value = record[key];
+    const normalized = typeof value === 'string' ? value.trim().toLowerCase() : undefined;
+    if (normalized === undefined || !allowed.includes(normalized)) {
+      throw requestContractError(
+        `workflow arg "${key}" for built-in "${name}" has an unsupported value ${JSON.stringify(value)}`,
+        `it is not one of the ${allowed.length} supported values (${allowed.map((entry) => JSON.stringify(entry)).join(', ')}), and an unrecognized value silently selects ${JSON.stringify(allowed[allowed.length - 1])}`,
+        `pass one of ${allowed.map((entry) => JSON.stringify(entry)).join(' or ')} (case-insensitive)`,
+      );
+    }
+  }
+  for (const key of contract.arrays ?? []) {
+    if (record[key] === undefined) continue;
+    if (!Array.isArray(record[key])) {
+      throw requestContractError(
+        `workflow arg "${key}" for built-in "${name}" is not an array`,
+        `received ${typeof record[key]}, which the workflow would read as zero entries`,
+        `pass a JSON array of values for "${key}"`,
+      );
+    }
+  }
+  for (const key of contract.gitCommitRefs ?? []) {
+    const value = record[key];
+    if (typeof value !== 'string' || !value.trim()) continue;
+    // Resolvability is decidable before any spend. An unresolvable ref used to be dropped silently,
+    // leaving the review to run with no committed evidence while the caller believed it had some.
+    const failure = await gitOutput(cwd, ['rev-parse', '--verify', `${value.trim()}^{commit}`]).then(
+      () => undefined,
+      (err: unknown) => workflowErrorMessage(err),
+    );
+    if (failure !== undefined) {
+      throw requestContractError(
+        `workflow arg "${key}" for built-in "${name}" does not resolve to a commit: ${JSON.stringify(value)}`,
+        `git rev-parse --verify rejected it in ${cwd} (${failure})`,
+        `pass a ref that exists there (e.g. "HEAD~1", "origin/main", a commit sha), or omit "${key}" to review only the working tree`,
+      );
+    }
+  }
+}
+
 function codeReviewBuiltinWorkflowScript(): string {
   return `export const meta = {
   name: "code-review",
@@ -766,7 +931,7 @@ const workflowInput = args && typeof args === "object" ? args : {};
 const prompt = typeof workflowInput.prompt === "string" && workflowInput.prompt.trim()
   ? workflowInput.prompt
   : "Review the current repository for correctness risks.";
-const level = workflowInput.level === "high" ? "high" : "xhigh";
+const level = String(workflowInput.level == null ? "" : workflowInput.level).trim().toLowerCase() === "high" ? "high" : "xhigh";
 const scopeEffort = level === "high" ? "medium" : "xhigh";
 const verdictEffort = level === "high" ? "high" : "xhigh";
 const caps = level === "high"
@@ -940,25 +1105,103 @@ function uniquePush(list, item) {
 function failUnsupportedRef(prefix, value, refSet) {
   fail(prefix + " " + value + ": not in " + refSet.name + " (" + refSet.size + " entries) derived from " + refSet.source + "; populated by " + refSet.populatedBy);
 }
+// Ref normalization. The property worth protecting is that a cited PATH exists in the evidence
+// snapshot; the kind and any trailing index are grammar, not authority. Which kinds exist for a path
+// depends on whether the change is untracked, unstaged, or staged — something the reviewer cannot
+// see — so a kind guess or an appended line number used to abort the whole run after full spend.
+// Exact match first, then a trailing numeric index, then the path. A path that is not in evidence
+// still fails: the anti-fabrication property is unchanged.
+let normalizedRefCount = 0;
+function stripTrailingIndex(value) {
+  const at = value.lastIndexOf(":");
+  if (at < 1 || at === value.length - 1) return value;
+  const tail = value.slice(at + 1);
+  for (let index = 0; index < tail.length; index += 1) {
+    const code = tail.charCodeAt(index);
+    if (code < 48 || code > 57) return value;
+  }
+  return value.slice(0, at);
+}
+function evidenceRefPath(ref) {
+  if (ref.indexOf("file:") === 0) return ref.slice(5);
+  if (ref.indexOf("diff:") === 0) {
+    const rest = ref.slice(5);
+    const at = rest.indexOf(":");
+    return at < 0 ? "" : rest.slice(at + 1);
+  }
+  if (ref.indexOf("hunk:") === 0) {
+    const rest = ref.slice(5);
+    const at = rest.indexOf(":");
+    return at < 0 ? "" : stripTrailingIndex(rest.slice(at + 1));
+  }
+  return "";
+}
+// Built on first use: these helpers are hoisted above the evidence context they read from.
+let allowedPathRefMapCache = null;
+function allowedPathRefs() {
+  if (allowedPathRefMapCache) return allowedPathRefMapCache;
+  const map = {};
+  for (let index = 0; index < allowedEvidenceRefs.length; index += 1) {
+    const ref = allowedEvidenceRefs[index];
+    const path = evidenceRefPath(ref);
+    if (!path) continue;
+    if (!map[path] || ref.indexOf("file:") === 0) map[path] = ref;
+  }
+  allowedPathRefMapCache = map;
+  return map;
+}
+function normalizeEvidenceRef(ref) {
+  if (allowedEvidenceRefMap[ref]) return ref;
+  const stripped = stripTrailingIndex(ref);
+  if (stripped !== ref && allowedEvidenceRefMap[stripped]) {
+    normalizedRefCount += 1;
+    return stripped;
+  }
+  const path = evidenceRefPath(stripped);
+  const byPath = path ? allowedPathRefs()[path] : "";
+  if (byPath) {
+    normalizedRefCount += 1;
+    return byPath;
+  }
+  return "";
+}
+function normalizeFilePath(file) {
+  const raw = text(file);
+  const withoutPrefix = raw.indexOf("file:") === 0 ? raw.slice(5) : raw;
+  if (allowedFileRefMap["file:" + withoutPrefix]) {
+    if (withoutPrefix !== raw) normalizedRefCount += 1;
+    return withoutPrefix;
+  }
+  const stripped = stripTrailingIndex(withoutPrefix);
+  if (stripped !== withoutPrefix && allowedFileRefMap["file:" + stripped]) {
+    normalizedRefCount += 1;
+    return stripped;
+  }
+  return "";
+}
 function assertDecisionRefs(refs, label) {
   if (!Array.isArray(refs) || refs.length < 1) fail(label + " must include evidence or decision refs.");
   for (let index = 0; index < refs.length; index += 1) {
     const ref = text(refs[index]);
-    if (!allowedEvidenceRefMap[ref] && !unavailableEvidenceRefMap[ref] && ref !== "prompt:request") {
-      failUnsupportedRef(label + " includes unsupported decision ref", ref, decisionRefSet);
-    }
+    if (unavailableEvidenceRefMap[ref] || ref === "prompt:request") continue;
+    const normalized = normalizeEvidenceRef(ref);
+    if (!normalized) failUnsupportedRef(label + " includes unsupported decision ref", ref, decisionRefSet);
+    refs[index] = normalized;
   }
 }
 function assertEvidenceRefs(refs, label) {
   if (!Array.isArray(refs) || refs.length < 1) fail(label + " must include at least one evidence ref.");
   for (let index = 0; index < refs.length; index += 1) {
     const ref = text(refs[index]);
-    if (!allowedEvidenceRefMap[ref]) failUnsupportedRef(label + " includes unsupported evidence ref", ref, evidenceRefSet);
+    const normalized = normalizeEvidenceRef(ref);
+    if (!normalized) failUnsupportedRef(label + " includes unsupported evidence ref", ref, evidenceRefSet);
+    refs[index] = normalized;
   }
 }
-function validateFile(file, label) {
-  const ref = "file:" + text(file);
-  if (!allowedFileRefMap[ref]) failUnsupportedRef(label + " references unsupported file", text(file), fileRefSet);
+function validateFileAt(owner, key, label) {
+  const normalized = normalizeFilePath(owner[key]);
+  if (!normalized) failUnsupportedRef(label + " references unsupported file", text(owner[key]), fileRefSet);
+  owner[key] = normalized;
 }
 function selectedDecisionMatches(decision, lens) {
   if (decision.action !== "select") return false;
@@ -966,7 +1209,7 @@ function selectedDecisionMatches(decision, lens) {
   return selected === lens.lensKey || selected === normalizeKey(lens.id, lens.lensKey);
 }
 function validateScope(scope) {
-  for (let index = 0; index < scope.files.length; index += 1) validateFile(scope.files[index], "scope.files[" + index + "]");
+  for (let index = 0; index < scope.files.length; index += 1) validateFileAt(scope.files, index, "scope.files[" + index + "]");
   for (let index = 0; index < scope.lensDecisions.length; index += 1) {
     assertDecisionRefs(scope.lensDecisions[index].decisionRefs, "scope.lensDecisions[" + index + "]");
   }
@@ -995,7 +1238,7 @@ function validateScope(scope) {
   return selected;
 }
 function validateCandidate(candidate, label) {
-  validateFile(candidate.file, label + ".file");
+  validateFileAt(candidate, "file", label + ".file");
   assertEvidenceRefs(candidate.evidenceRefs, label + ".evidenceRefs");
   return {
     file: text(candidate.file),
@@ -1318,8 +1561,8 @@ const fileRefSet = {
   source: "file: entries in the evidence context (git status changed/untracked paths)",
   populatedBy: "uncommitted or untracked paths in the working tree"
 };
-if (allowedFileRefs.length === 0) {
-  fail("no reviewable change evidence in the working tree: " + fileRefSet.name + " is empty (0 entries) derived from " + fileRefSet.source + "; populated by " + fileRefSet.populatedBy);
+if (firstLineValue(context, "evidenceGate: ") === "closed") {
+  fail(firstLineValue(context, "evidenceGateReason: "));
 }
 const sourceSnapshotId = firstLineValue(context, "Source Snapshot: ") || firstLineValue(context, "sourceSnapshotId: ") || hash(context);
 const contextHash = firstLineValue(context, "Context Hash: ") || firstLineValue(context, "contextHash: ") || hash({ context: context });
@@ -1377,7 +1620,7 @@ if (activeLenses.length === 0) {
     summary: scope.summary,
     findings: [],
     synthesis: { mode: "script_fallback", fallbackReason: "no active lenses", decisions: [] },
-    stats: { finders: 0, candidates: 0, verifierAttempts: 0, verified: 0, refuted: 0, invalid: 0, reported: 0, dropped: droppedStats([]) }
+    stats: { finders: 0, candidates: 0, verifierAttempts: 0, verified: 0, refuted: 0, invalid: 0, reported: 0, normalizedRefs: normalizedRefCount, dropped: droppedStats([]) }
   };
 }
 announcePhasePlan({
@@ -1519,6 +1762,7 @@ return {
     refuted: refuted,
     invalid: 0,
     reported: findings.length,
+    normalizedRefs: normalizedRefCount,
     dropped: droppedStats(decisionRows)
   }
 };`;
@@ -1764,6 +2008,16 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     if (this.closed) throw workflowInputError('Workflow runtime is closed.');
     const resumePlan = await this.prepareResumePlan(input);
     let resolved = await this.resolveLaunchInput(resumePlan.launchInput);
+    // Before the permission gate and before any journal or spend: a built-in's request contract is
+    // decidable from the args alone, so reject an unreadable request loudly here instead of letting
+    // the script's silent fallbacks run someone else's review.
+    if (resolved.workflowSource === 'built_in' && resolved.name) {
+      await validateBuiltinRequestArgs(
+        resolved.name,
+        resumePlan.launchInput.args,
+        this.options.cwd ?? process.cwd(),
+      );
+    }
     const parsed = parseInlineWorkflowScript(resolved.script);
     const scriptHash = workflowScriptHash(resolved.script);
     const isolationReview = workflowRequestedIsolationModes(resolved.script);
@@ -1933,19 +2187,70 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     readonly schemaCallSites: number;
     readonly keyedCallSites: number;
     readonly warnings: readonly string[];
+    readonly evidence?: ChangeEvidencePreview;
   }> {
     if (this.closed) throw workflowInputError('Workflow runtime is closed.');
     if (Object.prototype.hasOwnProperty.call(input, 'resumeFromRunId')) {
       throw workflowInputError('Workflow validation does not accept resumeFromRunId.');
     }
     const resolved = await this.resolveLaunchInput(input);
+    const cwd = this.options.cwd ?? process.cwd();
+    // Validation is the free pre-check, so it answers the same two questions a launch answers:
+    // is the request readable, and would it have anything to work on.
+    if (resolved.workflowSource === 'built_in' && resolved.name) {
+      await validateBuiltinRequestArgs(resolved.name, input.args, cwd);
+    }
     const parsed = parseInlineWorkflowScript(resolved.script);
+    const evidence = resolved.workflowSource === 'built_in' && resolved.name
+      ? await this.previewChangeEvidence(resolved.name, input.args, cwd)
+      : undefined;
     return {
       workflowName: parsed.meta.name,
       ...(parsed.meta.description ? { description: parsed.meta.description } : {}),
       workflowSource: resolved.workflowSource,
       scriptHash: workflowScriptHash(resolved.script),
       ...workflowAuthoringScan(resolved.script),
+      ...(evidence ? { evidence } : {}),
+    };
+  }
+
+  // Deterministic answer to "would this run, and what would it be allowed to cite?" — no agent, no
+  // token. Reuses the same evidence builder and the same gate reason the run would use, so the
+  // preview cannot disagree with the launch.
+  private async previewChangeEvidence(
+    name: string,
+    args: unknown,
+    cwd: string,
+  ): Promise<ChangeEvidencePreview | undefined> {
+    if (!BUILTIN_REQUEST_CONTRACTS[name]?.consumesChangeEvidence) return undefined;
+    const diffBaseRef = args && typeof args === 'object' && !Array.isArray(args)
+      ? (args as Record<string, unknown>).diffBaseRef
+      : undefined;
+    const options = normalizeWorkspaceContextOptions({
+      includeDiff: true,
+      ...(typeof diffBaseRef === 'string' && diffBaseRef.trim() ? { diffBaseRef: diffBaseRef.trim() } : {}),
+    });
+    const root = await workspaceContextRoot(cwd);
+    const runtimeStateExcludedPaths = workspaceRuntimeStateExcludedPaths(root);
+    const gitStatus = await gitOutputRaw(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.'])
+      .catch(() => '');
+    const evidence = await buildChangeEvidenceContext(
+      root,
+      gitStatus,
+      options,
+      [],
+      runtimeStateExcludedPaths,
+      // The preview must answer for the scope the run would actually use, or it stops being a
+      // pre-check and becomes a second opinion.
+      this.options.evidenceScope ?? 'default',
+    );
+    return {
+      gated: !evidence.gateOpen,
+      ...(evidence.gateOpen ? {} : { reason: evidence.gateReason }),
+      allowedFileRefs: evidence.allowedFileRefs.length,
+      allowedEvidenceRefs: evidence.allowedEvidenceRefs,
+      dropped: evidence.droppedPaths,
+      unavailableEvidence: evidence.unavailableEvidence,
     };
   }
 
@@ -2979,6 +3284,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     return await buildWorkspaceContext(
       this.options.cwd ?? process.cwd(),
       normalizeWorkspaceContextOptions(options),
+      this.options.evidenceScope ?? 'default',
     );
   }
 
@@ -4032,7 +4338,11 @@ async function gitOutputRaw(cwd: string, args: readonly string[]): Promise<strin
   }
 }
 
-async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptions): Promise<string> {
+async function buildWorkspaceContext(
+  cwd: string,
+  options: WorkspaceContextOptions,
+  evidenceScope: EvidenceScope = 'default',
+): Promise<string> {
   const root = await workspaceContextRoot(cwd);
   const runtimeStateExcludedPaths = workspaceRuntimeStateExcludedPaths(root);
   const statusUnavailableEvidence: string[] = [];
@@ -4052,7 +4362,7 @@ async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptio
   const gitStatusPathParse = parseGitStatusPaths(gitStatusPaths, runtimeStateExcludedPaths);
   const excludedWorkspacePaths = new Set(gitStatusPathParse.excludedPaths.map(workspacePathKey));
   const changeEvidence = options.includeDiff
-    ? await buildChangeEvidenceContext(root, gitStatusPaths, options, statusUnavailableEvidence, runtimeStateExcludedPaths)
+    ? await buildChangeEvidenceContext(root, gitStatusPaths, options, statusUnavailableEvidence, runtimeStateExcludedPaths, evidenceScope)
     : undefined;
   const explicitPaths = [
     ...options.files,
@@ -4106,12 +4416,23 @@ async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptio
   ].join('\n');
 }
 
+export interface EvidenceDroppedPath {
+  readonly path: string;
+  readonly rule: WorkspaceContextDropRule;
+}
+
 interface ChangeEvidenceContext {
   readonly sourceSnapshotId: string;
   readonly contextHash: string;
   readonly allowedEvidenceRefs: readonly string[];
   readonly unavailableEvidence: readonly string[];
   readonly text: string;
+  // Structured projection of the same values the prompt text carries, so `--validate` can report the
+  // request's satisfiability without spending an agent and without re-deriving the gate rule.
+  readonly allowedFileRefs: readonly string[];
+  readonly droppedPaths: readonly EvidenceDroppedPath[];
+  readonly gateOpen: boolean;
+  readonly gateReason: string;
 }
 
 interface GitStatusPathParse {
@@ -4131,10 +4452,29 @@ async function buildChangeEvidenceContext(
   options: WorkspaceContextOptions,
   initialUnavailableEvidence: readonly string[] = [],
   runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
+  evidenceScope: EvidenceScope = 'default',
 ): Promise<ChangeEvidenceContext> {
   const unavailableEvidence: string[] = [...initialUnavailableEvidence];
   const gitStatusPaths = parseGitStatusPaths(gitStatus, runtimeStateExcludedPaths);
-  const changedPaths = gitStatusPaths.paths.filter((path) => shouldIncludeWorkspaceContextPath(path, runtimeStateExcludedPaths));
+  const changedPaths: string[] = [];
+  const droppedPaths: EvidenceDroppedPath[] = [];
+  const seenDroppedPaths = new Set<string>();
+  const recordDroppedPath = (path: string, fallback: WorkspaceContextDropRule): void => {
+    if (!path || seenDroppedPaths.has(path)) return;
+    seenDroppedPaths.add(path);
+    droppedPaths.push({ path, rule: workspaceContextPathVerdict(path, runtimeStateExcludedPaths) ?? fallback });
+  };
+  for (const path of gitStatusPaths.paths) {
+    const rule = workspaceContextPathVerdict(path, runtimeStateExcludedPaths);
+    if (rule === undefined || evidenceScopeForgives(rule, evidenceScope)) changedPaths.push(path);
+    else recordDroppedPath(path, rule);
+  }
+  // Directory-excluded and runtime-state paths never reach gitStatusPaths.paths — the status parser
+  // routes them to excludedPaths — so a diagnostic built only from `paths` would under-report them.
+  // The fallback is 'runtime-state', not 'excluded-dir': the only way the status filter rejects a
+  // path the admission verdict accepts is a runtime-state match, and runtime state must never be
+  // named. A permissive fallback here mislabels it as a build path and leaks the name.
+  for (const path of gitStatusPaths.excludedPaths) recordDroppedPath(path, 'runtime-state');
   const excludedDiffPaths = new Set([
     ...gitStatusPaths.excludedPaths.map(workspacePathKey),
     ...runtimeStateExcludedPaths,
@@ -4153,7 +4493,7 @@ async function buildChangeEvidenceContext(
   ], options.maxDiffBytes).catch((err) => {
     unavailableEvidence.push(unavailableGitEvidence('diff-unstaged', err));
     return { text: '', truncated: false };
-  }), excludedDiffPaths, runtimeStateExcludedPaths);
+  }), excludedDiffPaths, runtimeStateExcludedPaths, evidenceScope);
   const staged = filterWorkspaceContextDiff(await boundedGitOutput(root, [
     'diff',
     '--cached',
@@ -4164,7 +4504,7 @@ async function buildChangeEvidenceContext(
   ], options.maxDiffBytes).catch((err) => {
     unavailableEvidence.push(unavailableGitEvidence('diff-staged', err));
     return { text: '', truncated: false };
-  }), excludedDiffPaths, runtimeStateExcludedPaths);
+  }), excludedDiffPaths, runtimeStateExcludedPaths, evidenceScope);
   let committed: BoundedGitText = { text: '', truncated: false };
   let acceptedDiffBaseRef = '';
   if (options.diffBaseRef) {
@@ -4184,7 +4524,7 @@ async function buildChangeEvidenceContext(
       ], options.maxDiffBytes).catch((err) => {
         unavailableEvidence.push(unavailableGitEvidence('diff-committed', err, options.diffBaseRef));
         return { text: '', truncated: false };
-      }), excludedDiffPaths, runtimeStateExcludedPaths);
+      }), excludedDiffPaths, runtimeStateExcludedPaths, evidenceScope);
     }
   }
   const diffEvidence = [
@@ -4192,11 +4532,29 @@ async function buildChangeEvidenceContext(
     { kind: 'staged', value: staged },
     { kind: 'committed', value: committed },
   ] as const;
-  const allowedEvidenceRefs = uniqueStrings([
-    ...changedPaths.map((path) => `file:${path}`),
-    ...diffEvidence.flatMap((entry) => diffEvidenceRefs(entry.kind, entry.value.text, runtimeStateExcludedPaths)),
-  ]);
+  const diffRefs = diffEvidence.flatMap((entry) => diffEvidenceRefs(entry.kind, entry.value.text, runtimeStateExcludedPaths, evidenceScope));
+  // A file ref is what the review harness validates its scope and findings against, so a
+  // diffBaseRef range that touched a file has to contribute one too — otherwise a committed-only
+  // review collects committed diff evidence it is then forbidden to cite. Derived from the same
+  // diff refs (not a second parser) and inert when no diffBaseRef resolved.
+  const committedPaths = diffRefs
+    .filter((ref) => ref.startsWith('diff:committed:'))
+    .map((ref) => ref.slice('diff:committed:'.length));
+  const fileRefs = uniqueStrings([...changedPaths, ...committedPaths].map((path) => `file:${path}`));
+  const allowedEvidenceRefs = uniqueStrings([...fileRefs, ...diffRefs]);
   const allowedEvidenceIndexDigest = fullHash(allowedEvidenceRefs.join('\n'));
+  // Two audiences, two projections of the same drop list. The caller owns the repository, so its
+  // diagnostic names the paths it can act on and counts only those — runtime state and unsafe paths
+  // are not the caller's changes, and counting them would report a clean tree as "3 paths dropped".
+  const callerReportableDrops = droppedPaths.filter((entry) => droppedPathNameable(entry));
+  const gateOpen = fileRefs.length > 0;
+  const gateReason = gateOpen
+    ? ''
+    : changeEvidenceGateReason(
+      changedPaths.length + callerReportableDrops.length,
+      callerReportableDrops,
+      Boolean(acceptedDiffBaseRef),
+    );
   const sourceSnapshotId = `git:${head}:${fullHash([
     gitStatus,
     unstaged.text,
@@ -4223,9 +4581,20 @@ async function buildChangeEvidenceContext(
     `allowedEvidenceIndexDigest: ${allowedEvidenceIndexDigest}`,
     `diffBaseRef: ${acceptedDiffBaseRef || '(none)'}`,
     `truncation: ${JSON.stringify(truncation)}`,
+    `evidenceScope: ${evidenceScope}`,
+    `evidenceGate: ${gateOpen ? 'open' : 'closed'}`,
+    `evidenceGateReason: ${gateReason || '(none)'}`,
+    '',
+    '#### Evidence Ref Grammar',
+    EVIDENCE_REF_GRAMMAR_NOTE,
     '',
     '#### Changed Files',
     changedPaths.length ? changedPaths.join('\n') : '(none)',
+    '',
+    // Non-blocking disclosure: the git status section lists these paths by name (it applies only the
+    // directory rule), so without this the reviewer sees a changed file it is forbidden to cite.
+    '#### Dropped From Evidence',
+    formatDroppedEvidenceDisclosure(droppedPaths),
     '',
     '#### Unstaged Diff',
     unstaged.text || '(none)',
@@ -4242,7 +4611,86 @@ async function buildChangeEvidenceContext(
     allowedEvidenceRefs,
     unavailableEvidence,
     text: sections.join('\n'),
+    allowedFileRefs: fileRefs,
+    droppedPaths: callerReportableDrops,
+    gateOpen,
+    gateReason,
   };
+}
+
+// Runtime-owned grammar note. The allowlist alone does not tell a reviewer which ref KINDS exist for
+// a given path — that depends on whether the change is untracked, unstaged, or staged, which the
+// model cannot see. Both real-world rejections observed on disk were this: a `file:` ref with a line
+// number appended, and a `diff:unstaged:` guess for a path that only existed as `file:`.
+const EVIDENCE_REF_GRAMMAR_NOTE = [
+  'Cite evidence only with strings copied verbatim from Allowed Evidence Refs. Do not append a line',
+  'number to a file: ref, and do not construct a ref kind that is not listed — the listed kinds are',
+  'the only ones that exist for this snapshot. Ref kinds: file:<path>, diff:<unstaged|staged|committed>:<path>,',
+  'hunk:<unstaged|staged|committed>:<path>:<n> where <n> is a per-file hunk index, not a line number.',
+].join('\n');
+
+// Runtime-state and unsafe paths are named nowhere in the prompt or diagnostics — the git status
+// section masks them for the same reason (the runtime must not feed its own state back to a
+// reviewer). They are still counted, so the numbers stay honest.
+const NAMEABLE_DROP_RULES: ReadonlySet<WorkspaceContextDropRule> = new Set([
+  'excluded-dir',
+  'extension-not-allowed',
+]);
+
+// Belt to the rule's braces: a path under either of these is never named whatever rule dropped it,
+// so a future rule (or a mislabel) cannot reintroduce the leak.
+const NEVER_NAMED_PATH_SEGMENTS: ReadonlySet<string> = new Set(['.git', '.ultracode-for-codex']);
+
+function droppedPathNameable(entry: EvidenceDroppedPath): boolean {
+  if (!NAMEABLE_DROP_RULES.has(entry.rule)) return false;
+  return !entry.path.split('/').some((segment) => NEVER_NAMED_PATH_SEGMENTS.has(segment));
+}
+
+// The reviewer's projection: only the paths it can see by name in the git status section yet cannot
+// cite. Directory-excluded, runtime-state, and unsafe paths are already masked there, so naming them
+// here would hand the reviewer names the status section deliberately withheld.
+function formatDroppedEvidenceDisclosure(droppedPaths: readonly EvidenceDroppedPath[]): string {
+  const disclosed = droppedPaths.filter((entry) => entry.rule === 'extension-not-allowed' && droppedPathNameable(entry));
+  if (disclosed.length === 0) return '(none)';
+  return disclosed
+    .map((entry) => `${entry.path} (${entry.rule}: not citable, contents withheld)`)
+    .join('\n');
+}
+
+function describeDroppedPathSample(rule: WorkspaceContextDropRule, paths: readonly string[]): string {
+  const nameable = paths.filter((path) => droppedPathNameable({ path, rule }));
+  if (nameable.length === 0) return '';
+  const shown = nameable.slice(0, 5);
+  return ` (${shown.join(', ')}${nameable.length > shown.length ? `, +${nameable.length - shown.length} more` : ''})`;
+}
+
+// The gate rule and its diagnostic live together in the runtime: the built-in script fails with this
+// message verbatim, and `--validate` reports it without spending an agent, so neither can drift from
+// the predicate that produced it.
+function changeEvidenceGateReason(
+  statusPathCount: number,
+  droppedPaths: readonly EvidenceDroppedPath[],
+  hasDiffBaseRef: boolean,
+): string {
+  const byRule = new Map<WorkspaceContextDropRule, string[]>();
+  for (const entry of droppedPaths) {
+    const paths = byRule.get(entry.rule) ?? [];
+    paths.push(entry.path);
+    byRule.set(entry.rule, paths);
+  }
+  const cause = droppedPaths.length === 0
+    ? statusPathCount === 0
+      ? 'git status reported no changed or untracked paths'
+      : `git status reported ${statusPathCount} path(s), none of which produced a file ref`
+    : `git status reported ${statusPathCount} changed path(s), all dropped before becoming evidence — ${[...byRule]
+        .map(([rule, paths]) => `${paths.length} by ${rule}${describeDroppedPathSample(rule, paths)}`)
+        .join('; ')}`;
+  const remediation = [
+    'change a file whose extension is in the evidence allowlist and outside the excluded directories',
+    hasDiffBaseRef ? undefined : 'or pass diffBaseRef to review a committed range',
+    'and re-run `--validate` to confirm before spending',
+  ].filter(Boolean).join(', ');
+  return `no reviewable change evidence in the working tree: ${cause}; ${remediation}`;
 }
 
 async function boundedGitOutput(root: string, args: readonly string[], maxBytes: number): Promise<BoundedGitText> {
@@ -4258,11 +4706,12 @@ function filterWorkspaceContextDiff(
   value: BoundedGitText,
   excludedPaths: ReadonlySet<string>,
   runtimeStateExcludedPaths: ReadonlySet<string>,
+  evidenceScope: EvidenceScope = 'default',
 ): BoundedGitText {
   if (!value.text) return value;
   return {
     ...value,
-    text: filterWorkspaceContextDiffText(value.text, excludedPaths, runtimeStateExcludedPaths),
+    text: filterWorkspaceContextDiffText(value.text, excludedPaths, runtimeStateExcludedPaths, evidenceScope),
   };
 }
 
@@ -4270,6 +4719,7 @@ function filterWorkspaceContextDiffText(
   text: string,
   excludedPaths: ReadonlySet<string>,
   runtimeStateExcludedPaths: ReadonlySet<string>,
+  evidenceScope: EvidenceScope = 'default',
 ): string {
   const kept: string[] = [];
   let block: string[] = [];
@@ -4283,8 +4733,8 @@ function filterWorkspaceContextDiffText(
       flush();
       const header = parseGitDiffHeader(line);
       includeBlock = header
-        ? workspaceContextDiffPathAllowed(header.oldPath, excludedPaths, runtimeStateExcludedPaths)
-          && workspaceContextDiffPathAllowed(header.newPath, excludedPaths, runtimeStateExcludedPaths)
+        ? workspaceContextDiffPathAllowed(header.oldPath, excludedPaths, runtimeStateExcludedPaths, evidenceScope)
+          && workspaceContextDiffPathAllowed(header.newPath, excludedPaths, runtimeStateExcludedPaths, evidenceScope)
         : false;
     }
     block.push(line);
@@ -4297,16 +4747,18 @@ function workspaceContextDiffPathAllowed(
   path: string,
   excludedPaths: ReadonlySet<string>,
   runtimeStateExcludedPaths: ReadonlySet<string>,
+  evidenceScope: EvidenceScope = 'default',
 ): boolean {
   if (!path || path === '/dev/null') return true;
   const key = workspacePathKey(path);
-  return shouldIncludeWorkspaceContextPath(key, runtimeStateExcludedPaths) && !workspacePathExcludedBySet(key, excludedPaths);
+  return evidencePathAllowed(key, runtimeStateExcludedPaths, evidenceScope) && !workspacePathExcludedBySet(key, excludedPaths);
 }
 
 function diffEvidenceRefs(
   kind: string,
   diff: string,
   runtimeStateExcludedPaths: ReadonlySet<string>,
+  evidenceScope: EvidenceScope = 'default',
 ): readonly string[] {
   const refs: string[] = [];
   let currentPath = '';
@@ -4316,10 +4768,10 @@ function diffEvidenceRefs(
     if (header) {
       currentPath = header.newPath || header.oldPath;
       hunkIndex = 0;
-      if (currentPath && currentPath !== '/dev/null' && shouldIncludeWorkspaceContextPath(currentPath, runtimeStateExcludedPaths)) refs.push(`diff:${kind}:${currentPath}`);
+      if (currentPath && currentPath !== '/dev/null' && evidencePathAllowed(currentPath, runtimeStateExcludedPaths, evidenceScope)) refs.push(`diff:${kind}:${currentPath}`);
       continue;
     }
-    if (currentPath && shouldIncludeWorkspaceContextPath(currentPath, runtimeStateExcludedPaths) && line.startsWith('@@')) {
+    if (currentPath && evidencePathAllowed(currentPath, runtimeStateExcludedPaths, evidenceScope) && line.startsWith('@@')) {
       hunkIndex += 1;
       refs.push(`hunk:${kind}:${currentPath}:${hunkIndex}`);
     }
@@ -4799,20 +5251,55 @@ async function resolveWorkspaceContextPath(
   };
 }
 
+// Why a path is not workspace-context material. Named so a rejection can state the rule that
+// dropped it instead of only the fact that nothing survived.
+type WorkspaceContextDropRule =
+  | 'unsafe-path'
+  | 'runtime-state'
+  | 'excluded-dir'
+  | 'extension-not-allowed';
+
+// The single authority for path admission. shouldIncludeWorkspaceContextPath is a thin wrapper, so
+// the predicate and the reported reason cannot drift apart.
+function workspaceContextPathVerdict(
+  path: string,
+  runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
+): WorkspaceContextDropRule | undefined {
+  const normalized = path.replaceAll('\\', '/').replace(/^\.\/+/, '');
+  if (!normalized || normalized.startsWith('../') || normalized.includes('/../')) return 'unsafe-path';
+  if (workspacePathExcludedBySet(normalized, runtimeStateExcludedPaths)) return 'runtime-state';
+  const parts = normalized.split('/');
+  if (parts.some((part) => WORKSPACE_CONTEXT_EXCLUDED_DIRS.has(part))) return 'excluded-dir';
+  const name = parts.at(-1) ?? '';
+  if (WORKSPACE_CONTEXT_PRIORITY_FILES.has(name)) return undefined;
+  const dot = name.lastIndexOf('.');
+  if (dot < 0) return 'extension-not-allowed';
+  return WORKSPACE_CONTEXT_ALLOWED_EXTENSIONS.has(name.slice(dot).toLowerCase())
+    ? undefined
+    : 'extension-not-allowed';
+}
+
 function shouldIncludeWorkspaceContextPath(
   path: string,
   runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
 ): boolean {
-  const normalized = path.replaceAll('\\', '/').replace(/^\.\/+/, '');
-  if (!normalized || normalized.startsWith('../') || normalized.includes('/../')) return false;
-  if (workspacePathExcludedBySet(normalized, runtimeStateExcludedPaths)) return false;
-  const parts = normalized.split('/');
-  if (parts.some((part) => WORKSPACE_CONTEXT_EXCLUDED_DIRS.has(part))) return false;
-  const name = parts.at(-1) ?? '';
-  if (WORKSPACE_CONTEXT_PRIORITY_FILES.has(name)) return true;
-  const dot = name.lastIndexOf('.');
-  if (dot < 0) return false;
-  return WORKSPACE_CONTEXT_ALLOWED_EXTENSIONS.has(name.slice(dot).toLowerCase());
+  return workspaceContextPathVerdict(path, runtimeStateExcludedPaths) === undefined;
+}
+
+// Evidence admission under an explicit scope. `all` forgives the extension rule and nothing else:
+// excluded directories, runtime state, and unsafe paths remain inadmissible at every scope, and the
+// prompt-budget file selection keeps using shouldIncludeWorkspaceContextPath unchanged.
+function evidenceScopeForgives(rule: WorkspaceContextDropRule, scope: EvidenceScope): boolean {
+  return scope === 'all' && rule === 'extension-not-allowed';
+}
+
+function evidencePathAllowed(
+  path: string,
+  runtimeStateExcludedPaths: ReadonlySet<string>,
+  scope: EvidenceScope,
+): boolean {
+  const rule = workspaceContextPathVerdict(path, runtimeStateExcludedPaths);
+  return rule === undefined || evidenceScopeForgives(rule, scope);
 }
 
 function shouldExposeWorkspaceStatusPath(
