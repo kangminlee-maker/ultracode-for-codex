@@ -194,10 +194,39 @@ machinery is specific to review's contract, not the runtime's center of
 gravity. The general path is intentionally open-ended and planner-driven, not
 under-built. For a review, prefer that built-in: it collects bounded change
 evidence, selects dynamic lenses, and synthesizes findings with provenance.
-Use `{"level":"high"}` for the medium/high profile; omit it for the deeper
-high/xhigh profile. It reviews pending working-tree changes: on a clean tree it fails
-before spawning any agent with `no reviewable change evidence in the working
-tree`, so make or stage a change first.
+Use `{"level":"high"}` for the medium/high profile; `{"level":"xhigh"}` or omit
+it for the deeper high/xhigh profile. Accepted args are exactly `prompt`, `level`,
+and `diffBaseRef`: an unknown or mistyped key, an unsupported `level`, or a
+`diffBaseRef` that does not resolve to a commit is rejected at launch before any
+spend, naming the rejected value, the cause, and the remediation.
+
+It reviews pending working-tree changes, plus the `diffBaseRef..HEAD` range when
+you pass one — a clean tree with a resolvable `diffBaseRef` is reviewable. With
+neither, it fails before spawning any agent with `no reviewable change evidence
+in the working tree`, and the message names which rule dropped which path.
+
+Ask before spending. `run --validate --name code-review` runs no agent and costs
+no token, and reports whether the request is readable and whether the evidence
+gate would open:
+
+```bash
+npm exec -- ultracode-for-codex run --accept-llm-guide=v1 --validate \
+  --name code-review --cwd /path/to/project --progress plain
+```
+
+Only paths whose extension is in the evidence allowlist become citable, so a
+repository of `.java`/`.rb`/`.sql`/`.kt` sources reports a closed gate by
+default. Pass `--evidence-scope all` to forgive that one rule; excluded
+directories, runtime state, and unsafe paths stay out at every scope.
+
+A cited ref is normalized before rejection (a trailing line number is stripped, a
+mismatched ref kind resolves through the cited path), so only a path absent from
+the evidence snapshot fails. `--ref-policy lenient` additionally drops just that
+candidate instead of the run and reports it in the result's `degraded` block — but
+a run whose candidates all dropped still fails, so a degraded run never reads as a
+clean review. Lens decisions and structural violations stay fatal either way. A
+non-default policy is announced on stderr at launch — built-ins are not
+permission-gated, so no prompt confirms the switch.
 
 Review is review-only. After synthesizing findings, present them ranked by
 severity and stop. Do not apply fixes, edit files, or start an implementation

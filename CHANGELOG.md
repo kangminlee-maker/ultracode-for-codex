@@ -8,6 +8,152 @@ the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Per-built-in request contracts validated at launch, before the permission gate and
+  any spend: unknown or mistyped `--args` keys (with a suggestion), non-string
+  `prompt`, unsupported `level`, non-array `prompts`, and a `diffBaseRef` that does
+  not resolve to a commit are rejected. Every rejection names the rejected value,
+  the cause, and the remediation. `level` now accepts `"xhigh"` explicitly (the
+  previously unnamed default) and is compared case-insensitively.
+- `run --validate` reports the change-evidence precondition for `code-review` with
+  no agent and no token: whether the gate would open, the allowed evidence refs, and
+  each dropped path with the rule that dropped it. It also runs the request-contract
+  validation, so it is a complete pre-check.
+- `--evidence-scope <default|all>` (settings: `workflow.evidenceScope`, default
+  `default`). `all` forgives only the evidence extension allowlist, making
+  `.java`/`.rb`/`.sql`/`.kt` repositories reviewable; excluded directories, runtime
+  state, and unsafe paths stay inadmissible at every scope, and prompt-budget file
+  selection keeps its own allowlist.
+- `code-review` reviews a committed range on a clean tree: a resolvable `diffBaseRef`
+  now contributes file refs, so `diffBaseRef..HEAD` alone can open the evidence gate.
+- `--ref-policy <strict|lenient>` (settings: `workflow.refPolicy`, default `strict`).
+  Under `lenient`, a cited ref that normalization cannot resolve to a path in evidence
+  drops that one candidate instead of the run, and the result carries a `degraded`
+  block plus `stats.refDrops`. A run whose candidates were ALL dropped still fails, so
+  a degraded run can never present as a clean review. Lens decisions (the review's
+  premises) and structural violations stay fatal at every policy. The policy is baked
+  into the built-in script text, so the two policies have different script hashes and are
+  distinguishable in run records. Built-in workflows are not permission-gated, so a policy
+  switch is not confirmed by a prompt — a non-default policy is announced on stderr at
+  launch instead. A resume whose source run executed a built-in under a different ref
+  policy is refused, because the source's cached agent results carry different failure
+  semantics and the agent call keys do not record the policy.
+- The run-level ref policy is recorded in the journal (`runtime.refPolicy`) on **every** run.
+  **Migration boundary:** a journal written by this version needs this version or newer to resume,
+  because an older reader rejects unknown `runtime` keys. Downgrading means starting fresh runs rather
+  than resuming. Recording it conditionally was tried and rejected: absence then became ambiguous, and
+  a resume inferred `strict` and could replay a lenient run's cached results.
+- A cross-policy resume is refused in both directions. The policy is proven from the journal; an absent
+  field (a run from before the field) or a recorded value this version does not recognize is
+  **unprovable** and refused rather than guessed from script bytes. Policy relevance is judged from the
+  registry actually in use, so a `builtinWorkflows`-injected workflow — one static script for every
+  policy — is never refused, while a built-in this version does not ship is refused on a mismatch.
+- A nested `workflow("code-review", …)` child is validated against its request contract before it
+  executes, so a parent cannot silently run the default review with a mistyped key.
+- A resumed built-in is validated against its request contract. Resume hands back the
+  persisted script path, so a resumed run classifies as `script_path`; the built-in
+  identity is now recovered from the run's journal (workflow name + script hash) and the
+  contract applied, closing a hole where a resumed review accepted a mistyped `--args`
+  key or an unsupported `level` and silently ran the script's fallback.
+- Evidence context discloses `#### Dropped From Evidence` (paths the reviewer can see
+  in git status but may not cite) and `#### Evidence Ref Grammar`.
+
+### Changed
+
+- **The evidence context sent to agents changed for every run, including `default`/`strict`.** What
+  the opt-in flags preserve is the *decisions* — which paths are admissible, which runs are gated,
+  which refs are rejected — not the bytes of the prompt. The context gained `evidenceScope`,
+  `evidenceGate`, `evidenceGateReason`, `#### Evidence Ref Grammar`, and `#### Dropped From Evidence`,
+  so `contextHash` and the agent cache keys derived from it differ from previous releases: a
+  `--resume-from-run-id` of a run started before this change re-runs its agents instead of reusing
+  cached results. With a resolvable `diffBaseRef`, `allowedEvidenceIndexDigest` also changes because
+  the range now contributes file refs.
+- The evidence-gate failure message now names the cause and remediation: how many
+  paths git status reported, which rule dropped each one, and what to change. It no
+  longer reports the runtime's own state files as caller changes.
+- Cited evidence refs are normalized before rejection — a trailing line number is
+  stripped from a `file:` ref, and a mismatched ref kind resolves through the cited
+  path — so a grammar slip no longer discards a whole run's agent results. A path
+  that is not in the evidence snapshot still fails closed. `stats.normalizedRefs`
+  counts the normalizations.
+- **The evidence gate now keys on readability, not on the existence of a ref.** A path counts as
+  reviewable only if the reviewer can actually see it: it produced an included content block, or it
+  produced a diff hunk. Previously the gate opened as soon as a `file:` ref existed, so three separate
+  shapes of the same defect let agents spend on a change they could not read — an untracked file larger
+  than `maxFileBytes` (no content block, and an untracked file has no patch), an evidence-only path that
+  lost the `maxFiles` budget to ordinary changed files, and a committed-range path crowded out by the
+  directory walk. When paths were admitted but none is readable, the gate closes with a distinct reason
+  (`no readable change evidence in the working tree: …`) naming the count and the remedies (reduce the
+  change, raise the workspace-context budget, or stage the file so a diff exists).
+- Evidence paths are selected for included-file blocks ahead of every other budget candidate, and among
+  them the paths with **no** diff hunk go first — a hunk already shows the reviewer the change, while an
+  untracked file's only visibility is its content block.
+- `evidenceGate:` / `evidenceGateReason:` moved from inside `### Change Evidence` to the workspace-context
+  header, because the gate is now decided after file selection. `run --validate` reports the same verdict
+  by running the same builder, so the preflight and the run cannot diverge.
+- **A `file:` ref is published only for a path the reviewer can read**, and the gate is now that same
+  rule ("is any file ref publishable?"). Publication and admission can no longer disagree: previously a
+  truncated `diffBaseRef..HEAD` range or an exhausted file budget left a citable ref for a change no
+  agent received, and because some other path was readable the gate opened and validation accepted the
+  citation. Withheld paths are disclosed as `unavailable:file-evidence:<n>:no-content-block-or-hunk`.
+- An evidence-gate failure whose drops are **all** `extension-not-allowed` now leads with
+  `--evidence-scope all` instead of "change a file whose extension is in the allowlist" — for a
+  Java-only repository the old text hid the supported answer and read as "rename your code". Mixed-rule
+  failures keep the generic remedy and mention the scope flag second.
+
+### Fixed
+
+- `--validate` and the run no longer answer from two different code paths: the preview builds the full
+  workspace context (including file selection) instead of re-deriving evidence on its own.
+- A commit range that touched only unsafe filenames no longer reports "git status reported no changed or
+  untracked paths". The closed-gate reason now accounts for the excluded names (count only — the names
+  themselves are never interpolated into the prompt).
+- A committed filename containing a backslash (legal on POSIX) keeps its raw name in `file:` refs.
+  Normalizing it to a slash named a nested path that does not exist, so the ref could be neither read
+  nor cited. Normalization is still applied for comparison keys only.
+- The `(none)` placeholder the context prints when no commit range was accepted is no longer read back as
+  a range: it is truthy, so `provenance.diffBaseRef` reported `"(none)"` and the file-ref diagnostic
+  claimed a `(none)..HEAD` range that was never reviewed.
+- A direct `--script-path` launch of a persisted built-in is refused when the script's baked-in ref policy
+  differs from the requested one. Promotion classifies such a launch as the built-in, but only the resume
+  shapes were policy-checked, so the run executed the source policy while stderr and the journal recorded
+  the requested one — and a later resume trusted that false record. The dangerous direction was a lenient
+  script under requested `strict`: the review completes with candidates dropped where a real strict run
+  fails. Refusal names the policy that generated the script and both ways out (pass that policy, or launch
+  by name to generate the current one).
+- A path that one `git status` entry reports as a safe change is no longer also treated as excluded
+  because a **different** entry mentioned it in an excluded position (an unsafe rename source pointing at
+  it). It was in both the accepted and the excluded list, and every consumer that asked "is this
+  excluded?" won, so the file lost its content block and its diff while still being listed as changed.
+  The parser now single-sources the exclusion.
+- A filename with a leading or trailing space keeps its identity. Two normalizers renamed it to a file
+  that does not exist — the shared `uniqueStrings` dedup (which trims) and the workspace path resolver —
+  while its `file:` ref kept the true name, so the reviewer held a citation licence for a file the runtime
+  had just failed to read. Path lists now dedup without trimming.
+- A filename ending in whitespace is no longer admitted as evidence, reported as
+  `unavailable:git-status-path:<n>:unrepresentable-path`. Refs travel as lines and every consumer of that
+  protocol trims a line — including the built-in script's own section parser — so such a name comes back
+  as a different one: the runtime read the real file and published a ref for a path that does not exist,
+  while citing the true path was rejected. Leading whitespace is interior to the line and stays
+  admissible. The two dedup helpers are now one that never normalizes its input.
+- A cited path ending in `:<digits>` (a legal filename such as `issue:123`) is matched exactly before the
+  trailing-index reading is tried. Stripping first redirected the citation to a different, usually
+  nonexistent file, so a strict review failed and a lenient one dropped the candidate — for `file:`/`diff:`
+  refs, which carry no index in the grammar at all. An exact path match is a fact; the index reading is a
+  guess, so the fact wins.
+- Runtime ref drops now produce synthesis decision rows, so `stats.dropped.unsupportedEvidence` counts
+  them. `stats.refDrops` rose while that field stayed `0`, contradicting the other accounting;
+  `docs/20260727-r6-ref-drop-policy-design.md` had committed to `stats.dropped` being the single drop
+  surface, and this implements it. The dropped candidate's provenance (that it existed, and why it left)
+  is now in `synthesis.decisions`.
+- Launch notices no longer break the channel they are written to. `--ref-policy` and the `--agent-types`
+  registry warnings were written as plain stderr text unconditionally; with `--progress jsonl` stderr IS
+  the event stream, and the background launcher redirects its child's stderr into `progress.jsonl`, so
+  every non-default-policy background run wrote an invalid first line that `status` then counted as a
+  malformed progress line. An attached JSONL run emits them as a `workflow.notice` event; a background
+  parent, whose stderr is the user's terminal, keeps the readable line.
+
 ## [0.6.1] - 2026-07-18
 
 ### Fixed

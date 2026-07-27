@@ -5,8 +5,8 @@ import { availableParallelism, homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { createContext, runInContext } from 'node:vm';
-import type { AgentConcurrency, NestedWorkflows, ReasoningEffort, ResolvedAgentType, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
-import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort, isSubagentFailure } from './types.js';
+import type { AgentConcurrency, EvidenceScope, NestedWorkflows, ReasoningEffort, RefPolicy, ResolvedAgentType, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
+import { REF_POLICY_VALUES, SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort, isRefPolicy, isSubagentFailure } from './types.js';
 import { AgentConcurrencyPool } from './agent-concurrency-pool.js';
 import {
   WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
@@ -430,6 +430,14 @@ interface WorkflowTaskRegistryOptions {
   // Gate for nested workflow() calls. Omitted or 'disabled' keeps the throwing stub
   // (current behavior); 'enabled' lets a workflow run built-in/inline children inline.
   readonly nestedWorkflows?: NestedWorkflows;
+  // Which changed paths may become citable evidence. Omitted or 'default' keeps the extension
+  // allowlist on the evidence path (current behavior); 'all' forgives only that rule.
+  readonly evidenceScope?: EvidenceScope;
+  // What happens to a cited ref that normalization cannot resolve to a path in evidence. Omitted or
+  // 'strict' fails the run (current behavior); 'lenient' drops that one candidate and discloses it.
+  // Baked into the built-in script text, so a policy change changes the script hash: the permission
+  // grant and the resume cache are policy-scoped rather than silently carried over.
+  readonly refPolicy?: RefPolicy;
   // Resolved agent-type registry (PG-AGENTTYPE). Omitted/empty leaves `agent({agentType})` inert:
   // a script that uses it fails loud. When present (the CLI loads it only under --agent-types),
   // runAgent resolves a named type's model/effort/persona for that one call. The map is keyed by the
@@ -503,6 +511,9 @@ interface WorkflowPermissionStore {
 interface WorkflowResumePlan {
   readonly launchInput: WorkflowLaunchInput;
   readonly sourceTask?: WorkflowResumeSource;
+  // Edit-and-iterate: a co-supplied selector replaces what the source ran, so the source's request
+  // contract does not govern the args of the workflow that will actually execute.
+  readonly replacedSource?: boolean;
 }
 
 interface WorkflowResumeSource {
@@ -715,6 +726,11 @@ const DYNAMIC_WORKFLOW_PATTERN_GUIDANCE = [
   '- loop-until-done: iterate repair and verification only when there is a clear stop condition.',
   'Prefer pipelines when later phases need earlier summaries; prefer parallel agents when independent evidence can be gathered at the same time.',
 ].join('\n');
+// The accepted `level` values live here only. The contract validates against this list and the
+// built-in script interpolates the same values, so the two cannot drift into disagreeing about which
+// values a caller may pass. Order matters: the last entry is the value an omitted `level` selects.
+const CODE_REVIEW_LEVELS = ['high', 'xhigh'] as const;
+
 const DEFAULT_BUILTIN_WORKFLOWS: readonly BuiltinWorkflow[] = [
   {
     name: 'task',
@@ -730,7 +746,7 @@ const DEFAULT_BUILTIN_WORKFLOWS: readonly BuiltinWorkflow[] = [
   },
   {
     name: 'code-review',
-    script: codeReviewBuiltinWorkflowScript(),
+    script: codeReviewBuiltinWorkflowScript('strict'),
   },
   {
     name: 'batch',
@@ -757,7 +773,205 @@ return await parallel(prompts.map((prompt, index) => () => agent(
   },
 ];
 
-function codeReviewBuiltinWorkflowScript(): string {
+// The built-in list is policy-scoped because the ref policy is baked into the code-review script
+// text: a different policy is a different script (different hash), so the permission grant and the
+// resume cache stay bound to the policy they were made under. Memoized per policy (two values).
+const BUILTIN_WORKFLOWS_BY_REF_POLICY = new Map<RefPolicy, readonly BuiltinWorkflow[]>([
+  ['strict', DEFAULT_BUILTIN_WORKFLOWS],
+]);
+
+// Which built-in a resumed run came from, and — only for a built-in whose script actually varies by
+// ref policy — which policy produced it. Resume classifies a source run as `script_path`
+// (prepareResumePlan hands back the persisted scriptPath), so without this the built-in's request
+// contract and its policy binding are both lost. `policy` stays undefined for a built-in that
+// generates the same script under every policy (task, batch); reporting one there would flag every
+// cross-policy resume of those as a mismatch that does not exist.
+interface BuiltinResumeIdentity {
+  readonly name: string;
+  // Whether this built-in's generated script varies by ref policy at all. False for task/batch, where
+  // there is nothing to prove and no resume needs refusing.
+  readonly policySensitive: boolean;
+  // The policy proven from the recorded script, when it matches a current variant.
+  readonly policy?: RefPolicy;
+}
+
+
+
+
+
+function defaultBuiltinWorkflows(refPolicy: RefPolicy): readonly BuiltinWorkflow[] {
+  const cached = BUILTIN_WORKFLOWS_BY_REF_POLICY.get(refPolicy);
+  if (cached) return cached;
+  const built = DEFAULT_BUILTIN_WORKFLOWS.map((workflow) => workflow.name === 'code-review'
+    ? { ...workflow, script: codeReviewBuiltinWorkflowScript(refPolicy) }
+    : workflow);
+  BUILTIN_WORKFLOWS_BY_REF_POLICY.set(refPolicy, built);
+  return built;
+}
+
+// Per-built-in request contract. Built-in scripts read `args` ad hoc with silent fallbacks, so an
+// unknown or mistyped key used to be swallowed: `{"promt":"…"}` ran the DEFAULT prompt and reported
+// success, and `{"level":"medium"}` silently selected the most expensive profile. A request error is
+// deterministically decidable before any agent spend, so the runtime hard-fails it at launch. Every
+// rejection carries three parts — rejected value, cause, remediation — via requestContractError.
+interface BuiltinRequestContract {
+  readonly keys: readonly string[];
+  readonly nonEmptyStrings?: readonly string[];
+  readonly enums?: Readonly<Record<string, readonly string[]>>;
+  readonly arrays?: readonly string[];
+  readonly gitCommitRefs?: readonly string[];
+  // Whether `--validate` should also report this built-in's change-evidence precondition.
+  readonly consumesChangeEvidence?: boolean;
+}
+
+// What `--validate` reports about a change-evidence-consuming built-in: whether the run would be
+// gated, why, and exactly what it would be allowed to cite.
+export interface ChangeEvidencePreview {
+  readonly gated: boolean;
+  readonly reason?: string;
+  readonly allowedFileRefs: number;
+  readonly allowedEvidenceRefs: readonly string[];
+  readonly dropped: readonly EvidenceDroppedPath[];
+  readonly unavailableEvidence: readonly string[];
+}
+
+const BUILTIN_REQUEST_CONTRACTS: Readonly<Record<string, BuiltinRequestContract>> = {
+  'code-review': {
+    keys: ['prompt', 'level', 'diffBaseRef'],
+    nonEmptyStrings: ['prompt', 'diffBaseRef'],
+    // "xhigh" names the previously unnamed default: omitting `level` still selects it, but a caller
+    // could not say so explicitly. Compared case-insensitively here and in the built-in script.
+    enums: { level: CODE_REVIEW_LEVELS },
+    gitCommitRefs: ['diffBaseRef'],
+    consumesChangeEvidence: true,
+  },
+  task: {
+    keys: ['prompt'],
+    nonEmptyStrings: ['prompt'],
+  },
+  batch: {
+    keys: ['prompts'],
+    arrays: ['prompts'],
+  },
+};
+
+// The one formatter for fail-loud request rejections: "<rejected>: <cause>; <remediation>". Mirrors
+// the built-in scripts' failUnsupportedRef shape so a caller reads the same three parts wherever a
+// request is refused, and so the shape cannot drift between rejection kinds.
+function requestContractError(rejected: string, cause: string, remediation: string): UltracodeRequestError {
+  return workflowInputError(`${rejected}: ${cause}; ${remediation}`);
+}
+
+function acceptedKeyList(contract: BuiltinRequestContract): string {
+  return `${contract.keys.length} accepted ${contract.keys.length === 1 ? 'key' : 'keys'}: ${contract.keys.join(', ')}`;
+}
+
+// Suggestion source for a rejected key: exact-but-miscased, a prefix relation (diffBase →
+// diffBaseRef), then a bounded edit distance (promt → prompt). Suggestion only — the rejection
+// stands either way, and the accepted set is always named.
+function nearestContractKey(key: string, accepted: readonly string[]): string | undefined {
+  const lower = key.toLowerCase();
+  for (const candidate of accepted) {
+    if (candidate.toLowerCase() === lower) return candidate;
+  }
+  for (const candidate of accepted) {
+    const candidateLower = candidate.toLowerCase();
+    if (candidateLower.startsWith(lower) || lower.startsWith(candidateLower)) return candidate;
+  }
+  for (const candidate of accepted) {
+    if (withinEditDistance(lower, candidate.toLowerCase(), 2)) return candidate;
+  }
+  return undefined;
+}
+
+function withinEditDistance(a: string, b: string, limit: number): boolean {
+  if (Math.abs(a.length - b.length) > limit) return false;
+  let previous = Array.from({ length: b.length + 1 }, (_unused, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j += 1) {
+      current[j] = a[i - 1] === b[j - 1]
+        ? previous[j - 1]
+        : 1 + Math.min(previous[j - 1], previous[j], current[j - 1]);
+    }
+    previous = current;
+  }
+  return previous[b.length] <= limit;
+}
+
+async function validateBuiltinRequestArgs(name: string, args: unknown, cwd: string): Promise<void> {
+  const contract = BUILTIN_REQUEST_CONTRACTS[name];
+  if (!contract || args === undefined || args === null) return;
+  if (typeof args !== 'object' || Array.isArray(args)) {
+    throw requestContractError(
+      `workflow args for built-in "${name}" must be a JSON object`,
+      `received ${Array.isArray(args) ? 'an array' : typeof args}, whose keys the workflow cannot read`,
+      `pass an object with the ${acceptedKeyList(contract)}`,
+    );
+  }
+  const record = args as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (contract.keys.includes(key)) continue;
+    const nearest = nearestContractKey(key, contract.keys);
+    throw requestContractError(
+      `unknown workflow arg "${key}" for built-in "${name}"`,
+      `it is not read by this workflow and would be silently ignored (${acceptedKeyList(contract)})`,
+      nearest ? `did you mean "${nearest}"?` : `remove it, or use one of the accepted keys`,
+    );
+  }
+  for (const key of contract.nonEmptyStrings ?? []) {
+    if (record[key] === undefined) continue;
+    const value = record[key];
+    if (typeof value !== 'string' || !value.trim()) {
+      throw requestContractError(
+        `workflow arg "${key}" for built-in "${name}" is not a non-empty string`,
+        `received ${typeof value === 'string' ? 'an empty or whitespace-only string' : typeof value}, which the workflow would silently replace with its default`,
+        `pass a non-empty string, or omit "${key}" to accept the default deliberately`,
+      );
+    }
+  }
+  for (const [key, allowed] of Object.entries(contract.enums ?? {})) {
+    if (record[key] === undefined) continue;
+    const value = record[key];
+    const normalized = typeof value === 'string' ? value.trim().toLowerCase() : undefined;
+    if (normalized === undefined || !allowed.includes(normalized)) {
+      throw requestContractError(
+        `workflow arg "${key}" for built-in "${name}" has an unsupported value ${JSON.stringify(value)}`,
+        `it is not one of the ${allowed.length} supported values (${allowed.map((entry) => JSON.stringify(entry)).join(', ')}), and an unrecognized value silently selects ${JSON.stringify(allowed[allowed.length - 1])}`,
+        `pass one of ${allowed.map((entry) => JSON.stringify(entry)).join(' or ')} (case-insensitive)`,
+      );
+    }
+  }
+  for (const key of contract.arrays ?? []) {
+    if (record[key] === undefined) continue;
+    if (!Array.isArray(record[key])) {
+      throw requestContractError(
+        `workflow arg "${key}" for built-in "${name}" is not an array`,
+        `received ${typeof record[key]}, which the workflow would read as zero entries`,
+        `pass a JSON array of values for "${key}"`,
+      );
+    }
+  }
+  for (const key of contract.gitCommitRefs ?? []) {
+    const value = record[key];
+    if (typeof value !== 'string' || !value.trim()) continue;
+    // Resolvability is decidable before any spend. An unresolvable ref used to be dropped silently,
+    // leaving the review to run with no committed evidence while the caller believed it had some.
+    const failure = await gitOutput(cwd, ['rev-parse', '--verify', `${value.trim()}^{commit}`]).then(
+      () => undefined,
+      (err: unknown) => workflowErrorMessage(err),
+    );
+    if (failure !== undefined) {
+      throw requestContractError(
+        `workflow arg "${key}" for built-in "${name}" does not resolve to a commit: ${JSON.stringify(value)}`,
+        `git rev-parse --verify rejected it in ${cwd} (${failure})`,
+        `pass a ref that exists there (e.g. "HEAD~1", "origin/main", a commit sha), or omit "${key}" to review only the working tree`,
+      );
+    }
+  }
+}
+
+function codeReviewBuiltinWorkflowScript(refPolicy: RefPolicy): string {
   return `export const meta = {
   name: "code-review",
   description: "Run a dynamic evidence-bound code review workflow"
@@ -766,7 +980,7 @@ const workflowInput = args && typeof args === "object" ? args : {};
 const prompt = typeof workflowInput.prompt === "string" && workflowInput.prompt.trim()
   ? workflowInput.prompt
   : "Review the current repository for correctness risks.";
-const level = workflowInput.level === "high" ? "high" : "xhigh";
+const level = String(workflowInput.level == null ? "" : workflowInput.level).trim().toLowerCase() === ${JSON.stringify(CODE_REVIEW_LEVELS[0])} ? ${JSON.stringify(CODE_REVIEW_LEVELS[0])} : ${JSON.stringify(CODE_REVIEW_LEVELS[1])};
 const scopeEffort = level === "high" ? "medium" : "xhigh";
 const verdictEffort = level === "high" ? "high" : "xhigh";
 const caps = level === "high"
@@ -940,25 +1154,192 @@ function uniquePush(list, item) {
 function failUnsupportedRef(prefix, value, refSet) {
   fail(prefix + " " + value + ": not in " + refSet.name + " (" + refSet.size + " entries) derived from " + refSet.source + "; populated by " + refSet.populatedBy);
 }
+// Ref normalization. The property worth protecting is that a cited PATH exists in the evidence
+// snapshot; the kind and any trailing index are grammar, not authority. Which kinds exist for a path
+// depends on whether the change is untracked, unstaged, or staged — something the reviewer cannot
+// see — so a kind guess or an appended line number used to abort the whole run after full spend.
+// Exact match first, then a trailing numeric index, then the path. A path that is not in evidence
+// still fails: the anti-fabrication property is unchanged.
+let normalizedRefCount = 0;
+// Verifier results processed in this run, including ones a lenient policy dropped. NOT a token-spend
+// figure: a resumed run's cached verifier results return through the same loop without reaching the
+// backend, and a script cannot see which agent() calls were cache hits. Fresh-vs-cached is available
+// in the journal and the agent.completed events (cached: true).
+let verifierResultCount = 0;
+// Ref policy (R6). "strict" fails the run on a ref that normalization cannot resolve to a path in
+// evidence. "lenient" drops the one candidate that cited it and lets the rest of the review stand.
+// What stays fatal at every policy: lens decisions (the review's premises, not its items) and any
+// structural violation. A drop is never silent — it lands in refDrops and in the result's "degraded"
+// block, and a run whose candidates were ALL dropped fails rather than reporting a clean review.
+const refLenient = ${refPolicy === 'lenient' ? 'true' : 'false'};
+const refDrops = [];
+// A path that escapes the workspace is a decidable structural violation, not a grammar slip: it is
+// refused at every policy, and a lenient drop must re-raise it rather than swallow the one signal
+// that says the reviewer fabricated a traversal path.
+function failStructural(message) {
+  throw "code-review invalid (structural): " + message;
+}
+function isStructuralFailure(err) {
+  return text(err && err.message ? err.message : err).indexOf("code-review invalid (structural): ") === 0;
+}
+function assertPathSafe(value, label) {
+  const raw = text(value);
+  // fromCharCode(92) avoids a backslash escape inside this generated script.
+  const normalized = raw.split(String.fromCharCode(92)).join("/");
+  // A drive-letter absolute path (C:/x, or a backslash form once normalized) escapes the workspace
+  // exactly like a POSIX absolute path. Without this it read as an ordinary unresolvable ref and a
+  // lenient policy downgraded it to a drop, contradicting "absolute paths stay fatal at every policy".
+  // Drive-ABSOLUTE requires the separator: "C:/foo" escapes the workspace, while "C:foo.ts" is a legal
+  // POSIX filename that must stay an ordinary path.
+  const driveAbsolute = normalized.length > 2
+    && normalized.charAt(1) === ":"
+    && normalized.charAt(2) === "/"
+    && /[A-Za-z]/.test(normalized.charAt(0));
+  if (
+    normalized.indexOf("../") === 0
+    || normalized.indexOf("/../") >= 0
+    || normalized === ".."
+    || normalized.charAt(0) === "/"
+    || driveAbsolute
+  ) {
+    failStructural(label + " references a path outside the workspace: " + raw);
+  }
+}
+// One declaration of the vacuous-pass rule, called at EVERY terminal point. Drops with nothing
+// verified is "could not judge", not "found nothing", so it fails instead of returning a report a
+// reader would take for a clean review. The no-active-lenses return used to bypass this.
+function assertNoVacuousPass(survivingCount, stage) {
+  if (refDrops.length === 0 || survivingCount > 0) return;
+  fail("no candidate survived " + refDrops.length + " unsupported-evidence drop(s) at " + stage
+    + "; this review is inconclusive, not clean; first: " + refDrops[0].reason);
+}
+// A candidate the runtime dropped never reaches synthesis, so it had no decision row: stats.refDrops
+// rose while stats.dropped.unsupportedEvidence stayed 0 and the two accountings contradicted each other.
+// The committed design (docs/20260727-r6-ref-drop-policy-design.md) keeps stats.dropped the single drop
+// surface and preserves the provenance that the candidate existed and why it left.
+function refDropDecisionRows() {
+  const rows = [];
+  for (let index = 0; index < refDrops.length; index += 1) {
+    const drop = refDrops[index];
+    rows.push({
+      candidateId: drop.stage + ":" + drop.label,
+      candidateDigest: "",
+      action: "drop",
+      reasonCategory: drop.reasonCategory,
+      reason: drop.reason,
+      mergeCandidates: [],
+      severity: ""
+    });
+  }
+  return rows;
+}
+function recordRefDrop(stage, label, err) {
+  const reason = text(err && err.message ? err.message : err);
+  refDrops.push({ stage: stage, label: label, reasonCategory: "unsupported_evidence", reason: reason });
+  return reason;
+}
+function stripTrailingIndex(value) {
+  const at = value.lastIndexOf(":");
+  if (at < 1 || at === value.length - 1) return value;
+  const tail = value.slice(at + 1);
+  for (let index = 0; index < tail.length; index += 1) {
+    const code = tail.charCodeAt(index);
+    if (code < 48 || code > 57) return value;
+  }
+  return value.slice(0, at);
+}
+function evidenceRefPath(ref) {
+  if (ref.indexOf("file:") === 0) return ref.slice(5);
+  if (ref.indexOf("diff:") === 0) {
+    const rest = ref.slice(5);
+    const at = rest.indexOf(":");
+    return at < 0 ? "" : rest.slice(at + 1);
+  }
+  if (ref.indexOf("hunk:") === 0) {
+    const rest = ref.slice(5);
+    const at = rest.indexOf(":");
+    return at < 0 ? "" : stripTrailingIndex(rest.slice(at + 1));
+  }
+  return "";
+}
+// Built on first use: these helpers are hoisted above the evidence context they read from.
+let allowedPathRefMapCache = null;
+function allowedPathRefs() {
+  if (allowedPathRefMapCache) return allowedPathRefMapCache;
+  const map = {};
+  for (let index = 0; index < allowedEvidenceRefs.length; index += 1) {
+    const ref = allowedEvidenceRefs[index];
+    const path = evidenceRefPath(ref);
+    if (!path) continue;
+    if (!map[path] || ref.indexOf("file:") === 0) map[path] = ref;
+  }
+  allowedPathRefMapCache = map;
+  return map;
+}
+function normalizeEvidenceRef(ref) {
+  if (allowedEvidenceRefMap[ref]) return ref;
+  const citedPath = evidenceRefPath(ref);
+  if (citedPath) assertPathSafe(citedPath, "evidence ref");
+  // The cited path, exactly as written, wins over the index guess. A trailing ":<digits>" is only a
+  // guess that an index was appended, and file:/diff: refs carry no index in the grammar at all; for a
+  // real file named "notes.md:9" the guess silently redirected the citation to a DIFFERENT file,
+  // "notes.md", attaching the finding to evidence the agent never read.
+  const byCitedPath = citedPath ? allowedPathRefs()[citedPath] : "";
+  if (byCitedPath) {
+    normalizedRefCount += 1;
+    return byCitedPath;
+  }
+  const stripped = stripTrailingIndex(ref);
+  if (stripped !== ref && allowedEvidenceRefMap[stripped]) {
+    normalizedRefCount += 1;
+    return stripped;
+  }
+  const path = evidenceRefPath(stripped);
+  const byPath = path ? allowedPathRefs()[path] : "";
+  if (byPath) {
+    normalizedRefCount += 1;
+    return byPath;
+  }
+  return "";
+}
+function normalizeFilePath(file) {
+  const raw = text(file);
+  assertPathSafe(raw.indexOf("file:") === 0 ? raw.slice(5) : raw, "file ref");
+  const withoutPrefix = raw.indexOf("file:") === 0 ? raw.slice(5) : raw;
+  if (allowedFileRefMap["file:" + withoutPrefix]) {
+    if (withoutPrefix !== raw) normalizedRefCount += 1;
+    return withoutPrefix;
+  }
+  const stripped = stripTrailingIndex(withoutPrefix);
+  if (stripped !== withoutPrefix && allowedFileRefMap["file:" + stripped]) {
+    normalizedRefCount += 1;
+    return stripped;
+  }
+  return "";
+}
 function assertDecisionRefs(refs, label) {
   if (!Array.isArray(refs) || refs.length < 1) fail(label + " must include evidence or decision refs.");
   for (let index = 0; index < refs.length; index += 1) {
     const ref = text(refs[index]);
-    if (!allowedEvidenceRefMap[ref] && !unavailableEvidenceRefMap[ref] && ref !== "prompt:request") {
-      failUnsupportedRef(label + " includes unsupported decision ref", ref, decisionRefSet);
-    }
+    if (unavailableEvidenceRefMap[ref] || ref === "prompt:request") continue;
+    const normalized = normalizeEvidenceRef(ref);
+    if (!normalized) failUnsupportedRef(label + " includes unsupported decision ref", ref, decisionRefSet);
+    refs[index] = normalized;
   }
 }
 function assertEvidenceRefs(refs, label) {
   if (!Array.isArray(refs) || refs.length < 1) fail(label + " must include at least one evidence ref.");
   for (let index = 0; index < refs.length; index += 1) {
     const ref = text(refs[index]);
-    if (!allowedEvidenceRefMap[ref]) failUnsupportedRef(label + " includes unsupported evidence ref", ref, evidenceRefSet);
+    const normalized = normalizeEvidenceRef(ref);
+    if (!normalized) failUnsupportedRef(label + " includes unsupported evidence ref", ref, evidenceRefSet);
+    refs[index] = normalized;
   }
 }
-function validateFile(file, label) {
-  const ref = "file:" + text(file);
-  if (!allowedFileRefMap[ref]) failUnsupportedRef(label + " references unsupported file", text(file), fileRefSet);
+function validateFileAt(owner, key, label) {
+  const normalized = normalizeFilePath(owner[key]);
+  if (!normalized) failUnsupportedRef(label + " references unsupported file", text(owner[key]), fileRefSet);
+  owner[key] = normalized;
 }
 function selectedDecisionMatches(decision, lens) {
   if (decision.action !== "select") return false;
@@ -966,7 +1347,22 @@ function selectedDecisionMatches(decision, lens) {
   return selected === lens.lensKey || selected === normalizeKey(lens.id, lens.lensKey);
 }
 function validateScope(scope) {
-  for (let index = 0; index < scope.files.length; index += 1) validateFile(scope.files[index], "scope.files[" + index + "]");
+  const keptFiles = [];
+  for (let index = 0; index < scope.files.length; index += 1) {
+    try {
+      validateFileAt(scope.files, index, "scope.files[" + index + "]");
+      keptFiles.push(scope.files[index]);
+    } catch (err) {
+      if (!refLenient || isStructuralFailure(err)) throw err;
+      recordRefDrop("scope.files", "scope.files[" + index + "]", err);
+    }
+  }
+  // A narrowed scope is reviewable; an empty one is not — reporting zero findings from no files
+  // would be a vacuous pass.
+  if (scope.files.length > 0 && keptFiles.length === 0) {
+    fail("every scope file was dropped as unsupported evidence (" + refDrops.length + " drop(s)); first: " + refDrops[0].reason);
+  }
+  scope.files = keptFiles;
   for (let index = 0; index < scope.lensDecisions.length; index += 1) {
     assertDecisionRefs(scope.lensDecisions[index].decisionRefs, "scope.lensDecisions[" + index + "]");
   }
@@ -995,7 +1391,7 @@ function validateScope(scope) {
   return selected;
 }
 function validateCandidate(candidate, label) {
-  validateFile(candidate.file, label + ".file");
+  validateFileAt(candidate, "file", label + ".file");
   assertEvidenceRefs(candidate.evidenceRefs, label + ".evidenceRefs");
   return {
     file: text(candidate.file),
@@ -1057,7 +1453,14 @@ function reviewLensStage(lens) {
     const capped = rawCandidates.slice(0, caps.maxCandidatesPerLens);
     const envelopes = [];
     for (let index = 0; index < capped.length; index += 1) {
-      const candidate = validateCandidate(capped[index], "candidate " + lens.lensKey + "/" + index);
+      let candidate;
+      try {
+        candidate = validateCandidate(capped[index], "candidate " + lens.lensKey + "/" + index);
+      } catch (err) {
+        if (!refLenient || isStructuralFailure(err)) throw err;
+        recordRefDrop("candidate", lens.lensKey + "/" + index, err);
+        continue;
+      }
       const candidateDigest = hash({
         sourceSnapshotId: sourceSnapshotId,
         contextHash: contextHash,
@@ -1096,7 +1499,16 @@ function reviewLensStage(lens) {
       if (verifierResults.length !== envelopes.length) fail("verifier count mismatch for " + lens.lensKey);
       const verified = [];
       for (let index = 0; index < envelopes.length; index += 1) {
+        verifierResultCount += 1;
         if (verifierResults[index] == null) fail("missing verifier result for " + envelopes[index].candidateId);
+        let verifier;
+        try {
+          verifier = validateVerifier(verifierResults[index], "verifier " + envelopes[index].candidateId);
+        } catch (err) {
+          if (!refLenient || isStructuralFailure(err)) throw err;
+          recordRefDrop("verifier", envelopes[index].candidateId, err);
+          continue;
+        }
         verified.push({
           candidateId: envelopes[index].candidateId,
           candidateIndex: envelopes[index].candidateIndex,
@@ -1104,7 +1516,7 @@ function reviewLensStage(lens) {
           lensKey: envelopes[index].lensKey,
           lensTitle: envelopes[index].lensTitle,
           candidate: envelopes[index].candidate,
-          verifier: validateVerifier(verifierResults[index], "verifier " + envelopes[index].candidateId)
+          verifier: verifier
         });
       }
       return verified;
@@ -1140,7 +1552,14 @@ function runSweep(kept, refutedCount) {
 function reviewSweepCandidates(lens, rawCandidates) {
   const envelopes = [];
   for (let index = 0; index < rawCandidates.length; index += 1) {
-    const candidate = validateCandidate(rawCandidates[index], "sweep candidate " + index);
+    let candidate;
+    try {
+      candidate = validateCandidate(rawCandidates[index], "sweep candidate " + index);
+    } catch (err) {
+      if (!refLenient || isStructuralFailure(err)) throw err;
+      recordRefDrop("sweep-candidate", "sweep/" + index, err);
+      continue;
+    }
     const candidateDigest = hash({
       sourceSnapshotId: sourceSnapshotId,
       contextHash: contextHash,
@@ -1176,7 +1595,16 @@ function reviewSweepCandidates(lens, rawCandidates) {
     if (verifierResults.length !== envelopes.length) fail("sweep verifier count mismatch");
     const verified = [];
     for (let index = 0; index < envelopes.length; index += 1) {
+      verifierResultCount += 1;
       if (verifierResults[index] == null) fail("missing sweep verifier result");
+      let sweepVerifier;
+      try {
+        sweepVerifier = validateVerifier(verifierResults[index], "sweep verifier " + index);
+      } catch (err) {
+        if (!refLenient || isStructuralFailure(err)) throw err;
+        recordRefDrop("sweep-verifier", "sweep/" + index, err);
+        continue;
+      }
       verified.push({
         candidateId: envelopes[index].candidateId,
         candidateIndex: envelopes[index].candidateIndex,
@@ -1184,7 +1612,7 @@ function reviewSweepCandidates(lens, rawCandidates) {
         lensKey: envelopes[index].lensKey,
         lensTitle: envelopes[index].lensTitle,
         candidate: envelopes[index].candidate,
-        verifier: validateVerifier(verifierResults[index], "sweep verifier " + index)
+        verifier: sweepVerifier
       });
     }
     return verified;
@@ -1291,6 +1719,10 @@ const context = await workspaceContext({
   includeDiff: true,
   diffBaseRef: workflowInput.diffBaseRef
 });
+const diffBaseRefRaw = firstLineValue(context, "diffBaseRef: ");
+// The context writes "(none)" when no range was accepted, and that sentinel is truthy: it was reaching
+// provenance and the file-ref descriptor as if a range existed.
+const diffBaseRef = diffBaseRefRaw === "(none)" ? "" : diffBaseRefRaw;
 const allowedEvidenceRefs = sectionLines(context, "### Allowed Evidence Refs", ["### Unavailable Evidence", "### Git Status"]);
 const unavailableEvidenceRefs = sectionLines(context, "### Unavailable Evidence", ["### Git Status"]);
 const allowedEvidenceRefMap = objectMap(allowedEvidenceRefs);
@@ -1315,16 +1747,19 @@ const decisionRefSet = {
 const fileRefSet = {
   name: "allowed file refs",
   size: allowedFileRefs.length,
-  source: "file: entries in the evidence context (git status changed/untracked paths)",
-  populatedBy: "uncommitted or untracked paths in the working tree"
+  source: diffBaseRef
+    ? "file: entries in the evidence context (git status changed/untracked paths and the diffBaseRef commit range)"
+    : "file: entries in the evidence context (git status changed/untracked paths)",
+  populatedBy: diffBaseRef
+    ? "uncommitted or untracked paths in the working tree, plus paths the " + diffBaseRef + "..HEAD range touched"
+    : "uncommitted or untracked paths in the working tree, or paths in a commit range when diffBaseRef is supplied"
 };
-if (allowedFileRefs.length === 0) {
-  fail("no reviewable change evidence in the working tree: " + fileRefSet.name + " is empty (0 entries) derived from " + fileRefSet.source + "; populated by " + fileRefSet.populatedBy);
+if (firstLineValue(context, "evidenceGate: ") === "closed") {
+  fail(firstLineValue(context, "evidenceGateReason: "));
 }
 const sourceSnapshotId = firstLineValue(context, "Source Snapshot: ") || firstLineValue(context, "sourceSnapshotId: ") || hash(context);
 const contextHash = firstLineValue(context, "Context Hash: ") || firstLineValue(context, "contextHash: ") || hash({ context: context });
 const allowedEvidenceIndexDigest = firstLineValue(context, "allowedEvidenceIndexDigest: ") || hash(allowedEvidenceRefs);
-const diffBaseRef = firstLineValue(context, "diffBaseRef: ");
 const truncation = firstLineValue(context, "truncation: ") || "{}";
 const sourceSnapshotHashKey = hash({ sourceSnapshotId: sourceSnapshotId, contextHash: contextHash, allowedEvidenceIndexDigest: allowedEvidenceIndexDigest }).slice(7, 39);
 announcePhasePlan({
@@ -1365,6 +1800,7 @@ const scopeBlock = {
 };
 const scopeDigest = hash({ sourceSnapshotId: sourceSnapshotId, contextHash: contextHash, scope: scopeBlock });
 if (activeLenses.length === 0) {
+  assertNoVacuousPass(0, "scope selection (no active lenses)");
   return {
     level: level,
     provenance: {
@@ -1376,8 +1812,11 @@ if (activeLenses.length === 0) {
     },
     summary: scope.summary,
     findings: [],
-    synthesis: { mode: "script_fallback", fallbackReason: "no active lenses", decisions: [] },
-    stats: { finders: 0, candidates: 0, verifierAttempts: 0, verified: 0, refuted: 0, invalid: 0, reported: 0, dropped: droppedStats([]) }
+    synthesis: { mode: "script_fallback", fallbackReason: "no active lenses", decisions: refDropDecisionRows() },
+    degraded: refDrops.length > 0
+      ? { refDrops: refDrops.length, entries: refDrops.slice(0, 20), truncated: refDrops.length > 20 }
+      : null,
+    stats: { finders: 0, candidates: 0, verifierAttempts: 0, verified: 0, refuted: 0, invalid: 0, reported: 0, normalizedRefs: normalizedRefCount, refDrops: refDrops.length, dropped: droppedStats(refDropDecisionRows()) }
   };
 }
 announcePhasePlan({
@@ -1402,12 +1841,17 @@ phase("Verify");
 const lensResults = await pipeline(activeLenses, reviewLensStage);
 const verifiedCandidates = [];
 for (let lensIndex = 0; lensIndex < lensResults.length; lensIndex += 1) {
+  // Still fatal: a lens chain that failed for any reason other than a per-item ref drop (an agent
+  // failure, a structural violation, a count mismatch) is not something a review can degrade past.
   if (lensResults[lensIndex] && lensResults[lensIndex].failed) fail(lensResults[lensIndex].error);
   if (lensResults[lensIndex] == null) fail("lens review failed for " + activeLenses[lensIndex].lensKey);
   for (let candidateIndex = 0; candidateIndex < lensResults[lensIndex].length; candidateIndex += 1) {
     verifiedCandidates.push(lensResults[lensIndex][candidateIndex]);
   }
 }
+// Vacuous-pass guard: drops with nothing left to verify is "could not judge", not "found nothing",
+// so it fails instead of completing with an empty, reassuring report.
+
 const nonRefuted = [];
 let refuted = 0;
 for (let index = 0; index < verifiedCandidates.length; index += 1) {
@@ -1430,6 +1874,10 @@ if (caps.sweep) {
     else nonRefuted.push(sweepResults[index]);
   }
 }
+// After the sweep, not before it: a sweep can still produce the candidate that makes a dropped run
+// reviewable, so checking earlier both missed sweep-only drops and failed runs the sweep could rescue.
+// One call site keeps the rule declared once.
+assertNoVacuousPass(verifiedCandidates.length, "candidate verification");
 let synthesis = { mode: "script_fallback", summary: "No confirmed or plausible candidates.", fallbackReason: "no reportable candidates", decisions: [] };
 if (nonRefuted.length > 0) {
   announcePhasePlan({
@@ -1468,7 +1916,10 @@ if (nonRefuted.length > 0) {
   });
   synthesis = normalizeSynthesis(rawSynthesis, nonRefuted);
 }
-const decisionRows = finalDecisionRows(synthesis, nonRefuted);
+// Runtime drops are appended, so the indexes the findings loop shares with synthesis.decisions are
+// untouched. degraded stays gated on refDrops.length, which is now exactly
+// stats.dropped.unsupportedEvidence: one row per drop.
+const decisionRows = finalDecisionRows(synthesis, nonRefuted).concat(refDropDecisionRows());
 const findings = [];
 for (let index = 0; index < synthesis.decisions.length; index += 1) {
   const decision = synthesis.decisions[index];
@@ -1504,8 +1955,14 @@ return {
     diffBaseRef: diffBaseRef || null,
     truncation: { raw: truncation }
   },
-  summary: synthesis.summary,
+  // A drop must never present as a clean review. When nothing survived, the summary says so.
+  summary: findings.length === 0 && refDrops.length > 0
+    ? "Inconclusive: " + refDrops.length + " candidate(s) dropped as unsupported evidence and no finding survived. This is not a clean review."
+    : synthesis.summary,
   findings: findings,
+  degraded: refDrops.length > 0
+    ? { refDrops: refDrops.length, entries: refDrops.slice(0, 20), truncated: refDrops.length > 20 }
+    : null,
   synthesis: {
     mode: synthesis.mode,
     fallbackReason: synthesis.fallbackReason,
@@ -1514,11 +1971,13 @@ return {
   stats: {
     finders: activeLenses.length + (caps.sweep ? 1 : 0),
     candidates: verifiedCandidates.length,
-    verifierAttempts: verifiedCandidates.length,
+    verifierAttempts: verifierResultCount,
     verified: verifiedCandidates.length,
     refuted: refuted,
     invalid: 0,
     reported: findings.length,
+    normalizedRefs: normalizedRefCount,
+    refDrops: refDrops.length,
     dropped: droppedStats(decisionRows)
   }
 };`;
@@ -1764,10 +2223,24 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     if (this.closed) throw workflowInputError('Workflow runtime is closed.');
     const resumePlan = await this.prepareResumePlan(input);
     let resolved = await this.resolveLaunchInput(resumePlan.launchInput);
+    // Before the permission gate and before any journal or spend: a built-in's request contract is
+    // decidable from the args alone, so reject an unreadable request loudly here instead of letting
+    // the script's silent fallbacks run someone else's review.
     const parsed = parseInlineWorkflowScript(resolved.script);
     const scriptHash = workflowScriptHash(resolved.script);
     const isolationReview = workflowRequestedIsolationModes(resolved.script);
     resolved = await this.resolveTrustedScriptPathMetadata(resolved, parsed, scriptHash, isolationReview);
+    // After metadata promotion: an explicitly supplied persisted scriptPath is promoted back to
+    // built_in here, and validating before that skipped the contract for the built-in actually running.
+    // Still ahead of the permission gate, the journal, and any spend.
+    const builtinContractName = await this.resumeAwareBuiltinContractName(resolved, resumePlan);
+    if (builtinContractName) {
+      await validateBuiltinRequestArgs(
+        builtinContractName,
+        resumePlan.launchInput.args,
+        this.options.cwd ?? process.cwd(),
+      );
+    }
     const permissionRequired = await this.workflowPermissionRequired(
       resumePlan.launchInput,
       resolved,
@@ -1817,6 +2290,12 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         runtime: {
           schemaVersion: 1,
           cwd: this.options.cwd ?? process.cwd(),
+          // Always recorded. Omitting it for the default made absence ambiguous — an intermediate build
+          // of this branch could write a lenient run with no field — and a resume then inferred strict
+          // and replayed lenient results. Provability wins over rollback convenience: a journal written
+          // here needs this version or newer to resume, which the CHANGELOG states as the migration
+          // boundary rather than leaving it to inference.
+          refPolicy: this.options.refPolicy ?? 'strict',
           ...(this.options.backend.model !== SUBAGENT_MODEL_PLACEHOLDER
             ? { model: this.options.backend.model }
             : {}),
@@ -1933,19 +2412,78 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     readonly schemaCallSites: number;
     readonly keyedCallSites: number;
     readonly warnings: readonly string[];
+    readonly evidence?: ChangeEvidencePreview;
   }> {
     if (this.closed) throw workflowInputError('Workflow runtime is closed.');
     if (Object.prototype.hasOwnProperty.call(input, 'resumeFromRunId')) {
       throw workflowInputError('Workflow validation does not accept resumeFromRunId.');
     }
-    const resolved = await this.resolveLaunchInput(input);
+    let resolved = await this.resolveLaunchInput(input);
+    const cwd = this.options.cwd ?? process.cwd();
     const parsed = parseInlineWorkflowScript(resolved.script);
+    // Promote a persisted scriptPath back to built_in first, exactly as launch does. Without this a
+    // preview of a persisted built-in skipped both the contract and the evidence gate while the real
+    // launch applied them — the preview would disagree with execution, which is its whole promise.
+    resolved = await this.resolveTrustedScriptPathMetadata(
+      resolved,
+      parsed,
+      workflowScriptHash(resolved.script),
+      workflowRequestedIsolationModes(resolved.script),
+    );
+    const builtinName = resolved.workflowSource === 'built_in'
+      ? resolved.name ?? resolved.scriptMetadata?.workflowName
+      : undefined;
+    // Validation is the free pre-check, so it answers the same two questions a launch answers:
+    // is the request readable, and would it have anything to work on.
+    if (builtinName) {
+      await validateBuiltinRequestArgs(builtinName, input.args, cwd);
+    }
+    const evidence = builtinName
+      ? await this.previewChangeEvidence(builtinName, input.args, cwd)
+      : undefined;
     return {
       workflowName: parsed.meta.name,
       ...(parsed.meta.description ? { description: parsed.meta.description } : {}),
       workflowSource: resolved.workflowSource,
       scriptHash: workflowScriptHash(resolved.script),
       ...workflowAuthoringScan(resolved.script),
+      ...(evidence ? { evidence } : {}),
+    };
+  }
+
+  // Deterministic answer to "would this run, and what would it be allowed to cite?" — no agent, no
+  // token. Reuses the same evidence builder and the same gate reason the run would use, so the
+  // preview cannot disagree with the launch.
+  private async previewChangeEvidence(
+    name: string,
+    args: unknown,
+    cwd: string,
+  ): Promise<ChangeEvidencePreview | undefined> {
+    if (!BUILTIN_REQUEST_CONTRACTS[name]?.consumesChangeEvidence) return undefined;
+    const diffBaseRef = args && typeof args === 'object' && !Array.isArray(args)
+      ? (args as Record<string, unknown>).diffBaseRef
+      : undefined;
+    const options = normalizeWorkspaceContextOptions({
+      includeDiff: true,
+      ...(typeof diffBaseRef === 'string' && diffBaseRef.trim() ? { diffBaseRef: diffBaseRef.trim() } : {}),
+    });
+    // The whole builder, not a re-derivation: the gate now depends on which files were readable within
+    // the budget, so a preview that skipped file selection would answer a different question.
+    const built = await buildWorkspaceContext(cwd, options, this.options.evidenceScope ?? 'default');
+    const { evidence, gate } = built;
+    // includeDiff was requested and this built-in consumes change evidence, so the builder must have
+    // produced both. Reporting `undefined` instead would tell the caller this review has no evidence
+    // precondition — a clean preflight for a run that would then gate.
+    if (!evidence || !gate) {
+      throw new Error(`change-evidence preview for ${name} produced no evidence context (includeDiff was requested)`);
+    }
+    return {
+      gated: !gate.open,
+      ...(gate.open ? {} : { reason: gate.reason }),
+      allowedFileRefs: evidence.allowedFileRefs.length,
+      allowedEvidenceRefs: evidence.allowedEvidenceRefs,
+      dropped: evidence.droppedPaths,
+      unavailableEvidence: evidence.unavailableEvidence,
     };
   }
 
@@ -1964,6 +2502,153 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       .length;
     const { workspaceFingerprint: _internal, ...info } = workflowResumeSourceInfoFromJournal(runId, sourceJournal, completedAgentCount);
     return info;
+  }
+
+  // The built-in whose request contract governs this launch, including a resumed run that classifies
+  // as script_path. Also the one place that refuses a resume whose source ran under a different ref
+  // policy: the source's cached agent results were produced under different failure semantics, and
+  // the agent call keys do not carry the policy, so replaying them across policies is silent drift.
+  private async resumeAwareBuiltinContractName(
+    resolved: ResolvedWorkflowLaunchInput,
+    resumePlan: WorkflowResumePlan,
+  ): Promise<string | undefined> {
+    const currentPolicy = this.options.refPolicy ?? 'strict';
+    if (resumePlan.sourceTask) {
+      const runId = resumePlan.sourceTask.runId;
+      const started = await this.resumeSourceStartedEntry(resumePlan.sourceTask);
+      const sourceIsBuiltin = started.workflowSource === 'built_in';
+      const identity = sourceIsBuiltin
+        ? this.builtinIdentityFor(started.workflowName, started.scriptHash)
+        : undefined;
+      // The journal is the proof. An absent field means the run predates this field, NOT that it was
+      // strict: an intermediate build of this branch could write a lenient run with no field, so the
+      // script-derived policy is the only fallback and its absence stays unprovable. An explicitly
+      // recorded value this version does not recognize is likewise unprovable, never guessed.
+      const journaledPolicy = started.runtime?.refPolicy;
+      const sourcePolicy = journaledPolicy === undefined
+        ? identity?.policy
+        : isRefPolicy(journaledPolicy) ? journaledPolicy : undefined;
+      // Policy matters when the source's script could differ by policy: proven for a recognized
+      // built-in, unknown for one this registry does not ship (so fail closed), and for a non-built-in
+      // source only when nesting could have run a built-in child with script-agnostic call keys.
+      const relevanceFromNesting = !identity && !sourceIsBuiltin
+        && this.nestedWorkflows && this.registryHasPolicySensitiveBuiltin();
+      const policyRelevant = identity
+        ? identity.policySensitive
+        : sourceIsBuiltin || relevanceFromNesting;
+      if (policyRelevant && sourcePolicy !== currentPolicy) {
+        const subject = identity
+          ? `built-in "${identity.name}"`
+          : sourceIsBuiltin
+            ? `built-in "${started.workflowName}", which this version does not recognize`
+            : 'a workflow that is not identifiable as a built-in, whose nested built-in child (if any) is journaled only as script-agnostic agent entries';
+        throw sourcePolicy === undefined
+          ? requestContractError(
+            `resume of run ${runId} under --ref-policy ${currentPolicy}`,
+            `the source run executed ${subject} and does not record the ref policy it ran under, so its cached agent results cannot be shown to match ${currentPolicy}`,
+            `start a fresh run under ${currentPolicy} without --resume-from-run-id${relevanceFromNesting ? ', or resume without --nested-workflows' : ''}`,
+          )
+          : requestContractError(
+            `resume of run ${runId} under --ref-policy ${currentPolicy}`,
+            `the source run executed ${subject} under --ref-policy ${sourcePolicy}, whose cached agent results were produced under different failure semantics and whose call keys do not record the policy`,
+            `resume with --ref-policy ${sourcePolicy}, or start a fresh run under ${currentPolicy} without --resume-from-run-id`,
+          );
+      }
+      // The contract must describe the workflow that will actually execute.
+      if (identity && !resumePlan.replacedSource) return identity.name;
+    }
+    // A co-supplied scriptPath carries no `name`, but promotion sets workflowSource from the persisted
+    // metadata, which names the built-in actually being executed.
+    const promotedName = resolved.workflowSource === 'built_in'
+      ? resolved.name ?? resolved.scriptMetadata?.workflowName
+      : undefined;
+    // A promoted scriptPath executes the PERSISTED script, whose ref policy is baked into its text. The
+    // resume shapes above are refused on a mismatch, but a direct --script-path launch reached here
+    // unchecked: it ran the source policy while stderr and the journal recorded the requested one, and a
+    // later resume then trusted that false record. The dangerous direction is a lenient script launched
+    // under strict — the review completes with candidates dropped where a real strict run fails.
+    if (promotedName && resolved.scriptPath && resolved.scriptMetadata) {
+      const identity = this.builtinIdentityFor(promotedName, resolved.scriptMetadata.scriptHash);
+      if (identity?.policySensitive && identity.policy !== currentPolicy) {
+        throw identity.policy === undefined
+          ? requestContractError(
+            `--script-path launch of built-in "${promotedName}" under --ref-policy ${currentPolicy}`,
+            'the persisted script does not match any ref-policy variant this version generates, so the policy it would execute under cannot be shown to be the requested one',
+            `launch it by name (--name ${promotedName}) so the current policy's script is generated`,
+          )
+          : requestContractError(
+            `--script-path launch of built-in "${promotedName}" under --ref-policy ${currentPolicy}`,
+            `the persisted script was generated under --ref-policy ${identity.policy}, and that policy is baked into its text, so it would execute under ${identity.policy} while this run reports ${currentPolicy}`,
+            `pass --ref-policy ${identity.policy} to run the persisted script as written, or launch by name (--name ${promotedName}) to generate the ${currentPolicy} script`,
+          );
+      }
+    }
+    return promotedName;
+  }
+
+  // Identity comes from the source journal's run.started entry, which is the only place that records
+  // provenance: a name and a matching script hash alone would misclassify a project or user workflow
+  // that copies a built-in, and would silently skip the contract for a genuine built-in whose script
+  // an upgrade changed. Requiring workflowSource === 'built_in' fixes the first; policyUnproven
+  // reports the second instead of ignoring it.
+  // Policy sensitivity is a property of the registry actually in use, not of the default built-ins. An
+  // injected `builtinWorkflows` list is static — one script for every policy — so nothing in it can
+  // depend on the ref policy, and refusing its cross-policy resume would be pure over-refusal.
+  private builtinScriptVariants(name: string): readonly { readonly policy: RefPolicy; readonly script: string }[] {
+    const injected = this.options.builtinWorkflows;
+    if (injected) {
+      const workflow = injected.find((entry) => entry.name === name);
+      return workflow ? REF_POLICY_VALUES.map((policy) => ({ policy, script: workflow.script })) : [];
+    }
+    const variants: { readonly policy: RefPolicy; readonly script: string }[] = [];
+    for (const policy of REF_POLICY_VALUES) {
+      const workflow = defaultBuiltinWorkflows(policy).find((entry) => entry.name === name);
+      if (workflow) variants.push({ policy, script: workflow.script });
+    }
+    return variants;
+  }
+
+  // A name this registry still ships is a built-in even when the recorded script matches no variant (an
+  // older generator): the contract still applies, only the script-derived policy is lost.
+  private builtinIdentityFor(name: string, scriptHash: string): BuiltinResumeIdentity | undefined {
+    if (!name) return undefined;
+    const variants = this.builtinScriptVariants(name);
+    if (variants.length === 0) return undefined;
+    const policySensitive = variants.some((variant) => variant.script !== variants[0].script);
+    const matched = variants.find((variant) => workflowScriptHash(variant.script) === scriptHash);
+    if (!matched && !policySensitive) return undefined;
+    // One script for every policy AND no match means the source ran something else under this name, so
+    // its provenance is unknown — claiming "insensitive" there would skip the policy check for a source
+    // that may well have been the policy-sensitive built-in.
+    return matched && policySensitive
+      ? { name, policySensitive, policy: matched.policy }
+      : { name, policySensitive };
+  }
+
+  // Whether any built-in the live registry can hand a nested child varies by ref policy. An injected
+  // registry is static, so no child obtainable from it can change with the policy and refusing a
+  // parent's cross-policy resume would be over-refusal.
+  private registryHasPolicySensitiveBuiltin(): boolean {
+    if (this.options.builtinWorkflows) return false;
+    const names = new Set(defaultBuiltinWorkflows('strict').map((entry) => entry.name));
+    for (const name of names) {
+      const variants = this.builtinScriptVariants(name);
+      if (variants.some((variant) => variant.script !== variants[0].script)) return true;
+    }
+    return false;
+  }
+
+  private async resumeSourceStartedEntry(
+    sourceTask: WorkflowResumeSource,
+  ): Promise<Extract<WorkflowJournalEntry, { readonly kind: 'workflow.run.started' }>> {
+    // A read failure means the provenance is unknown, not that the source is not a built-in. Treating
+    // it as the latter skipped both the request contract and the policy guard while still letting the
+    // cache-backed resume proceed, so it fails loud instead.
+    try {
+      return (await this.readResumeSourceJournal(sourceTask)).started;
+    } catch {
+      throw workflowResumeSourceInvalidError(sourceTask.runId);
+    }
   }
 
   private async prepareResumePlan(input: WorkflowLaunchInput): Promise<WorkflowResumePlan> {
@@ -1994,6 +2679,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       assertSingleWorkflowSourceSelector(input);
       return {
         sourceTask,
+        replacedSource: true,
         launchInput: {
           ...(input.script !== undefined ? { script: input.script } : {}),
           ...(input.scriptPath !== undefined ? { scriptPath: input.scriptPath } : {}),
@@ -2548,7 +3234,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     requestedName: string,
     available: Set<string>,
   ): ResolvedWorkflowLaunchInput | null {
-    for (const workflow of this.options.builtinWorkflows ?? DEFAULT_BUILTIN_WORKFLOWS) {
+    for (const workflow of this.options.builtinWorkflows ?? defaultBuiltinWorkflows(this.options.refPolicy ?? 'strict')) {
       const name = workflow.name.trim();
       if (!name) continue;
       available.add(name);
@@ -2976,10 +3662,11 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
       throw workflowInputError('Workflow is aborted.');
     }
-    return await buildWorkspaceContext(
+    return (await buildWorkspaceContext(
       this.options.cwd ?? process.cwd(),
       normalizeWorkspaceContextOptions(options),
-    );
+      this.options.evidenceScope ?? 'default',
+    )).text;
   }
 
   // Resolve an `agent({agentType})` selection (PG-AGENTTYPE). Undefined selection → undefined (no
@@ -3709,6 +4396,18 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     // projecting it to a bare object). C5e (one-level) still holds — a child's host.workflow is the
     // throwing stub, bound by frame presence, so concurrent children can't nest.
     const child = await this.resolveNestedChild(nameOrRef);
+    // The request contract applied only at top-level launch, so a parent could call
+    // workflow("code-review", { promt: "…" }) and silently run the default review — the same silent
+    // spend the contract exists to stop. A mid-run rejection fails the parent loudly, which is the
+    // same shape a nested permission failure already has.
+    if (child.workflowSource === 'built_in') {
+      await validateBuiltinRequestArgs(
+        child.parsed.meta.name,
+        childArgs,
+        this.options.cwd ?? process.cwd(),
+      );
+    }
+
     await this.assertNestedChildPermitted(child);
     const frame: WorkflowChildFrame = {
       args: childArgs,
@@ -4032,27 +4731,57 @@ async function gitOutputRaw(cwd: string, args: readonly string[]): Promise<strin
   }
 }
 
-async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptions): Promise<string> {
-  const root = await workspaceContextRoot(cwd);
-  const runtimeStateExcludedPaths = workspaceRuntimeStateExcludedPaths(root);
-  const statusUnavailableEvidence: string[] = [];
+// Both the run and `--validate` read git status through here, so a status failure produces the same
+// unavailable-evidence tokens on both paths. When the preview collected status on its own, a
+// non-repository workspace made the preview report a different evidence snapshot than the run.
+interface WorkspaceGitStatus {
+  readonly display: string;
+  readonly paths: string;
+  readonly unavailableEvidence: readonly string[];
+}
+
+async function collectWorkspaceGitStatus(
+  root: string,
+  runtimeStateExcludedPaths: ReadonlySet<string>,
+): Promise<WorkspaceGitStatus> {
+  const unavailableEvidence: string[] = [];
   let gitStatusRaw = '';
   try {
     gitStatusRaw = await gitOutputRaw(root, ['status', '--short', '--untracked-files=all', '--', '.']);
   } catch (err) {
-    statusUnavailableEvidence.push(`unavailable:git-status:${gitFailureToken(err)}`);
+    unavailableEvidence.push(`unavailable:git-status:${gitFailureToken(err)}`);
   }
-  const gitStatus = statusUnavailableEvidence.length
-    ? `(unavailable: ${statusUnavailableEvidence[0]})`
+  const display = unavailableEvidence.length
+    ? `(unavailable: ${unavailableEvidence[0]})`
     : boundWorkspaceStatusDisplay(formatGitStatusDisplay(gitStatusRaw, runtimeStateExcludedPaths));
-  const gitStatusPaths = await gitOutputRaw(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.']).catch((err) => {
-    statusUnavailableEvidence.push(`unavailable:git-status-raw:${gitFailureToken(err)}`);
+  const paths = await gitOutputRaw(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.']).catch((err) => {
+    unavailableEvidence.push(`unavailable:git-status-raw:${gitFailureToken(err)}`);
     return gitStatusRaw;
   });
+  return { display, paths, unavailableEvidence };
+}
+
+interface WorkspaceContextResult {
+  readonly text: string;
+  readonly evidence?: ChangeEvidenceContext;
+  readonly gate?: { readonly open: boolean; readonly reason: string };
+}
+
+async function buildWorkspaceContext(
+  cwd: string,
+  options: WorkspaceContextOptions,
+  evidenceScope: EvidenceScope = 'default',
+): Promise<WorkspaceContextResult> {
+  const root = await workspaceContextRoot(cwd);
+  const runtimeStateExcludedPaths = workspaceRuntimeStateExcludedPaths(root);
+  const status = await collectWorkspaceGitStatus(root, runtimeStateExcludedPaths);
+  const statusUnavailableEvidence = [...status.unavailableEvidence];
+  const gitStatus = status.display;
+  const gitStatusPaths = status.paths;
   const gitStatusPathParse = parseGitStatusPaths(gitStatusPaths, runtimeStateExcludedPaths);
   const excludedWorkspacePaths = new Set(gitStatusPathParse.excludedPaths.map(workspacePathKey));
-  const changeEvidence = options.includeDiff
-    ? await buildChangeEvidenceContext(root, gitStatusPaths, options, statusUnavailableEvidence, runtimeStateExcludedPaths)
+  const evidenceDraft = options.includeDiff
+    ? await buildChangeEvidenceContext(root, gitStatusPaths, options, statusUnavailableEvidence, runtimeStateExcludedPaths, evidenceScope)
     : undefined;
   const explicitPaths = [
     ...options.files,
@@ -4060,13 +4789,37 @@ async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptio
   ];
   const changedPaths = gitStatusPathParse.paths.filter((path) => shouldIncludeWorkspaceContextPath(path, runtimeStateExcludedPaths));
   const listedPaths = await listWorkspaceContextCandidates(root);
-  const candidates = uniqueStrings([
+  // Two admission rules, deliberately different. A path the EVIDENCE scope admitted must be shown:
+  // an untracked .java under --evidence-scope all has no unstaged patch, so if the budget allowlist
+  // also removed it from the included files the reviewer would see a path and a status and nothing
+  // else — the gate would open and agents would spend blind. Everything else (the directory walk,
+  // priority files, query mentions) keeps the prompt-budget allowlist.
+  const evidenceFilePaths = new Set((evidenceDraft?.filePaths ?? []).map(workspacePathKey));
+  // Evidence paths lead, and within them the ones with NO hunk lead again. A path that produced a hunk
+  // is visible through the diff even without a content block; an untracked file has no patch at all, so
+  // a content block is the only way the reviewer can see it. Ordering it last reproduced the
+  // blind-review path for exactly the files an evidence scope was widened to admit.
+  const evidenceHunkPaths = new Set((evidenceDraft?.hunkPaths ?? []).map(workspacePathKey));
+  const evidenceCandidates = [...(evidenceDraft?.filePaths ?? [])].sort((left, right) => {
+    const leftHasHunk = evidenceHunkPaths.has(workspacePathKey(left)) ? 1 : 0;
+    const rightHasHunk = evidenceHunkPaths.has(workspacePathKey(right)) ? 1 : 0;
+    return leftHasHunk - rightHasHunk;
+  });
+  const candidates = uniqueExact([
+    ...evidenceCandidates,
     ...explicitPaths,
     ...changedPaths,
     ...WORKSPACE_CONTEXT_PRIORITY_FILES,
     ...listedPaths,
-  ]).filter((path) => shouldIncludeWorkspaceContextPath(path, runtimeStateExcludedPaths) && !excludedWorkspacePaths.has(workspacePathKey(path)));
+  ]).filter((path) => {
+    const key = workspacePathKey(path);
+    if (excludedWorkspacePaths.has(key)) return false;
+    return evidenceFilePaths.has(key)
+      ? evidencePathAllowed(key, runtimeStateExcludedPaths, evidenceScope)
+      : shouldIncludeWorkspaceContextPath(path, runtimeStateExcludedPaths);
+  });
   const fileBlocks: string[] = [];
+  const includedPaths = new Set<string>();
   let usedBytes = 0;
   for (const candidate of candidates) {
     if (fileBlocks.length >= options.maxFiles) break;
@@ -4076,17 +4829,24 @@ async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptio
     if (usedBytes + blockBytes > options.maxBytes) {
       if (fileBlocks.length > 0) break;
       fileBlocks.push(block.slice(0, options.maxBytes));
+      includedPaths.add(workspacePathKey(candidate));
       break;
     }
     fileBlocks.push(block);
+    includedPaths.add(workspacePathKey(candidate));
     usedBytes += blockBytes;
   }
-  return [
+  // Selection is done, so readability is decided: the evidence can now publish its refs.
+  const changeEvidence = evidenceDraft?.finalize(includedPaths);
+  const gate = changeEvidence ? changeEvidenceGate(changeEvidence) : undefined;
+  const text = [
     '## Workspace Context',
     `Root: ${root}`,
-    ...(changeEvidence ? [
+    ...(changeEvidence && gate ? [
       `Source Snapshot: ${changeEvidence.sourceSnapshotId}`,
       `Context Hash: ${changeEvidence.contextHash}`,
+      `evidenceGate: ${gate.open ? 'open' : 'closed'}`,
+      `evidenceGateReason: ${gate.reason || '(none)'}`,
       '',
       '### Change Evidence',
       changeEvidence.text,
@@ -4104,6 +4864,12 @@ async function buildWorkspaceContext(cwd: string, options: WorkspaceContextOptio
     '### Included Files',
     fileBlocks.length ? fileBlocks.join('\n\n') : '(no readable text files selected)',
   ].join('\n');
+  return { text, ...(changeEvidence ? { evidence: changeEvidence } : {}), ...(gate ? { gate } : {}) };
+}
+
+export interface EvidenceDroppedPath {
+  readonly path: string;
+  readonly rule: WorkspaceContextDropRule;
 }
 
 interface ChangeEvidenceContext {
@@ -4112,6 +4878,24 @@ interface ChangeEvidenceContext {
   readonly allowedEvidenceRefs: readonly string[];
   readonly unavailableEvidence: readonly string[];
   readonly text: string;
+  // Structured projection of the same values the prompt text carries, so `--validate` can report the
+  // request's satisfiability without spending an agent and without re-deriving the gate rule.
+  readonly allowedFileRefs: readonly string[];
+  // How many paths the admission rules accepted, readable or not. The gate reports this when every one
+  // of them turned out to be unreadable, which is a different failure from "nothing was admitted".
+  readonly admittedPathCount: number;
+  readonly droppedPaths: readonly EvidenceDroppedPath[];
+  readonly statusPathCount: number;
+  readonly hasDiffBaseRef: boolean;
+  readonly unsafeCommittedNames: number;
+}
+
+// What the file selector needs before the evidence exists: which paths to prioritize for content
+// blocks, and which of them already have a hunk (so a content block is not their only visibility).
+interface ChangeEvidenceDraft {
+  readonly filePaths: readonly string[];
+  readonly hunkPaths: readonly string[];
+  readonly finalize: (includedPaths: ReadonlySet<string>) => ChangeEvidenceContext;
 }
 
 interface GitStatusPathParse {
@@ -4131,10 +4915,29 @@ async function buildChangeEvidenceContext(
   options: WorkspaceContextOptions,
   initialUnavailableEvidence: readonly string[] = [],
   runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
-): Promise<ChangeEvidenceContext> {
+  evidenceScope: EvidenceScope = 'default',
+): Promise<ChangeEvidenceDraft> {
   const unavailableEvidence: string[] = [...initialUnavailableEvidence];
   const gitStatusPaths = parseGitStatusPaths(gitStatus, runtimeStateExcludedPaths);
-  const changedPaths = gitStatusPaths.paths.filter((path) => shouldIncludeWorkspaceContextPath(path, runtimeStateExcludedPaths));
+  const changedPaths: string[] = [];
+  const droppedPaths: EvidenceDroppedPath[] = [];
+  const seenDroppedPaths = new Set<string>();
+  const recordDroppedPath = (path: string, fallback: WorkspaceContextDropRule): void => {
+    if (!path || seenDroppedPaths.has(path)) return;
+    seenDroppedPaths.add(path);
+    droppedPaths.push({ path, rule: workspaceContextPathVerdict(path, runtimeStateExcludedPaths) ?? fallback });
+  };
+  for (const path of gitStatusPaths.paths) {
+    const rule = workspaceContextPathVerdict(path, runtimeStateExcludedPaths);
+    if (rule === undefined || evidenceScopeForgives(rule, evidenceScope)) changedPaths.push(path);
+    else recordDroppedPath(path, rule);
+  }
+  // Directory-excluded and runtime-state paths never reach gitStatusPaths.paths — the status parser
+  // routes them to excludedPaths — so a diagnostic built only from `paths` would under-report them.
+  // The fallback is 'runtime-state', not 'excluded-dir': the only way the status filter rejects a
+  // path the admission verdict accepts is a runtime-state match, and runtime state must never be
+  // named. A permissive fallback here mislabels it as a build path and leaks the name.
+  for (const path of gitStatusPaths.excludedPaths) recordDroppedPath(path, 'runtime-state');
   const excludedDiffPaths = new Set([
     ...gitStatusPaths.excludedPaths.map(workspacePathKey),
     ...runtimeStateExcludedPaths,
@@ -4153,7 +4956,7 @@ async function buildChangeEvidenceContext(
   ], options.maxDiffBytes).catch((err) => {
     unavailableEvidence.push(unavailableGitEvidence('diff-unstaged', err));
     return { text: '', truncated: false };
-  }), excludedDiffPaths, runtimeStateExcludedPaths);
+  }), excludedDiffPaths, runtimeStateExcludedPaths, evidenceScope);
   const staged = filterWorkspaceContextDiff(await boundedGitOutput(root, [
     'diff',
     '--cached',
@@ -4164,8 +4967,10 @@ async function buildChangeEvidenceContext(
   ], options.maxDiffBytes).catch((err) => {
     unavailableEvidence.push(unavailableGitEvidence('diff-staged', err));
     return { text: '', truncated: false };
-  }), excludedDiffPaths, runtimeStateExcludedPaths);
+  }), excludedDiffPaths, runtimeStateExcludedPaths, evidenceScope);
   let committed: BoundedGitText = { text: '', truncated: false };
+  let committedRangePaths: readonly string[] = [];
+  let unsafeCommittedNames = 0;
   let acceptedDiffBaseRef = '';
   if (options.diffBaseRef) {
     const baseCommit = await gitOutput(root, ['rev-parse', '--verify', `${options.diffBaseRef}^{commit}`]).catch((err) => {
@@ -4174,7 +4979,7 @@ async function buildChangeEvidenceContext(
     });
     if (baseCommit) {
       acceptedDiffBaseRef = options.diffBaseRef;
-      committed = filterWorkspaceContextDiff(await boundedGitOutput(root, [
+      const rawCommitted = await boundedGitOutput(root, [
         'diff',
         '--no-ext-diff',
         '--patch',
@@ -4184,7 +4989,50 @@ async function buildChangeEvidenceContext(
       ], options.maxDiffBytes).catch((err) => {
         unavailableEvidence.push(unavailableGitEvidence('diff-committed', err, options.diffBaseRef));
         return { text: '', truncated: false };
-      }), excludedDiffPaths, runtimeStateExcludedPaths);
+      });
+      committedRangePaths = await gitOutputRaw(root, [
+        'diff',
+        '--name-only',
+        '-z',
+        '--no-ext-diff',
+        '--find-renames',
+        `${baseCommit}..HEAD`,
+        '--',
+      ]).then(
+        (text) => {
+          const names: string[] = [];
+          let unsafe = 0;
+          let unrepresentable = 0;
+          for (const raw of text.split('\0').filter(Boolean)) {
+            // Git's raw name is the identity. workspacePathKey rewrites a backslash to a slash, which on
+            // POSIX turns a legal file into a nonexistent nested path, so the ref would point somewhere
+            // that cannot be read or cited. Normalization stays for comparison only.
+            if (!isWorkspaceEvidencePathSafe(raw)) unsafe += 1;
+            else if (!isWorkspaceEvidencePathRepresentable(raw)) unrepresentable += 1;
+            else names.push(raw);
+          }
+          if (unsafe > 0) {
+            unavailableEvidence.push(`unavailable:diff-committed-name:${unsafe}:unsafe-path`);
+            unsafeCommittedNames += unsafe;
+          }
+          if (unrepresentable > 0) {
+            unavailableEvidence.push(`unavailable:diff-committed-name:${unrepresentable}:unrepresentable-path`);
+          }
+          return uniqueExact(names);
+        },
+        (err: unknown) => {
+          unavailableEvidence.push(unavailableGitEvidence('diff-committed-names', err, options.diffBaseRef));
+          return [];
+        },
+      );
+      // A committed-range path never appears in git status, so unless it is classified here the diff
+      // filter discards it silently and the gate reports "git status found no changes" for a range
+      // that did contain files.
+      for (const path of committedRangePaths) {
+        const rule = workspaceContextPathVerdict(path, runtimeStateExcludedPaths);
+        if (rule !== undefined && !evidenceScopeForgives(rule, evidenceScope)) recordDroppedPath(path, rule);
+      }
+      committed = filterWorkspaceContextDiff(rawCommitted, excludedDiffPaths, runtimeStateExcludedPaths, evidenceScope);
     }
   }
   const diffEvidence = [
@@ -4192,11 +5040,22 @@ async function buildChangeEvidenceContext(
     { kind: 'staged', value: staged },
     { kind: 'committed', value: committed },
   ] as const;
-  const allowedEvidenceRefs = uniqueStrings([
-    ...changedPaths.map((path) => `file:${path}`),
-    ...diffEvidence.flatMap((entry) => diffEvidenceRefs(entry.kind, entry.value.text, runtimeStateExcludedPaths)),
-  ]);
-  const allowedEvidenceIndexDigest = fullHash(allowedEvidenceRefs.join('\n'));
+  const diffRefResults = diffEvidence.map((entry) => diffEvidenceRefs(entry.kind, entry.value.text, runtimeStateExcludedPaths, evidenceScope));
+  const diffRefs = diffRefResults.flatMap((entry) => entry.refs);
+  // Paths that produced at least one hunk. A path with no readable content block and no hunk gives the
+  // reviewer a ref and nothing to look at, which is why the gate is decided after file selection now.
+  const hunkPaths = uniqueExact(diffRefResults.flatMap((entry) => entry.hunkPaths));
+  // A file ref is what the review harness validates its scope and findings against, so a
+  // diffBaseRef range that touched a file has to contribute one too — otherwise a committed-only
+  // review collects committed diff evidence it is then forbidden to cite. Taken from a NUL-delimited
+  // name listing rather than the patch header: `diff --git a/foo bar.ts b/foo bar.ts` does not quote
+  // spaces, so a header parser cannot split it and the path (and the whole gate) would be lost.
+  const committedPaths = committedRangePaths.filter((path) => evidencePathAllowed(path, runtimeStateExcludedPaths, evidenceScope));
+  const admittedPaths = uniqueExact([...changedPaths, ...committedPaths]);
+  // Two audiences, two projections of the same drop list. The caller owns the repository, so its
+  // diagnostic names the paths it can act on and counts only those — runtime state and unsafe paths
+  // are not the caller's changes, and counting them would report a clean tree as "3 paths dropped".
+  const callerReportableDrops = droppedPaths.filter((entry) => droppedPathNameable(entry));
   const sourceSnapshotId = `git:${head}:${fullHash([
     gitStatus,
     unstaged.text,
@@ -4208,6 +5067,25 @@ async function buildChangeEvidenceContext(
     staged: staged.truncated,
     committed: committed.truncated,
   };
+  const hunkPathKeys = new Set(hunkPaths.map(workspacePathKey));
+  // A `file:` ref is a licence to cite the file's contents, so it may only be published for a path the
+  // reviewer can actually read: one whose content block was included, or whose diff retained a hunk. A
+  // truncated committed range or an exhausted file budget used to leave a citable ref for a change no
+  // agent ever received — the gate opened on some other readable path, and validation then accepted
+  // citations to an unseen file. Readability is only known after file selection, so the projection that
+  // publishes refs is deferred to finalize().
+  const finalize = (includedPaths: ReadonlySet<string>): ChangeEvidenceContext => {
+  const readablePaths = admittedPaths.filter((path) => {
+    const key = workspacePathKey(path);
+    return includedPaths.has(key) || hunkPathKeys.has(key);
+  });
+  const withheldPathCount = admittedPaths.length - readablePaths.length;
+  const evidenceUnavailable = withheldPathCount > 0
+    ? [...unavailableEvidence, `unavailable:file-evidence:${withheldPathCount}:no-content-block-or-hunk`]
+    : unavailableEvidence;
+  const fileRefs = uniqueExact(readablePaths.map((path) => `file:${path}`));
+  const allowedEvidenceRefs = uniqueExact([...fileRefs, ...diffRefs]);
+  const allowedEvidenceIndexDigest = fullHash(allowedEvidenceRefs.join('\n'));
   const contextHash = fullHash(JSON.stringify({
     root,
     sourceSnapshotId,
@@ -4215,7 +5093,7 @@ async function buildChangeEvidenceContext(
     acceptedDiffBaseRef,
     truncation,
     allowedEvidenceRefs,
-    unavailableEvidence,
+    unavailableEvidence: evidenceUnavailable,
   }));
   const sections = [
     `sourceSnapshotId: ${sourceSnapshotId}`,
@@ -4223,9 +5101,18 @@ async function buildChangeEvidenceContext(
     `allowedEvidenceIndexDigest: ${allowedEvidenceIndexDigest}`,
     `diffBaseRef: ${acceptedDiffBaseRef || '(none)'}`,
     `truncation: ${JSON.stringify(truncation)}`,
+    `evidenceScope: ${evidenceScope}`,
+    '',
+    '#### Evidence Ref Grammar',
+    EVIDENCE_REF_GRAMMAR_NOTE,
     '',
     '#### Changed Files',
     changedPaths.length ? changedPaths.join('\n') : '(none)',
+    '',
+    // Non-blocking disclosure: the git status section lists these paths by name (it applies only the
+    // directory rule), so without this the reviewer sees a changed file it is forbidden to cite.
+    '#### Dropped From Evidence',
+    formatDroppedEvidenceDisclosure(droppedPaths),
     '',
     '#### Unstaged Diff',
     unstaged.text || '(none)',
@@ -4240,9 +5127,129 @@ async function buildChangeEvidenceContext(
     sourceSnapshotId,
     contextHash,
     allowedEvidenceRefs,
-    unavailableEvidence,
+    unavailableEvidence: evidenceUnavailable,
     text: sections.join('\n'),
+    allowedFileRefs: fileRefs,
+    admittedPathCount: admittedPaths.length,
+    droppedPaths: callerReportableDrops,
+    statusPathCount: changedPaths.length + callerReportableDrops.length,
+    hasDiffBaseRef: Boolean(acceptedDiffBaseRef),
+    unsafeCommittedNames,
   };
+  };
+  return { filePaths: admittedPaths, hunkPaths, finalize };
+}
+
+// Runtime-owned grammar note. The allowlist alone does not tell a reviewer which ref KINDS exist for
+// a given path — that depends on whether the change is untracked, unstaged, or staged, which the
+// model cannot see. Both real-world rejections observed on disk were this: a `file:` ref with a line
+// number appended, and a `diff:unstaged:` guess for a path that only existed as `file:`.
+const EVIDENCE_REF_GRAMMAR_NOTE = [
+  'Cite evidence only with strings copied verbatim from Allowed Evidence Refs. Do not append a line',
+  'number to a file: ref, and do not construct a ref kind that is not listed — the listed kinds are',
+  'the only ones that exist for this snapshot. Ref kinds: file:<path>, diff:<unstaged|staged|committed>:<path>,',
+  'hunk:<unstaged|staged|committed>:<path>:<n> where <n> is a per-file hunk index, not a line number.',
+].join('\n');
+
+// Runtime-state and unsafe paths are named nowhere in the prompt or diagnostics — the git status
+// section masks them for the same reason (the runtime must not feed its own state back to a
+// reviewer). They are still counted, so the numbers stay honest.
+const NAMEABLE_DROP_RULES: ReadonlySet<WorkspaceContextDropRule> = new Set([
+  'excluded-dir',
+  'extension-not-allowed',
+]);
+
+// Belt to the rule's braces: a path under either of these is never named whatever rule dropped it,
+// so a future rule (or a mislabel) cannot reintroduce the leak.
+const NEVER_NAMED_PATH_SEGMENTS: ReadonlySet<string> = new Set(['.git', '.ultracode-for-codex']);
+
+function droppedPathNameable(entry: EvidenceDroppedPath): boolean {
+  if (!NAMEABLE_DROP_RULES.has(entry.rule)) return false;
+  return !entry.path.split('/').some((segment) => NEVER_NAMED_PATH_SEGMENTS.has(segment));
+}
+
+// The reviewer's projection: only the paths it can see by name in the git status section yet cannot
+// cite. Directory-excluded, runtime-state, and unsafe paths are already masked there, so naming them
+// here would hand the reviewer names the status section deliberately withheld.
+function formatDroppedEvidenceDisclosure(droppedPaths: readonly EvidenceDroppedPath[]): string {
+  const disclosed = droppedPaths.filter((entry) => entry.rule === 'extension-not-allowed' && droppedPathNameable(entry));
+  if (disclosed.length === 0) return '(none)';
+  return disclosed
+    .map((entry) => `${entry.path} (${entry.rule}: not citable, contents withheld)`)
+    .join('\n');
+}
+
+function describeDroppedPathSample(rule: WorkspaceContextDropRule, paths: readonly string[]): string {
+  const nameable = paths.filter((path) => droppedPathNameable({ path, rule }));
+  if (nameable.length === 0) return '';
+  const shown = nameable.slice(0, 5);
+  return ` (${shown.join(', ')}${nameable.length > shown.length ? `, +${nameable.length - shown.length} more` : ''})`;
+}
+
+// The gate rule and its diagnostic live together in the runtime: the built-in script fails with this
+// message verbatim, and `--validate` reports it without spending an agent, so neither can drift from
+// the predicate that produced it.
+// The gate asks whether the reviewer can actually SEE a change, not whether a ref exists. Three rounds
+// of review found instances of the same defect — a gate opening on a ref whose content and diff were
+// both absent — so admission is decided here, after file selection, from readable evidence.
+function changeEvidenceGate(
+  evidence: ChangeEvidenceContext,
+): { readonly open: boolean; readonly reason: string } {
+  // One rule, one place: a file ref is published only for a readable path, so "can this be reviewed?"
+  // and "may this be cited?" cannot disagree.
+  if (evidence.allowedFileRefs.length > 0) return { open: true, reason: '' };
+  const admittedButUnreadable = evidence.admittedPathCount;
+  return {
+    open: false,
+    reason: admittedButUnreadable > 0
+      ? `no readable change evidence in the working tree: ${admittedButUnreadable} changed path(s) were admitted but none produced readable evidence — no content block fit the file/byte budget, and no diff hunk was available (an untracked file has no patch, and a binary file produces neither); if the path is text, reduce the change, raise the workspace context budget, or stage the file so a diff exists — a binary change cannot be reviewed from evidence at all`
+      : changeEvidenceGateReason(
+        evidence.statusPathCount,
+        evidence.droppedPaths,
+        evidence.hasDiffBaseRef,
+        evidence.unsafeCommittedNames,
+      ),
+  };
+}
+
+function changeEvidenceGateReason(
+  statusPathCount: number,
+  droppedPaths: readonly EvidenceDroppedPath[],
+  hasDiffBaseRef: boolean,
+  unsafeCommittedNames = 0,
+): string {
+  const byRule = new Map<WorkspaceContextDropRule, string[]>();
+  for (const entry of droppedPaths) {
+    const paths = byRule.get(entry.rule) ?? [];
+    paths.push(entry.path);
+    byRule.set(entry.rule, paths);
+  }
+  const unsafeNote = unsafeCommittedNames > 0
+    ? `; ${unsafeCommittedNames} committed name(s) were excluded as unsafe paths (not named here)`
+    : '';
+  const cause = droppedPaths.length === 0
+    ? statusPathCount === 0
+      ? `git status reported no changed or untracked paths${unsafeNote}`
+      : `git status reported ${statusPathCount} path(s), none of which produced a file ref`
+    : `git status reported ${statusPathCount} changed path(s), all dropped before becoming evidence — ${[...byRule]
+        .map(([rule, paths]) => `${paths.length} by ${rule}${describeDroppedPathSample(rule, paths)}`)
+        .join('; ')}`;
+  // Name the remediation that actually applies to what was dropped. Telling a Java-only repository to
+  // "change a file whose extension is in the allowlist" hides the supported answer and reads as
+  // "rename your code": --evidence-scope all forgives exactly the extension rule and nothing else.
+  const extensionDropped = byRule.has('extension-not-allowed');
+  const extensionOnly = extensionDropped && byRule.size === 1;
+  const remediation = [
+    extensionOnly
+      ? 'pass --evidence-scope all to forgive the extension allowlist (excluded directories, runtime state, and unsafe paths stay inadmissible)'
+      : 'change a file whose extension is in the evidence allowlist and outside the excluded directories',
+    extensionDropped && !extensionOnly
+      ? 'or pass --evidence-scope all to forgive the extension allowlist for those paths'
+      : undefined,
+    hasDiffBaseRef ? undefined : 'or pass diffBaseRef to review a committed range',
+    'and re-run `--validate` to confirm before spending',
+  ].filter(Boolean).join(', ');
+  return `no reviewable change evidence in the working tree: ${cause}; ${remediation}`;
 }
 
 async function boundedGitOutput(root: string, args: readonly string[], maxBytes: number): Promise<BoundedGitText> {
@@ -4258,11 +5265,12 @@ function filterWorkspaceContextDiff(
   value: BoundedGitText,
   excludedPaths: ReadonlySet<string>,
   runtimeStateExcludedPaths: ReadonlySet<string>,
+  evidenceScope: EvidenceScope = 'default',
 ): BoundedGitText {
   if (!value.text) return value;
   return {
     ...value,
-    text: filterWorkspaceContextDiffText(value.text, excludedPaths, runtimeStateExcludedPaths),
+    text: filterWorkspaceContextDiffText(value.text, excludedPaths, runtimeStateExcludedPaths, evidenceScope),
   };
 }
 
@@ -4270,6 +5278,7 @@ function filterWorkspaceContextDiffText(
   text: string,
   excludedPaths: ReadonlySet<string>,
   runtimeStateExcludedPaths: ReadonlySet<string>,
+  evidenceScope: EvidenceScope = 'default',
 ): string {
   const kept: string[] = [];
   let block: string[] = [];
@@ -4283,8 +5292,8 @@ function filterWorkspaceContextDiffText(
       flush();
       const header = parseGitDiffHeader(line);
       includeBlock = header
-        ? workspaceContextDiffPathAllowed(header.oldPath, excludedPaths, runtimeStateExcludedPaths)
-          && workspaceContextDiffPathAllowed(header.newPath, excludedPaths, runtimeStateExcludedPaths)
+        ? workspaceContextDiffPathAllowed(header.oldPath, excludedPaths, runtimeStateExcludedPaths, evidenceScope)
+          && workspaceContextDiffPathAllowed(header.newPath, excludedPaths, runtimeStateExcludedPaths, evidenceScope)
         : false;
     }
     block.push(line);
@@ -4297,18 +5306,28 @@ function workspaceContextDiffPathAllowed(
   path: string,
   excludedPaths: ReadonlySet<string>,
   runtimeStateExcludedPaths: ReadonlySet<string>,
+  evidenceScope: EvidenceScope = 'default',
 ): boolean {
   if (!path || path === '/dev/null') return true;
   const key = workspacePathKey(path);
-  return shouldIncludeWorkspaceContextPath(key, runtimeStateExcludedPaths) && !workspacePathExcludedBySet(key, excludedPaths);
+  return evidencePathAllowed(key, runtimeStateExcludedPaths, evidenceScope) && !workspacePathExcludedBySet(key, excludedPaths);
+}
+
+interface DiffEvidenceRefs {
+  readonly refs: readonly string[];
+  // Paths that produced at least one hunk. The gate needs these, and only this loop knows the path a
+  // hunk belongs to — recovering it by re-parsing the ref string would duplicate the ref grammar.
+  readonly hunkPaths: readonly string[];
 }
 
 function diffEvidenceRefs(
   kind: string,
   diff: string,
   runtimeStateExcludedPaths: ReadonlySet<string>,
-): readonly string[] {
+  evidenceScope: EvidenceScope = 'default',
+): DiffEvidenceRefs {
   const refs: string[] = [];
+  const hunkPaths: string[] = [];
   let currentPath = '';
   let hunkIndex = 0;
   for (const line of diff.split(/\r?\n/)) {
@@ -4316,15 +5335,16 @@ function diffEvidenceRefs(
     if (header) {
       currentPath = header.newPath || header.oldPath;
       hunkIndex = 0;
-      if (currentPath && currentPath !== '/dev/null' && shouldIncludeWorkspaceContextPath(currentPath, runtimeStateExcludedPaths)) refs.push(`diff:${kind}:${currentPath}`);
+      if (currentPath && currentPath !== '/dev/null' && evidencePathAllowed(currentPath, runtimeStateExcludedPaths, evidenceScope)) refs.push(`diff:${kind}:${currentPath}`);
       continue;
     }
-    if (currentPath && shouldIncludeWorkspaceContextPath(currentPath, runtimeStateExcludedPaths) && line.startsWith('@@')) {
+    if (currentPath && evidencePathAllowed(currentPath, runtimeStateExcludedPaths, evidenceScope) && line.startsWith('@@')) {
       hunkIndex += 1;
       refs.push(`hunk:${kind}:${currentPath}:${hunkIndex}`);
+      if (hunkIndex === 1) hunkPaths.push(currentPath);
     }
   }
-  return refs;
+  return { refs, hunkPaths };
 }
 
 interface GitDiffHeader {
@@ -4334,14 +5354,34 @@ interface GitDiffHeader {
 
 function parseGitDiffHeader(line: string): GitDiffHeader | undefined {
   if (!line.startsWith('diff --git ')) return undefined;
-  const first = readGitDiffHeaderToken(line.slice('diff --git '.length));
-  if (!first) return undefined;
-  const second = readGitDiffHeaderToken(first.rest.trimStart());
-  if (!second || second.rest.trim()) return undefined;
-  const oldPath = gitDiffHeaderTokenPath(first.token, 'a/');
-  const newPath = gitDiffHeaderTokenPath(second.token, 'b/');
-  if (oldPath === undefined || newPath === undefined) return undefined;
-  return { oldPath, newPath };
+  const rest = line.slice('diff --git '.length);
+  const first = readGitDiffHeaderToken(rest);
+  if (first) {
+    const second = readGitDiffHeaderToken(first.rest.trimStart());
+    if (second && !second.rest.trim()) {
+      const oldPath = gitDiffHeaderTokenPath(first.token, 'a/');
+      const newPath = gitDiffHeaderTokenPath(second.token, 'b/');
+      if (oldPath !== undefined && newPath !== undefined) return { oldPath, newPath };
+    }
+  }
+  return parseSymmetricGitDiffHeader(rest);
+}
+
+// Git does not quote a plain space, so `diff --git a/foo bar.ts b/foo bar.ts` cannot be split on
+// whitespace. For a same-path change the two halves are `a/P` and `b/P` with identical P, which
+// disambiguates it. A rename whose paths both contain spaces stays ambiguous at the header level —
+// git itself relies on the rename from/to lines there — so it is left unparsed rather than guessed.
+function parseSymmetricGitDiffHeader(rest: string): GitDiffHeader | undefined {
+  if (!rest.startsWith('a/')) return undefined;
+  for (let index = rest.indexOf(' b/'); index >= 0; index = rest.indexOf(' b/', index + 1)) {
+    const oldPath = rest.slice('a/'.length, index);
+    const newPath = rest.slice(index + ' b/'.length);
+    // Symmetry alone is not proof: renaming `foo.ts` to `bar.ts b/foo.ts b/bar.ts` also yields a
+    // symmetric split, whose halves would then be published as a path that does not exist. A candidate
+    // containing the separator is exactly that ambiguous case, so it stays unparsed.
+    if (oldPath && oldPath === newPath && !oldPath.includes(' b/')) return { oldPath, newPath };
+  }
+  return undefined;
 }
 
 function readGitDiffHeaderToken(value: string): { readonly token: string; readonly rest: string } | undefined {
@@ -4445,6 +5485,23 @@ function extractMentionedWorkspacePaths(query: string): readonly string[] {
   return [...out];
 }
 
+// A path that one status entry reported as a safe change is not excluded because a DIFFERENT entry
+// mentioned it in an excluded position — an unsafe rename source pointing at it, for instance. Leaving
+// it in both lists made it citable and unreadable at once: every consumer that asks "is this excluded?"
+// won, so the file lost its content block and its diff while still being listed as changed.
+function gitStatusPathParseResult(
+  paths: readonly string[],
+  excludedPaths: readonly string[],
+  unavailableEvidence: readonly string[],
+): GitStatusPathParse {
+  const accepted = new Set(paths.map(workspacePathKey));
+  return {
+    paths,
+    excludedPaths: excludedPaths.filter((path) => !accepted.has(workspacePathKey(path))),
+    unavailableEvidence,
+  };
+}
+
 function parseGitStatusPaths(
   status: string,
   runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
@@ -4486,11 +5543,13 @@ function parseGitStatusPaths(
     }
     const selectedPath = renameParts ? renameParts.target : rawPath;
     const path = normalizeGitStatusPath(selectedPath);
-    if (isWorkspaceEvidencePathSafe(path) && shouldExposeWorkspaceStatusPath(path, runtimeStateExcludedPaths)) paths.push(path);
+    if (isWorkspaceEvidencePathSafe(path) && !isWorkspaceEvidencePathRepresentable(path)) {
+      unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:unrepresentable-path`);
+    } else if (isWorkspaceEvidencePathSafe(path) && shouldExposeWorkspaceStatusPath(path, runtimeStateExcludedPaths)) paths.push(path);
     else if (isWorkspaceEvidencePathSafe(path)) excludedPaths.push(path);
     else unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:${renameParts ? 'unsafe-target' : 'unsafe-path'}`);
   }
-  return { paths, excludedPaths, unavailableEvidence };
+  return gitStatusPathParseResult(paths, excludedPaths, unavailableEvidence);
 }
 
 function parseGitStatusPathsZ(
@@ -4522,14 +5581,16 @@ function parseGitStatusPathsZ(
         excludedBySource = true;
       }
     }
-    if (isWorkspaceEvidencePathSafe(path) && shouldExposeWorkspaceStatusPath(path, runtimeStateExcludedPaths) && !excludedBySource) paths.push(path);
+    if (isWorkspaceEvidencePathSafe(path) && !isWorkspaceEvidencePathRepresentable(path)) {
+      unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:unrepresentable-path`);
+    } else if (isWorkspaceEvidencePathSafe(path) && shouldExposeWorkspaceStatusPath(path, runtimeStateExcludedPaths) && !excludedBySource) paths.push(path);
     else if (isWorkspaceEvidencePathSafe(path)) excludedPaths.push(path);
     else unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:${renameOrCopy ? 'unsafe-target' : 'unsafe-path'}`);
     if (renameOrCopy) {
       index += 1;
     }
   }
-  return { paths, excludedPaths, unavailableEvidence };
+  return gitStatusPathParseResult(paths, excludedPaths, unavailableEvidence);
 }
 
 // Bound the `### Git Status` display to a byte budget, keeping whole leading lines (git lists staged
@@ -4640,6 +5701,15 @@ function formatGitStatusPathForDisplay(
 
 function isWorkspaceEvidencePathSafe(path: string): boolean {
   return path !== '' && !/[\uFFFD\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(path);
+}
+
+// Refs travel as lines, and every consumer of that protocol trims a line — including the built-in
+// script's own section parser. A name ending in whitespace therefore comes back as a DIFFERENT name: the
+// runtime read the real file and published a ref for a path that does not exist, so citing the true path
+// was rejected while citing the published ref pointed nowhere. Leading whitespace is interior to the
+// line and survives, so only a trailing run is unrepresentable.
+function isWorkspaceEvidencePathRepresentable(path: string): boolean {
+  return !/\s$/u.test(path);
 }
 
 interface GitStatusRenameParts {
@@ -4787,9 +5857,11 @@ async function resolveWorkspaceContextPath(
   root: string,
   requestedPath: string,
 ): Promise<{ readonly path: string; readonly relativePath: string } | null> {
-  const requested = requestedPath.trim();
-  if (!requested) return null;
-  const candidate = isAbsolute(requested) ? resolve(requested) : resolve(root, requested);
+  // No trim: a leading or trailing space is part of a legal filename. Trimming resolved a real file to a
+  // different, nonexistent path while its evidence ref kept the true name, so the reviewer held a
+  // citation licence for a file the runtime had just failed to read.
+  if (requestedPath === '') return null;
+  const candidate = isAbsolute(requestedPath) ? resolve(requestedPath) : resolve(root, requestedPath);
   if (!pathInsideOrEqual(root, candidate)) return null;
   const canonical = await realpath(candidate).catch(() => null);
   if (!canonical || !pathInsideOrEqual(root, canonical)) return null;
@@ -4799,20 +5871,58 @@ async function resolveWorkspaceContextPath(
   };
 }
 
+// Why a path is not workspace-context material. Named so a rejection can state the rule that
+// dropped it instead of only the fact that nothing survived.
+type WorkspaceContextDropRule =
+  | 'unsafe-path'
+  | 'runtime-state'
+  | 'excluded-dir'
+  | 'extension-not-allowed';
+
+// The single authority for path admission. shouldIncludeWorkspaceContextPath is a thin wrapper, so
+// the predicate and the reported reason cannot drift apart.
+function workspaceContextPathVerdict(
+  path: string,
+  runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
+): WorkspaceContextDropRule | undefined {
+  const normalized = path.replaceAll('\\', '/').replace(/^\.\/+/, '');
+  if (!normalized || normalized.startsWith('../') || normalized.includes('/../')) return 'unsafe-path';
+  if (!isWorkspaceEvidencePathSafe(normalized)) return 'unsafe-path';
+  // A name carrying a newline, an escape, or a bidi control would break the structured prompt's section
+  // and ref boundaries wherever it is interpolated, so it is inadmissible at every evidence scope.
+  if (workspacePathExcludedBySet(normalized, runtimeStateExcludedPaths)) return 'runtime-state';
+  const parts = normalized.split('/');
+  if (parts.some((part) => WORKSPACE_CONTEXT_EXCLUDED_DIRS.has(part))) return 'excluded-dir';
+  const name = parts.at(-1) ?? '';
+  if (WORKSPACE_CONTEXT_PRIORITY_FILES.has(name)) return undefined;
+  const dot = name.lastIndexOf('.');
+  if (dot < 0) return 'extension-not-allowed';
+  return WORKSPACE_CONTEXT_ALLOWED_EXTENSIONS.has(name.slice(dot).toLowerCase())
+    ? undefined
+    : 'extension-not-allowed';
+}
+
 function shouldIncludeWorkspaceContextPath(
   path: string,
   runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
 ): boolean {
-  const normalized = path.replaceAll('\\', '/').replace(/^\.\/+/, '');
-  if (!normalized || normalized.startsWith('../') || normalized.includes('/../')) return false;
-  if (workspacePathExcludedBySet(normalized, runtimeStateExcludedPaths)) return false;
-  const parts = normalized.split('/');
-  if (parts.some((part) => WORKSPACE_CONTEXT_EXCLUDED_DIRS.has(part))) return false;
-  const name = parts.at(-1) ?? '';
-  if (WORKSPACE_CONTEXT_PRIORITY_FILES.has(name)) return true;
-  const dot = name.lastIndexOf('.');
-  if (dot < 0) return false;
-  return WORKSPACE_CONTEXT_ALLOWED_EXTENSIONS.has(name.slice(dot).toLowerCase());
+  return workspaceContextPathVerdict(path, runtimeStateExcludedPaths) === undefined;
+}
+
+// Evidence admission under an explicit scope. `all` forgives the extension rule and nothing else:
+// excluded directories, runtime state, and unsafe paths remain inadmissible at every scope, and the
+// prompt-budget file selection keeps using shouldIncludeWorkspaceContextPath unchanged.
+function evidenceScopeForgives(rule: WorkspaceContextDropRule, scope: EvidenceScope): boolean {
+  return scope === 'all' && rule === 'extension-not-allowed';
+}
+
+function evidencePathAllowed(
+  path: string,
+  runtimeStateExcludedPaths: ReadonlySet<string>,
+  scope: EvidenceScope,
+): boolean {
+  const rule = workspaceContextPathVerdict(path, runtimeStateExcludedPaths);
+  return rule === undefined || evidenceScopeForgives(rule, scope);
 }
 
 function shouldExposeWorkspaceStatusPath(
@@ -4849,17 +5959,21 @@ function splitLines(value: string): string[] {
   return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
-function uniqueStrings(values: Iterable<string>): string[] {
+// Dedup that preserves the value. The trimming variant this replaced renamed a file whose name carried a
+// leading or trailing space into one that does not exist — in one direction the read failed while the ref
+// kept the true name, in the other the ref lost it while the read succeeded. Paths and the refs built
+// from them are values, not tokens, so nothing on this path may normalize them.
+function uniqueExact(values: Iterable<string>): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const value of values) {
-    const normalized = value.trim();
-    if (!normalized || seen.has(normalized)) continue;
-    seen.add(normalized);
-    out.push(normalized);
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
   }
   return out;
 }
+
 
 function preservedWorktree(
   worktree: WorkflowAgentWorktree,

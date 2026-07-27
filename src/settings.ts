@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
-import type { AgentConcurrency, AgentFileWrite, AgentMcpServers, AgentTypes, AgentWebSearch, NestedWorkflows, ReasoningEffort, Verbosity, WorktreeRetention } from './runtime/types.js';
-import { AGENT_FILE_WRITE_VALUES, AGENT_TYPES_VALUES, AGENT_WEB_SEARCH_VALUES, NESTED_WORKFLOWS_VALUES, REASONING_EFFORTS, WORKTREE_RETENTIONS, isAgentConcurrencyKeyword, isAgentFileWrite, isAgentMcpServerList, isAgentTypes, isAgentWebSearch, isNestedWorkflows, isReasoningEffort, isWorktreeRetention } from './runtime/types.js';
+import type { AgentConcurrency, AgentFileWrite, AgentMcpServers, AgentTypes, AgentWebSearch, EvidenceScope, NestedWorkflows, ReasoningEffort, RefPolicy, Verbosity, WorktreeRetention } from './runtime/types.js';
+import { AGENT_FILE_WRITE_VALUES, AGENT_TYPES_VALUES, AGENT_WEB_SEARCH_VALUES, EVIDENCE_SCOPE_VALUES, NESTED_WORKFLOWS_VALUES, REF_POLICY_VALUES, REASONING_EFFORTS, WORKTREE_RETENTIONS, isAgentConcurrencyKeyword, isAgentFileWrite, isAgentMcpServerList, isAgentTypes, isAgentWebSearch, isEvidenceScope, isNestedWorkflows, isRefPolicy, isReasoningEffort, isWorktreeRetention } from './runtime/types.js';
 
 export { isReasoningEffort };
 
@@ -19,6 +19,8 @@ export interface UltracodeSettings {
     readonly worktreeRetention: WorktreeRetention;
     readonly agentConcurrency: AgentConcurrency;
     readonly nestedWorkflows: NestedWorkflows;
+    readonly evidenceScope: EvidenceScope;
+    readonly refPolicy: RefPolicy;
     readonly agentWebSearch: AgentWebSearch;
     readonly agentFileWrite: AgentFileWrite;
     readonly agentMcp: AgentMcpServers;
@@ -99,6 +101,14 @@ export function loadSettings(): UltracodeSettings {
       nestedWorkflows: readNestedWorkflowsSetting(
         workflow?.nestedWorkflows,
         'workflow.nestedWorkflows',
+      ),
+      evidenceScope: readEvidenceScopeSetting(
+        workflow?.evidenceScope,
+        'workflow.evidenceScope',
+      ),
+      refPolicy: readRefPolicySetting(
+        workflow?.refPolicy,
+        'workflow.refPolicy',
       ),
       agentWebSearch: readAgentWebSearchSetting(
         workflow?.agentWebSearch,
@@ -190,6 +200,14 @@ export function workflowDefaultNestedWorkflows(): NestedWorkflows {
   return loadSettings().workflow.nestedWorkflows;
 }
 
+export function workflowDefaultEvidenceScope(): EvidenceScope {
+  return loadSettings().workflow.evidenceScope;
+}
+
+export function workflowDefaultRefPolicy(): RefPolicy {
+  return loadSettings().workflow.refPolicy;
+}
+
 export function workflowDefaultAgentWebSearch(): AgentWebSearch {
   return loadSettings().workflow.agentWebSearch;
 }
@@ -275,6 +293,24 @@ function readNestedWorkflowsSetting(
   if (value === undefined) return 'disabled';
   if (isNestedWorkflows(value)) return value;
   throw new Error(`${key} must be one of ${NESTED_WORKFLOWS_VALUES.join(', ')}.`);
+}
+
+function readEvidenceScopeSetting(
+  value: unknown,
+  key: string,
+): EvidenceScope {
+  if (value === undefined) return 'default';
+  if (isEvidenceScope(value)) return value;
+  throw new Error(`${key} must be one of ${EVIDENCE_SCOPE_VALUES.join(', ')}.`);
+}
+
+function readRefPolicySetting(
+  value: unknown,
+  key: string,
+): RefPolicy {
+  if (value === undefined) return 'strict';
+  if (isRefPolicy(value)) return value;
+  throw new Error(`${key} must be one of ${REF_POLICY_VALUES.join(', ')}.`);
 }
 
 function readAgentWebSearchSetting(

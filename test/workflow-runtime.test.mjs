@@ -9,6 +9,7 @@ import { WorkflowTaskRegistry, isRetryableFailureReason } from '../dist/runtime/
 import { SubagentFailure } from '../dist/runtime/types.js';
 import {
   WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+  WorkflowJournalWriter,
   computeWorkflowAgentCallKey,
   readWorkflowJournal,
   workflowJournalPath,
@@ -605,6 +606,9 @@ test('built-in code-review runs dynamic lens finders, candidate verifiers, sweep
     assert.equal(snapshot.result.stats.verifierAttempts, 2);
     assert.equal(snapshot.result.stats.reported, 1);
     assert.match(snapshot.result.provenance.sourceSnapshotId, /^git:[0-9a-f]{40}:sha256:[0-9a-f]{64}$/);
+    // No range was requested. The context prints "(none)" for display, and that string is truthy, so
+    // reading it unguarded reported a commit range that was never reviewed.
+    assert.equal(snapshot.result.provenance.diffBaseRef, null);
     const planEvent = events.find((event) => event.type === 'workflow.plan.ready');
     assert.equal(planEvent.mode, 'phase_parallel');
     assert.equal(planEvent.phases.length, 1);
@@ -741,10 +745,1650 @@ test('built-in code-review fails before spawning agents when the working tree ha
     const snapshot = runtime.get(launch.taskId);
     assert.equal(snapshot.status, 'failed');
     assert.match(snapshot.error, /no reviewable change evidence in the working tree/);
-    assert.match(snapshot.error, /allowed file refs is empty \(0 entries\) derived from /);
-    assert.match(snapshot.error, /; populated by /);
+    // Cause and remediation, not just the fact of failure.
+    assert.match(snapshot.error, /git status reported no changed or untracked paths/);
+    assert.match(snapshot.error, /change a file whose extension is in the evidence allowlist/);
+    assert.match(snapshot.error, /re-run `--validate` to confirm before spending/);
     assert.equal(backend.requests.length, 0);
     assert.equal(snapshot.events.some((event) => event.type === 'workflow.agent.started'), false);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('code-review normalizes ref grammar mistakes instead of discarding the run', async () => {
+  for (const marker of ['LINE_SUFFIX_REF', 'KIND_MISMATCH_REF']) {
+    const backend = new FakeSubagentBackend();
+    const { runtime, root } = await createRuntime({ backend });
+    try {
+      await initializeGitRepo(root);
+      await mkdir(join(root, 'docs'), { recursive: true });
+      await writeFile(join(root, 'docs', 'client-package-plan.md'), 'The platform token owns authority.\n');
+
+      const launch = await runtime.launch({
+        name: 'code-review',
+        args: { prompt: `${marker} Review docs/client-package-plan.md.` },
+      });
+      await collectEvents(runtime, launch.taskId);
+      const snapshot = runtime.get(launch.taskId);
+      assert.equal(snapshot.status, 'completed', `${marker}: ${snapshot.error ?? ''}`);
+      assert.ok(snapshot.result.stats.normalizedRefs >= 1, marker);
+      const refs = snapshot.result.findings.flatMap((finding) => finding.evidenceRefs);
+      // Every surviving ref is a string the runtime actually published.
+      for (const ref of refs) {
+        assert.ok(
+          ref === 'file:docs/client-package-plan.md' || /^(diff|hunk):/.test(ref),
+          `${marker} normalized to an unpublished ref: ${ref}`,
+        );
+      }
+      for (const finding of snapshot.result.findings) {
+        assert.equal(finding.file, 'docs/client-package-plan.md', marker);
+      }
+    } finally {
+      await runtime.close();
+    }
+  }
+});
+
+async function runCodeReview({ marker, refPolicy, evidenceScope, extraFiles = {} }) {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { refPolicy, evidenceScope } });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'docs'), { recursive: true });
+    await writeFile(join(root, 'docs', 'client-package-plan.md'), 'The platform token owns authority.\n');
+    for (const [name, contents] of Object.entries(extraFiles)) {
+      await writeFile(join(root, name), contents);
+    }
+    const launch = await runtime.launch({
+      name: 'code-review',
+      args: { prompt: `${marker} Review docs/client-package-plan.md.` },
+    });
+    await collectEvents(runtime, launch.taskId);
+    return { snapshot: runtime.get(launch.taskId), backend };
+  } finally {
+    await runtime.close();
+  }
+}
+
+test('refPolicy lenient drops the unusable candidate and keeps the rest of the review', async () => {
+  const { snapshot } = await runCodeReview({ marker: 'PARTIAL_INVALID_REF', refPolicy: 'lenient' });
+  assert.equal(snapshot.status, 'completed', snapshot.error ?? '');
+  assert.equal(snapshot.result.stats.refDrops, 1);
+  assert.equal(snapshot.result.degraded.refDrops, 1);
+  assert.equal(snapshot.result.degraded.entries[0].stage, 'candidate');
+  assert.equal(snapshot.result.degraded.entries[0].reasonCategory, 'unsupported_evidence');
+  assert.match(snapshot.result.degraded.entries[0].reason, /unsupported evidence ref file:outside\.md/);
+  // The sibling candidate survived, so the review still reports.
+  assert.ok(snapshot.result.findings.length >= 1);
+  for (const finding of snapshot.result.findings) {
+    assert.ok(finding.evidenceRefs.every((ref) => !ref.includes('outside.md')));
+  }
+  // One drop-accounting surface. A candidate the runtime dropped never reaches synthesis, so without a
+  // synthesized decision row refDrops rose while dropped.unsupportedEvidence stayed 0 and the two
+  // accountings contradicted each other (docs/20260727-r6-ref-drop-policy-design.md).
+  assert.equal(snapshot.result.stats.dropped.unsupportedEvidence, 1);
+  const dropRow = snapshot.result.synthesis.decisions.find((row) => row.reasonCategory === 'unsupported_evidence');
+  assert.ok(dropRow, JSON.stringify(snapshot.result.synthesis.decisions));
+  assert.equal(dropRow.action, 'drop');
+  assert.match(dropRow.candidateId, /^candidate:/);
+});
+
+test('a cited path that ends in a colon and digits is not read as an appended index', async () => {
+  // `issue:123` is a legal filename. Stripping ":123" first redirected the citation to `issue`, a
+  // different (nonexistent) file, so a review of a real change failed as unsupported evidence. An exact
+  // path match is a fact; the index reading is a guess, and file:/diff: refs carry no index at all.
+  const { snapshot } = await runCodeReview({
+    marker: 'COLON_INDEX_REF',
+    refPolicy: 'strict',
+    evidenceScope: 'all',
+    extraFiles: { 'issue:123': 'the tracked issue body\n' },
+  });
+  // Strict is the demanding side: before the fix this run failed outright on the candidate's ref.
+  assert.equal(snapshot.status, 'completed', snapshot.error ?? '');
+  assert.doesNotMatch(snapshot.error ?? '', /unsupported evidence ref/);
+  assert.ok(snapshot.result.stats.normalizedRefs >= 1, JSON.stringify(snapshot.result.stats));
+  assert.equal(snapshot.result.stats.refDrops, 0);
+
+  // Control: the same kind-mismatch on a name WITHOUT a colon suffix already normalized, so the test is
+  // about the suffix rather than about kind normalization in general.
+  const plain = await runCodeReview({
+    marker: 'COLON_INDEX_REF_PLAIN',
+    refPolicy: 'strict',
+    evidenceScope: 'all',
+    extraFiles: { 'issue.md': 'the tracked issue body\n' },
+  });
+  assert.equal(plain.snapshot.status, 'completed', plain.snapshot.error ?? '');
+  assert.ok(plain.snapshot.result.stats.normalizedRefs >= 1);
+});
+
+test('refPolicy strict fails the same run (lenient flag is wired, not inert)', async () => {
+  const { snapshot, backend } = await runCodeReview({ marker: 'PARTIAL_INVALID_REF', refPolicy: 'strict' });
+  assert.equal(snapshot.status, 'failed');
+  assert.match(snapshot.error, /includes unsupported evidence ref file:outside\.md/);
+  // Strict is also the default: no refPolicy option must behave the same way.
+  const fallback = await runCodeReview({ marker: 'PARTIAL_INVALID_REF', refPolicy: undefined });
+  assert.equal(fallback.snapshot.status, 'failed');
+  assert.ok(backend.requests.length >= 1);
+});
+
+test('refPolicy lenient still fails when every candidate is dropped (no vacuous pass)', async () => {
+  const { snapshot } = await runCodeReview({ marker: 'INVALID_EVIDENCE_REF', refPolicy: 'lenient' });
+  assert.equal(snapshot.status, 'failed');
+  assert.match(snapshot.error, /no candidate survived 1 unsupported-evidence drop\(s\) at candidate verification/);
+  assert.match(snapshot.error, /this review is inconclusive, not clean/);
+  assert.match(snapshot.error, /includes unsupported evidence ref file:outside\.md/);
+});
+
+test('the vacuous-pass guard covers sweep-only drops and does not pre-empt a sweep rescue', async () => {
+  // The guard used to run before the sweep, so a sweep-only drop completed with an empty report while
+  // a lens drop failed a run the sweep could still have rescued. Both directions are asserted here.
+  const swept = await runCodeReview({ marker: 'SWEEP_ONLY_DROP', refPolicy: 'lenient' });
+  assert.equal(swept.snapshot.status, 'failed');
+  assert.match(swept.snapshot.error, /no candidate survived 1 unsupported-evidence drop\(s\)/);
+  assert.match(swept.snapshot.error, /inconclusive, not clean/);
+
+  const rescued = await runCodeReview({ marker: 'SWEEP_RESCUE', refPolicy: 'lenient' });
+  assert.equal(rescued.snapshot.status, 'completed', rescued.snapshot.error ?? '');
+  assert.equal(rescued.snapshot.result.stats.refDrops, 1);
+  assert.ok(rescued.snapshot.result.findings.length >= 1);
+
+  // Control: strict still fails both fixtures on the ref itself, not on the vacuous-pass rule.
+  const strict = await runCodeReview({ marker: 'SWEEP_ONLY_DROP', refPolicy: 'strict' });
+  assert.equal(strict.snapshot.status, 'failed');
+  assert.match(strict.snapshot.error, /includes unsupported evidence ref file:outside\.md/);
+});
+
+test('a drive-relative name is not a structural violation', async () => {
+  const { snapshot } = await runCodeReview({ marker: 'DRIVE_RELATIVE_REF', refPolicy: 'lenient' });
+  assert.equal(snapshot.status, 'failed');
+  // It is refused as unsupported evidence, but "C:foo.md" is a legal POSIX filename, not an escape.
+  assert.doesNotMatch(snapshot.error, /structural/);
+  assert.match(snapshot.error, /no candidate survived/);
+});
+
+test('a resumed built-in still validates its request contract', async () => {
+  // Resume hands back the persisted scriptPath, so the run classifies as script_path and the built-in
+  // contract used to be skipped entirely — a resumed review accepted a mistyped key and silently ran
+  // the script's fallback.
+  const backend = new FakeSubagentBackend();
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-contract-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  await initializeGitRepo(root);
+  await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
+  const runtime = new WorkflowTaskRegistry({ backend, cwd: root, stateDir, requestTimeoutMs: 30_000 });
+  let runId;
+  let firstScriptPath;
+  try {
+    const first = await runtime.launch({ name: 'code-review', args: { prompt: 'Review pending.ts' } });
+    await collectEvents(runtime, first.taskId);
+    runId = runtime.get(first.taskId).runId;
+    firstScriptPath = runtime.get(first.taskId).scriptPath;
+    assert.ok(runId);
+    assert.ok(typeof firstScriptPath === 'string');
+
+    await assert.rejects(
+      () => runtime.launch({ resumeFromRunId: runId, args: { promt: 'typo on resume' } }),
+      /unknown workflow arg "promt" for built-in "code-review"/,
+    );
+    await assert.rejects(
+      () => runtime.launch({ resumeFromRunId: runId, args: { prompt: 'Review pending.ts', level: 'medium' } }),
+      /has an unsupported value "medium"/,
+    );
+
+    // Control: valid args resume normally, so the contract is applied rather than the resume blocked.
+    const resumed = await runtime.launch({ resumeFromRunId: runId, args: { prompt: 'Review pending.ts' } });
+    await collectEvents(runtime, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(runtime.get(resumed.taskId).status));
+
+    // Edit-and-iterate: a co-supplied selector executes a DIFFERENT workflow, so its own contract
+    // governs. Validating `prompts` against code-review's contract would break a shipped feature.
+    const replaced = await runtime.launch({
+      resumeFromRunId: runId,
+      name: 'batch',
+      args: { prompts: ['first', 'second'] },
+    });
+    await collectEvents(runtime, replaced.taskId);
+    assert.ok(['completed', 'failed'].includes(runtime.get(replaced.taskId).status));
+
+    // A co-supplied scriptPath naming the SAME persisted built-in still executes that built-in, so its
+    // contract must apply even though the launch input carries no `name`.
+    await assert.rejects(
+      () => runtime.launch({
+        resumeFromRunId: runId,
+        scriptPath: firstScriptPath,
+        args: { prompt: 'Review pending.ts', level: 'medium' },
+      }),
+      /workflow arg "level" for built-in "code-review" has an unsupported value "medium"/,
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a resume under a different ref policy is refused', async () => {
+  const backend = new FakeSubagentBackend();
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-policy-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  await initializeGitRepo(root);
+  await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
+  const strictRuntime = new WorkflowTaskRegistry({ backend, cwd: root, stateDir, requestTimeoutMs: 30_000 });
+  let runId;
+  try {
+    const first = await strictRuntime.launch({ name: 'code-review', args: { prompt: 'Review pending.ts' } });
+    await collectEvents(strictRuntime, first.taskId);
+    runId = strictRuntime.get(first.taskId).runId;
+  } finally {
+    await strictRuntime.close();
+  }
+
+  const lenientRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'lenient',
+  });
+  try {
+    // The source run's cached agent results were produced under strict failure semantics and the call
+    // keys do not record the policy, so replaying them under lenient would be silent drift.
+    await assert.rejects(
+      () => lenientRuntime.launch({ resumeFromRunId: runId }),
+      /the source run executed built-in "code-review" under --ref-policy strict/,
+    );
+    await assert.rejects(
+      () => lenientRuntime.launch({ resumeFromRunId: runId }),
+      /resume with --ref-policy strict, or start a fresh run under lenient/,
+    );
+  } finally {
+    await lenientRuntime.close();
+  }
+
+  // Control: the same policy resumes, so the check keys on the mismatch rather than on resuming at all.
+  const sameRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'strict',
+  });
+  try {
+    const resumed = await sameRuntime.launch({ resumeFromRunId: runId });
+    await collectEvents(sameRuntime, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(sameRuntime.get(resumed.taskId).status));
+  } finally {
+    await sameRuntime.close();
+  }
+
+  // The REVERSE direction: a lenient source resumed under the strict default. "strict is the default"
+  // proves nothing about what the source ran, and testing only one direction is what let this through.
+  const lenientRoot = await mkdtemp(join(tmpdir(), 'workflow-resume-policy-reverse-'));
+  tempDirs.push(lenientRoot);
+  const lenientStateDir = join(lenientRoot, '.ultracode-for-codex');
+  await initializeGitRepo(lenientRoot);
+  await writeFile(join(lenientRoot, 'pending.ts'), 'export const pending = 1;\n');
+  const sourceLenient = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: lenientRoot, stateDir: lenientStateDir,
+    requestTimeoutMs: 30_000, refPolicy: 'lenient',
+  });
+  let lenientRunId;
+  try {
+    const first = await sourceLenient.launch({ name: 'code-review', args: { prompt: 'Review pending.ts' } });
+    await collectEvents(sourceLenient, first.taskId);
+    lenientRunId = sourceLenient.get(first.taskId).runId;
+  } finally {
+    await sourceLenient.close();
+  }
+  const strictRuntime2 = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: lenientRoot, stateDir: lenientStateDir, requestTimeoutMs: 30_000,
+  });
+  try {
+    await assert.rejects(
+      () => strictRuntime2.launch({ resumeFromRunId: lenientRunId }),
+      /under --ref-policy lenient, whose cached agent results were produced under different failure semantics/,
+    );
+  } finally {
+    await strictRuntime2.close();
+  }
+});
+
+test('a built-in whose recorded script no longer matches any variant is still policy-checked', async () => {
+  // Simulates a source run created by an older generator: the script matches neither current variant,
+  // so the script-derived policy is lost. The journaled run-level policy still proves it.
+  const legacyReview = { name: 'code-review', script: 'export const meta = { name: "code-review", description: "legacy" };\nreturn { legacy: true };' };
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-legacy-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  const legacyRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    builtinWorkflows: [legacyReview],
+  });
+  let runId;
+  try {
+    const first = await legacyRuntime.launch({ name: 'code-review', args: {} });
+    await collectEvents(legacyRuntime, first.taskId);
+    runId = legacyRuntime.get(first.taskId).runId;
+    assert.ok(runId);
+  } finally {
+    await legacyRuntime.close();
+  }
+
+  const lenientRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'lenient',
+  });
+  try {
+    await assert.rejects(
+      () => lenientRuntime.launch({ resumeFromRunId: runId }),
+      /under --ref-policy strict, whose cached agent results were produced under different failure semantics/,
+    );
+  } finally {
+    await lenientRuntime.close();
+  }
+
+  // Control: the default policy resumes, so the refusal keys on the unprovable switch.
+  const strictRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+  });
+  try {
+    const resumed = await strictRuntime.launch({ resumeFromRunId: runId });
+    await collectEvents(strictRuntime, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(strictRuntime.get(resumed.taskId).status));
+  } finally {
+    await strictRuntime.close();
+  }
+});
+
+test('an unidentifiable source is refused for a policy switch only when nesting is enabled', async () => {
+  const script = `export const meta = { name: "inline-parent", description: "parent" };\nreturn { ok: true };`;
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-nested-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  const first = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+  });
+  let runId;
+  try {
+    const launched = await first.launch({ script, args: {} });
+    await collectEvents(first, launched.taskId);
+    runId = first.get(launched.taskId).runId;
+  } finally {
+    await first.close();
+  }
+
+  // A nested built-in child is journaled only as script-agnostic agent entries, so a cross-policy
+  // replay could hide inside a parent this check cannot identify.
+  const nested = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    refPolicy: 'lenient', nestedWorkflows: 'enabled',
+  });
+  try {
+    await assert.rejects(
+      () => nested.launch({ resumeFromRunId: runId }),
+      /not identifiable as a built-in/,
+    );
+  } finally {
+    await nested.close();
+  }
+
+  // Control: with an injected (static) registry no child can vary by policy, so nesting must not make
+  // the policy relevant at all.
+  const injectedNested = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    refPolicy: 'lenient', nestedWorkflows: 'enabled',
+    builtinWorkflows: [{ name: 'only-static', script: 'export const meta = { name: "only-static", description: "s" };\nreturn {};' }],
+  });
+  try {
+    const resumed = await injectedNested.launch({ resumeFromRunId: runId });
+    await collectEvents(injectedNested, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(injectedNested.get(resumed.taskId).status));
+  } finally {
+    await injectedNested.close();
+  }
+
+  // Control: the same policy switch without nesting is allowed, so the refusal is not blanket.
+  const notNested = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'lenient',
+  });
+  try {
+    const resumed = await notNested.launch({ resumeFromRunId: runId });
+    await collectEvents(notNested, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(notNested.get(resumed.taskId).status));
+  } finally {
+    await notNested.close();
+  }
+
+  // Control: nesting enabled with the SAME policy as the source resumes, so the rule keys on the
+  // mismatch rather than on nesting.
+  const nestedSamePolicy = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    nestedWorkflows: 'enabled',
+  });
+  try {
+    const resumed = await nestedSamePolicy.launch({ resumeFromRunId: runId });
+    await collectEvents(nestedSamePolicy, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(nestedSamePolicy.get(resumed.taskId).status));
+  } finally {
+    await nestedSamePolicy.close();
+  }
+
+  // The REVERSE direction: a lenient parent resumed under the strict default with nesting enabled.
+  const lenientParentRoot = await mkdtemp(join(tmpdir(), 'workflow-resume-nested-reverse-'));
+  tempDirs.push(lenientParentRoot);
+  const lenientParentStateDir = join(lenientParentRoot, '.ultracode-for-codex');
+  const lenientParent = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: lenientParentRoot, stateDir: lenientParentStateDir,
+    requestTimeoutMs: 30_000, refPolicy: 'lenient', nestedWorkflows: 'enabled',
+  });
+  let lenientParentRunId;
+  try {
+    const launched = await lenientParent.launch({ script, args: {} });
+    await collectEvents(lenientParent, launched.taskId);
+    lenientParentRunId = lenientParent.get(launched.taskId).runId;
+  } finally {
+    await lenientParent.close();
+  }
+  const strictNested = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: lenientParentRoot, stateDir: lenientParentStateDir,
+    requestTimeoutMs: 30_000, nestedWorkflows: 'enabled',
+  });
+  try {
+    await assert.rejects(
+      () => strictNested.launch({ resumeFromRunId: lenientParentRunId }),
+      /under --ref-policy lenient, whose cached agent results were produced under different failure semantics/,
+    );
+  } finally {
+    await strictNested.close();
+  }
+});
+
+test('a built-in this version no longer recognizes is still policy-checked', async () => {
+  // The journal says built_in but the name is not a built-in here (removed, renamed, or supplied
+  // through builtinWorkflows). Treating that as "not a built-in" made policy irrelevant with nesting
+  // off, so a journaled mismatch was ignored and a lenient source could resume as strict.
+  const gone = { name: 'gone-review', script: 'export const meta = { name: "gone-review", description: "gone" };\nreturn { gone: true };' };
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-gone-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  const source = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    builtinWorkflows: [gone], refPolicy: 'lenient',
+  });
+  let runId;
+  try {
+    const first = await source.launch({ name: 'gone-review', args: {} });
+    await collectEvents(source, first.taskId);
+    runId = source.get(first.taskId).runId;
+    assert.ok(runId);
+  } finally {
+    await source.close();
+  }
+
+  // Nesting is OFF here, which is exactly the combination that used to slip through.
+  const strictRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+  });
+  try {
+    await assert.rejects(
+      () => strictRuntime.launch({ resumeFromRunId: runId }),
+      /which this version does not recognize/,
+    );
+  } finally {
+    await strictRuntime.close();
+  }
+
+  // Control: the same policy resumes, so the refusal keys on the mismatch.
+  const lenientRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    builtinWorkflows: [gone], refPolicy: 'lenient',
+  });
+  try {
+    const resumed = await lenientRuntime.launch({ resumeFromRunId: runId });
+    await collectEvents(lenientRuntime, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(lenientRuntime.get(resumed.taskId).status));
+  } finally {
+    await lenientRuntime.close();
+  }
+});
+
+test('a direct scriptPath launch of a persisted built-in is refused across ref policies', async () => {
+  // The persisted script has its ref policy baked into its text. Promotion classifies the launch as the
+  // built-in, so without this check the run executed the SOURCE policy while stderr and the journal
+  // recorded the requested one — and a later resume trusted that false record. The dangerous direction
+  // is a lenient script under requested strict: the review completes with candidates dropped where a
+  // real strict run fails.
+  const backend = new FakeSubagentBackend();
+  const root = await mkdtemp(join(tmpdir(), 'workflow-scriptpath-policy-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  await initializeGitRepo(root);
+  await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
+
+  const lenientRuntime = new WorkflowTaskRegistry({
+    backend, cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'lenient',
+  });
+  let lenientScriptPath;
+  try {
+    const first = await lenientRuntime.launch({ name: 'code-review', args: { prompt: 'Review pending.ts' } });
+    await collectEvents(lenientRuntime, first.taskId);
+    lenientScriptPath = lenientRuntime.get(first.taskId).scriptPath;
+    assert.ok(typeof lenientScriptPath === 'string');
+  } finally {
+    await lenientRuntime.close();
+  }
+
+  const strictRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'strict',
+  });
+  try {
+    await assert.rejects(
+      () => strictRuntime.launch({ scriptPath: lenientScriptPath, args: { prompt: 'Review pending.ts' } }),
+      /the persisted script was generated under --ref-policy lenient/,
+    );
+    await assert.rejects(
+      () => strictRuntime.launch({ scriptPath: lenientScriptPath, args: { prompt: 'Review pending.ts' } }),
+      /pass --ref-policy lenient to run the persisted script as written, or launch by name/,
+    );
+  } finally {
+    await strictRuntime.close();
+  }
+
+  // Control: the policy that actually generated the script launches it, so the check keys on the
+  // mismatch rather than on passing a scriptPath at all. What matters is that the launch is ACCEPTED —
+  // how the review then turns out depends on the fixture's evidence, not on this rule.
+  const sameRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'lenient',
+  });
+  try {
+    const again = await sameRuntime.launch({ scriptPath: lenientScriptPath, args: { prompt: 'Review pending.ts' } });
+    await collectEvents(sameRuntime, again.taskId);
+    const snapshot = sameRuntime.get(again.taskId);
+    assert.doesNotMatch(snapshot.error ?? '', /persisted script was generated under --ref-policy/);
+    assert.ok(['completed', 'failed'].includes(snapshot.status));
+  } finally {
+    await sameRuntime.close();
+  }
+});
+
+test('a journal with no recorded ref policy is unprovable, not assumed strict', async () => {
+  // The only population that can carry no field is a run from before the field existed — including an
+  // intermediate build of this branch, where lenient WAS possible. Inferring strict there would let a
+  // strict resume replay lenient cached results, so absence must stay unprovable.
+  // Built by writing a journal that copies a real run's started entry with runtime.refPolicy omitted;
+  // the writer owns the hash chain, so this is a real journal, not a hand-forged one.
+  const legacy = {
+    name: 'code-review',
+    script: 'export const meta = { name: "code-review", description: "intermediate build" };\nreturn { legacy: true };',
+  };
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-prefield-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  const source = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    builtinWorkflows: [legacy], refPolicy: 'lenient',
+  });
+  let started;
+  try {
+    const first = await source.launch({ name: 'code-review', args: {} });
+    await collectEvents(source, first.taskId);
+    const snapshot = source.get(first.taskId);
+    const journal = await readWorkflowJournal(workflowJournalPath(snapshot.transcriptDir));
+    started = journal.entries.find((entry) => entry.kind === 'workflow.run.started');
+    assert.equal(started.runtime.refPolicy, 'lenient');
+  } finally {
+    await source.close();
+  }
+
+  // Same started entry, minus the policy field.
+  const preFieldRunId = 'run_00000000-0000-4000-8000-00000000beef';
+  const transcriptDir = join(stateDir, 'subagents', 'workflows', preFieldRunId);
+  const writer = await WorkflowJournalWriter.create({
+    transcriptDir, taskId: 'task_prefield', runId: preFieldRunId,
+  });
+  const { refPolicy, ...runtimeWithoutPolicy } = started.runtime;
+  assert.equal(refPolicy, 'lenient');
+  await writer.append({
+    kind: 'workflow.run.started',
+    workflowName: started.workflowName,
+    workflowSource: started.workflowSource,
+    ...(started.workflowSourcePath ? { workflowSourcePath: started.workflowSourcePath } : {}),
+    scriptPath: started.scriptPath,
+    scriptHash: started.scriptHash,
+    args: started.args,
+    runtime: runtimeWithoutPolicy,
+  });
+  await writer.append({
+    kind: 'workflow.run.failed', reason: 'workflow_failed', message: 'intermediate build', durationMs: 1,
+  });
+
+  const strictRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+  });
+  try {
+    await assert.rejects(
+      () => strictRuntime.launch({ resumeFromRunId: preFieldRunId }),
+      /does not record the ref policy it ran under/,
+    );
+  } finally {
+    await strictRuntime.close();
+  }
+});
+
+test('a committed path containing a space survives into the evidence gate', async () => {
+  // `diff --git a/foo bar.ts b/foo bar.ts` does not quote the space, so deriving committed paths from
+  // the patch header lost the path and the gate then reported "no changed paths" for a valid range.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'foo bar.ts'), 'export const spaced = 1;\n');
+    await gitLines(root, ['add', '--', 'foo bar.ts']);
+    await gitLines(root, ['commit', '-m', 'spaced']);
+
+    const report = await runtime.validateWorkflowInput({
+      name: 'code-review',
+      args: { prompt: 'Review the last commit.', diffBaseRef: 'HEAD~1' },
+    });
+    assert.equal(report.evidence.gated, false);
+    assert.equal(report.evidence.allowedEvidenceRefs.includes('file:foo bar.ts'), true,
+      JSON.stringify(report.evidence.allowedEvidenceRefs));
+    // Opening the gate is not enough: agents would spend without seeing the change. The committed diff
+    // and hunk refs must survive too, and the file must reach an included-file block.
+    assert.equal(report.evidence.allowedEvidenceRefs.includes('diff:committed:foo bar.ts'), true,
+      JSON.stringify(report.evidence.allowedEvidenceRefs));
+    assert.equal(report.evidence.allowedEvidenceRefs.includes('hunk:committed:foo bar.ts:1'), true,
+      JSON.stringify(report.evidence.allowedEvidenceRefs));
+
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('the gate refuses to open when an admitted path produced nothing readable', async () => {
+  // An untracked file larger than the byte budget yields no content block, and an untracked file has no
+  // patch either — so a ref existed while the reviewer had nothing to look at. The gate is now decided
+  // from readable evidence, not from the presence of a ref.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { evidenceScope: 'all' } });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    // maxFileBytes defaults to 12_000; workspaceContextFileBlock yields nothing for a larger file.
+    await writeFile(join(root, 'src', 'Huge.java'), `class Huge { ${'/* pad */'.repeat(4000)} }\n`);
+
+    const report = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.equal(report.evidence.gated, true);
+    assert.match(report.evidence.reason, /none produced readable evidence/);
+    // The remediation has to be true for the path that closed the gate. A binary change cannot be
+    // reviewed from evidence at all, so the message must not offer only text-file remedies.
+    assert.match(report.evidence.reason, /a binary file produces neither/);
+
+    const launch = await runtime.launch({ name: 'code-review', args: { prompt: 'Review it' } });
+    await collectEvents(runtime, launch.taskId);
+    assert.equal(runtime.get(launch.taskId).status, 'failed');
+    assert.equal(backend.requests.length, 0, 'no agent may spend when nothing is readable');
+
+    // Control: a small file of the same admitted kind opens the gate, so the rule keys on readability.
+    await writeFile(join(root, 'src', 'Small.java'), 'class Small { void ok() {} }\n');
+    const ready = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.equal(ready.evidence.gated, false);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a filename ending in whitespace is not admitted as evidence', async () => {
+  // Refs travel as lines and every consumer of that protocol trims a line — including the built-in
+  // script's own section parser. Publishing `file:src/app.ts ` therefore handed the reviewer a ref that
+  // reads back as a different, nonexistent file: citing the real path was rejected as unsupported while
+  // citing the published ref pointed nowhere. Such a name is excluded, with the reason named.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { evidenceScope: 'all' } });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src', 'app.ts '), 'export const trailing = 1;\n');
+
+    const report = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.equal(report.evidence.gated, true);
+    assert.deepEqual(report.evidence.allowedEvidenceRefs, [], 'no ref may name a path the protocol cannot carry');
+    assert.ok(
+      report.evidence.unavailableEvidence.includes('unavailable:git-status-path:1:unrepresentable-path'),
+      JSON.stringify(report.evidence.unavailableEvidence),
+    );
+
+    // Control: leading whitespace is interior to the ref line, so it survives and stays admissible.
+    await writeFile(join(root, 'src', ' leading.ts'), 'export const leading = 1;\n');
+    const withLeading = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.equal(withLeading.evidence.gated, false);
+    assert.equal(withLeading.evidence.allowedEvidenceRefs.includes('file:src/ leading.ts'), true);
+    assert.equal(
+      withLeading.evidence.allowedEvidenceRefs.some((ref) => ref.includes('app.ts')),
+      false,
+      'the unrepresentable path stays out even once the gate opens',
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('an admitted path that cannot be read gets no citable file ref', async () => {
+  // A `file:` ref is a licence to cite the file's contents. When one path is readable the gate opens, so
+  // an unreadable sibling used to keep its ref and validation accepted citations to a change no agent
+  // ever received. Readability now decides publication, not just the gate.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { evidenceScope: 'all' } });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    // Readable: small, so its content block fits. Opens the gate on its own.
+    await writeFile(join(root, 'src', 'Small.java'), 'class Small { void ok() {} }\n');
+    // Unreadable: untracked (no patch) and over maxFileBytes (12,000), so no content block either.
+    await writeFile(join(root, 'src', 'Huge.java'), `class Huge { ${'/* pad */'.repeat(4000)} }\n`);
+
+    const report = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.equal(report.evidence.gated, false, 'the readable path must open the gate');
+    assert.equal(report.evidence.allowedEvidenceRefs.includes('file:src/Small.java'), true);
+    assert.equal(
+      report.evidence.allowedEvidenceRefs.includes('file:src/Huge.java'),
+      false,
+      'an unreadable path must not be citable',
+    );
+    // Withheld, not silently absent: the count is disclosed as unavailable evidence.
+    assert.ok(
+      report.evidence.unavailableEvidence.some((token) => token === 'unavailable:file-evidence:1:no-content-block-or-hunk'),
+      JSON.stringify(report.evidence.unavailableEvidence),
+    );
+
+    // Control: stage the big file so a diff exists, and its ref returns — the rule keys on readability,
+    // not on file size.
+    await gitLines(root, ['add', '--', 'src/Huge.java']);
+    const staged = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.equal(staged.evidence.allowedEvidenceRefs.includes('file:src/Huge.java'), true);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('an evidence path is read before ordinary budget candidates', async () => {
+  // With 24 ordinary allowlisted changed paths ahead of it, an evidence-only path used to lose the
+  // maxFiles budget and reach the reviewer as a ref with no contents.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { evidenceScope: 'all' } });
+  try {
+    await initializeGitRepo(root);
+    // 30 tracked files with uncommitted edits: each has a hunk, so the reviewer can see them through
+    // the diff even without a content block. They fill the maxFiles budget (24) on their own.
+    for (let index = 0; index < 30; index += 1) {
+      const name = `a${String(index).padStart(2, '0')}.ts`;
+      await writeFile(join(root, name), `export const f${index} = ${index};\n`);
+    }
+    await gitLines(root, ['add', '-A']);
+    await gitLines(root, ['commit', '-m', 'tracked']);
+    for (let index = 0; index < 30; index += 1) {
+      await writeFile(join(root, `a${String(index).padStart(2, '0')}.ts`), `export const f${index} = ${index + 1};\n`);
+    }
+    // Untracked: git produces no patch for it, so a content block is the only way it can be seen.
+    await writeFile(join(root, 'zz.java'), 'class Zz { void late() {} }\n');
+
+    const launch = await runtime.launch({ name: 'code-review', args: { prompt: 'Review the change' } });
+    await collectEvents(runtime, launch.taskId);
+    assert.ok(backend.requests.length >= 1);
+    const prompt = backend.requests[0].messages.map((message) => message.content).join('\n');
+    assert.match(prompt, /--- zz\.java \(/, 'the evidence path must be read before the budget fills');
+    assert.match(prompt, /void late\(\)/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('evidenceScope all shows the admitted file contents, not just its path', async () => {
+  // An untracked .java has no unstaged patch, so if the budget allowlist also removed it from the
+  // included files the gate would open and agents would spend with a path and a status and nothing
+  // else — a blind review of the repositories this scope exists to support.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { evidenceScope: 'all' } });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src', 'App.java'), 'class App { void authority() {} }\n');
+
+    const launch = await runtime.launch({ name: 'code-review', args: { prompt: 'Review src/App.java' } });
+    await collectEvents(runtime, launch.taskId);
+    assert.ok(backend.requests.length >= 1, 'the gate must open under evidenceScope all');
+    const prompt = backend.requests[0].messages.map((message) => message.content).join('\n');
+    assert.match(prompt, /--- src\/App\.java \(/, 'the admitted file must reach an included-file block');
+    assert.match(prompt, /void authority\(\)/, 'its contents must be present, not only its path');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('an ambiguous rename header is left unparsed rather than misattributed', async () => {
+  // Renaming into a name that contains the header separator produces a symmetric split whose halves
+  // are a path that does not exist. Publishing a diff ref for it would let findings cite evidence
+  // attributed to the wrong file, so the header stays unparsed.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'foo.ts'), 'export const foo = 1;\n');
+    await gitLines(root, ['add', '--', 'foo.ts']);
+    await gitLines(root, ['commit', '-m', 'add foo']);
+    await mkdir(join(root, 'bar.ts b', 'foo.ts b'), { recursive: true });
+    await gitLines(root, ['mv', '--', 'foo.ts', join('bar.ts b', 'foo.ts b', 'bar.ts')]);
+    await gitLines(root, ['commit', '-m', 'rename into an ambiguous name']);
+
+    const report = await runtime.validateWorkflowInput({
+      name: 'code-review',
+      args: { prompt: 'Review the rename.', diffBaseRef: 'HEAD~1' },
+    });
+    const refs = report.evidence.allowedEvidenceRefs;
+    // Positive control: the real (renamed) path is published from the NUL name listing.
+    assert.equal(refs.includes('file:bar.ts b/foo.ts b/bar.ts'), true, JSON.stringify(refs));
+    // The fabricated symmetric path — the halves of the ambiguous header — must appear nowhere.
+    const fabricated = 'foo.ts b/bar.ts';
+    for (const ref of refs) {
+      const path = ref.startsWith('file:')
+        ? ref.slice('file:'.length)
+        : ref.replace(/^(diff|hunk):[a-z]+:/, '').replace(/:\d+$/, '');
+      assert.notEqual(path, fabricated, `misattributed ref published: ${ref}`);
+    }
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('an unsafe committed filename is excluded and reported', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'safe.ts'), 'export const safe = 1;\n');
+    // A newline in the name is exactly what the git-status parser already refuses.
+    await writeFile(join(root, 'un\nsafe.ts'), 'export const unsafe = 1;\n');
+    // Legal on POSIX, and safe by the same predicate: a backslash is not a control character. Normalizing
+    // it to a slash would name a nested path that does not exist, so the ref could not be read or cited.
+    await writeFile(join(root, 'back\\slash.ts'), 'export const literal = 1;\n');
+    await gitLines(root, ['add', '-A']);
+    await gitLines(root, ['commit', '-m', 'both']);
+
+    const report = await runtime.validateWorkflowInput({
+      name: 'code-review',
+      args: { prompt: 'Review the last commit.', diffBaseRef: 'HEAD~1' },
+    });
+    assert.equal(report.evidence.allowedEvidenceRefs.includes('file:safe.ts'), true);
+    assert.equal(report.evidence.allowedEvidenceRefs.includes('file:back\\slash.ts'), true);
+    assert.equal(report.evidence.allowedEvidenceRefs.includes('file:back/slash.ts'), false);
+    for (const ref of report.evidence.allowedEvidenceRefs) {
+      assert.ok(!ref.includes('\n'), `unsafe name reached a ref: ${JSON.stringify(ref)}`);
+    }
+    assert.ok(
+      report.evidence.unavailableEvidence.some((token) => token.includes('diff-committed-name')),
+      JSON.stringify(report.evidence.unavailableEvidence),
+    );
+
+    // A range whose only touched name is unsafe produces no ref at all. The gate must close, and the
+    // reason must account for the exclusion instead of claiming git reported nothing changed.
+    await writeFile(join(root, 'un\nsafe.ts'), 'export const unsafe = 2;\n');
+    await gitLines(root, ['add', '-A']);
+    await gitLines(root, ['commit', '-m', 'unsafe only']);
+    const gated = await runtime.validateWorkflowInput({
+      name: 'code-review',
+      args: { prompt: 'Review the last commit.', diffBaseRef: 'HEAD~1' },
+    });
+    assert.equal(gated.evidence.gated, true);
+    assert.match(gated.evidence.reason, /1 committed name\(s\) were excluded as unsafe paths/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a committed-range path is prioritized for an included-file block', async () => {
+  // Opening the gate is not enough — agents would spend without seeing the change. In a repository
+  // with more files than maxFiles, a committed-only path loses to the directory walk unless the
+  // evidence file paths are prioritized ahead of it.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    // Root-level fillers whose names sort before the reviewed file, so they compete for the same
+    // included-file budget (maxFiles is 24 by default).
+    for (let index = 0; index < 40; index += 1) {
+      const name = `a${String(index).padStart(2, '0')}.ts`;
+      await writeFile(join(root, name), `export const filler${index} = ${index};\n`);
+    }
+    await gitLines(root, ['add', '-A']);
+    await gitLines(root, ['commit', '-m', 'filler']);
+    await writeFile(join(root, 'reviewed.ts'), 'export const reviewed = 1;\n');
+    await gitLines(root, ['add', '--', 'reviewed.ts']);
+    await gitLines(root, ['commit', '-m', 'the one under review']);
+
+    const launch = await runtime.launch({
+      name: 'code-review',
+      args: { prompt: 'Review the last commit.', diffBaseRef: 'HEAD~1' },
+    });
+    await collectEvents(runtime, launch.taskId);
+    assert.ok(backend.requests.length >= 1);
+    const prompt = backend.requests[0].messages.map((message) => message.content).join('\n');
+    assert.match(prompt, /--- reviewed\.ts \(/, 'the committed path must reach an included-file block');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a nested built-in child is validated against its request contract', async () => {
+  // The contract applied only at top-level launch, so a parent could run the default review with a
+  // mistyped key — the silent spend the contract exists to stop.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({
+    backend, runtimeOptions: { nestedWorkflows: 'enabled' },
+  });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
+    const script = `export const meta = { name: "nested-parent", description: "calls a built-in" };
+return await workflow("code-review", { promt: "typo reaches the child" });`;
+    const launch = await runtime.launch({ script, args: {} });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.match(snapshot.error, /unknown workflow arg "promt" for built-in "code-review"/);
+    assert.equal(backend.requests.length, 0, 'the child must not spend before its contract is checked');
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a nested built-in child with valid args still runs (control)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({
+    backend, runtimeOptions: { nestedWorkflows: 'enabled' },
+  });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'docs'), { recursive: true });
+    await writeFile(join(root, 'docs', 'client-package-plan.md'), 'The platform token owns authority.\n');
+    const script = `export const meta = { name: "nested-parent", description: "calls a built-in" };
+return await workflow("code-review", { prompt: "Review docs/client-package-plan.md." });`;
+    const launch = await runtime.launch({ script, args: {} });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'completed', snapshot.error ?? '');
+    assert.ok(backend.requests.length >= 1);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('validation promotes a persisted built-in scriptPath like the launch path does', async () => {
+  // Passing the persisted scriptPath used to skip both the contract and the evidence preview, so the
+  // advertised zero-token pre-check disagreed with what a launch would do.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
+    const launch = await runtime.launch({ name: 'code-review', args: { prompt: 'Review pending.ts' } });
+    await collectEvents(runtime, launch.taskId);
+    const scriptPath = runtime.get(launch.taskId).scriptPath;
+    assert.ok(typeof scriptPath === 'string');
+
+    // The contract applies through the promoted path.
+    await assert.rejects(
+      () => runtime.validateWorkflowInput({ scriptPath, args: { prompt: 'x', level: 'medium' } }),
+      /workflow arg "level" for built-in "code-review" has an unsupported value "medium"/,
+    );
+    // And so does the evidence preview.
+    const report = await runtime.validateWorkflowInput({ scriptPath, args: { prompt: 'Review pending.ts' } });
+    assert.equal(report.workflowSource, 'built_in');
+    assert.ok(report.evidence, 'a promoted built-in must still get an evidence preview');
+    assert.equal(report.evidence.gated, false);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('an unmatched injected script under a built-in name is unknown provenance, not insensitive', async () => {
+  // The source ran the real policy-sensitive code-review under lenient; the resuming runtime injects a
+  // DIFFERENT script under that name. Duplicating the injected script per policy made it look
+  // insensitive and skipped the policy check entirely.
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-unmatched-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  await initializeGitRepo(root);
+  await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
+  const source = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'lenient',
+  });
+  let runId;
+  try {
+    const first = await source.launch({ name: 'code-review', args: { prompt: 'Review pending.ts' } });
+    await collectEvents(source, first.taskId);
+    runId = source.get(first.taskId).runId;
+  } finally {
+    await source.close();
+  }
+
+  const impostor = {
+    name: 'code-review',
+    script: 'export const meta = { name: "code-review", description: "impostor" };\nreturn { impostor: true };',
+  };
+  const strictRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    builtinWorkflows: [impostor],
+  });
+  try {
+    await assert.rejects(
+      () => strictRuntime.launch({ resumeFromRunId: runId }),
+      /under --ref-policy lenient, whose cached agent results were produced under different failure semantics/,
+    );
+  } finally {
+    await strictRuntime.close();
+  }
+});
+
+test('an injected built-in present in both runtimes resumes across policies', async () => {
+  // An injected builtinWorkflows list is static — one script for every policy — so nothing in it can
+  // depend on the ref policy and refusing its cross-policy resume is pure over-refusal. Contrast with
+  // the gone-review case above, where the resuming runtime does not ship the name at all.
+  const shared = {
+    name: 'shared-review',
+    script: 'export const meta = { name: "shared-review", description: "policy-independent" };\nreturn { shared: true };',
+  };
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-injected-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  const source = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    builtinWorkflows: [shared], refPolicy: 'lenient',
+  });
+  let runId;
+  try {
+    const first = await source.launch({ name: 'shared-review', args: {} });
+    await collectEvents(source, first.taskId);
+    runId = source.get(first.taskId).runId;
+    assert.ok(runId);
+  } finally {
+    await source.close();
+  }
+
+  const strictRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    builtinWorkflows: [shared],
+  });
+  try {
+    const resumed = await strictRuntime.launch({ resumeFromRunId: runId });
+    await collectEvents(strictRuntime, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(strictRuntime.get(resumed.taskId).status));
+  } finally {
+    await strictRuntime.close();
+  }
+});
+
+test('the journal always records the ref policy', async () => {
+  // Recorded unconditionally: omitting it for the default made absence ambiguous, because an
+  // intermediate build could write a lenient run with no field, and a resume then inferred strict.
+  for (const [refPolicy, expected] of [[undefined, 'strict'], ['strict', 'strict'], ['lenient', 'lenient']]) {
+    const root = await mkdtemp(join(tmpdir(), 'workflow-journal-policy-'));
+    tempDirs.push(root);
+    const runtime = new WorkflowTaskRegistry({
+      backend: new FakeSubagentBackend(), cwd: root, stateDir: join(root, '.ultracode-for-codex'),
+      requestTimeoutMs: 30_000, ...(refPolicy ? { refPolicy } : {}),
+    });
+    try {
+      const launch = await runtime.launch({ script: 'export const meta = { name: "policy-journal", description: "d" };\nreturn { ok: true };', args: {} });
+      await collectEvents(runtime, launch.taskId);
+      const snapshot = runtime.get(launch.taskId);
+      const journal = await readWorkflowJournal(workflowJournalPath(snapshot.transcriptDir));
+      const started = journal.entries.find((entry) => entry.kind === 'workflow.run.started');
+      assert.equal(started.runtime.refPolicy, expected, `refPolicy=${String(refPolicy)}`);
+    } finally {
+      await runtime.close();
+    }
+  }
+});
+
+test('a policy-insensitive built-in resumes across policies (false-positive control)', async () => {
+  // `task` generates the same script under every ref policy, so a cross-policy resume of it is not a
+  // mismatch. Without the policy-sensitivity guard the identity check would match the first variant
+  // and reject every such resume.
+  const backend = new FakeSubagentBackend();
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-insensitive-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  const strictRuntime = new WorkflowTaskRegistry({ backend, cwd: root, stateDir, requestTimeoutMs: 30_000 });
+  let runId;
+  try {
+    const first = await strictRuntime.launch({ name: 'task', args: { prompt: 'FAIL_AGENT analyze the package' } });
+    await collectEvents(strictRuntime, first.taskId);
+    runId = strictRuntime.get(first.taskId).runId;
+    assert.ok(runId);
+  } finally {
+    await strictRuntime.close();
+  }
+
+  const lenientRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'lenient',
+  });
+  try {
+    const resumed = await lenientRuntime.launch({ resumeFromRunId: runId });
+    await collectEvents(lenientRuntime, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(lenientRuntime.get(resumed.taskId).status));
+  } finally {
+    await lenientRuntime.close();
+  }
+});
+
+test('validation preview carries git-status failures like the run does', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend });
+  try {
+    // No initializeGitRepo: the workspace is not a repository, so status collection fails.
+    const report = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review.' } });
+    assert.equal(report.evidence.gated, true);
+    assert.ok(
+      report.evidence.unavailableEvidence.some((token) => token.startsWith('unavailable:git-status')),
+      `preview dropped the status failure: ${JSON.stringify(report.evidence.unavailableEvidence)}`,
+    );
+    assert.equal(backend.requests.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('validation preview reports no status failure inside a repository (control)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    const report = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review.' } });
+    assert.equal(
+      report.evidence.unavailableEvidence.some((token) => token.startsWith('unavailable:git-status')),
+      false,
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a committed range narrowed by a path rule is named, not reported as "no changes"', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src', 'App.java'), 'class App {}\n');
+    await gitLines(root, ['add', 'src/App.java']);
+    await gitLines(root, ['commit', '-m', 'ship java']);
+
+    // Clean tree: the only evidence would come from the committed range, and its one file is
+    // extension-excluded. The gate must name that rule rather than claim git status found nothing.
+    const report = await runtime.validateWorkflowInput({
+      name: 'code-review',
+      args: { prompt: 'Review the last commit.', diffBaseRef: 'HEAD~1' },
+    });
+    assert.equal(report.evidence.gated, true);
+    assert.deepEqual(report.evidence.dropped, [{ path: 'src/App.java', rule: 'extension-not-allowed' }]);
+    assert.match(report.evidence.reason, /1 by extension-not-allowed \(src\/App\.java\)/);
+    assert.doesNotMatch(report.evidence.reason, /no changed or untracked paths/);
+
+    // Control: an admissible committed file opens the gate through the same range.
+    await writeFile(join(root, 'src', 'app.ts'), 'export const app = 1;\n');
+    await gitLines(root, ['add', 'src/app.ts']);
+    await gitLines(root, ['commit', '-m', 'ship ts']);
+    const ready = await runtime.validateWorkflowInput({
+      name: 'code-review',
+      args: { prompt: 'Review the last commit.', diffBaseRef: 'HEAD~1' },
+    });
+    assert.equal(ready.evidence.gated, false);
+    assert.equal(ready.evidence.allowedEvidenceRefs.includes('file:src/app.ts'), true);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('verifierAttempts counts verifier agents that ran, including dropped results', async () => {
+  const lenient = await runCodeReview({ marker: 'VERIFIER_BAD_REF', refPolicy: 'lenient' });
+  assert.equal(lenient.snapshot.status, 'completed', lenient.snapshot.error ?? '');
+  const stats = lenient.snapshot.result.stats;
+  assert.equal(stats.refDrops, 1);
+  assert.equal(lenient.snapshot.result.degraded.entries[0].stage, 'verifier');
+  // Two verifiers ran and consumed tokens; one result was dropped.
+  assert.equal(stats.verifierAttempts, 2);
+  assert.equal(stats.candidates, 1);
+
+  // Control: strict still fails on the same fixture.
+  const strict = await runCodeReview({ marker: 'VERIFIER_BAD_REF', refPolicy: 'strict' });
+  assert.equal(strict.snapshot.status, 'failed');
+  assert.match(strict.snapshot.error, /includes unsupported evidence ref file:outside\.md/);
+});
+
+test('the change-evidence context has a pinned section order', async () => {
+  // The cross-family review's highest-severity issue was that this context changed unconditionally
+  // while the change claimed byte-identity. Identity with the previous release is genuinely broken and
+  // is now disclosed; this test pins the CURRENT shape so the next accidental change to what agents
+  // see — and therefore to contextHash and the agent cache keys derived from it — fails loudly here.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'docs'), { recursive: true });
+    await writeFile(join(root, 'docs', 'client-package-plan.md'), 'The platform token owns authority.\n');
+
+    const launch = await runtime.launch({ name: 'code-review', args: { prompt: 'Review.' } });
+    await collectEvents(runtime, launch.taskId);
+    assert.ok(backend.requests.length >= 1);
+    const prompt = backend.requests[0].messages.map((message) => message.content).join('\n');
+
+    const expected = [
+      // The gate now sits in the top-level header, because it is decided after file selection rather
+      // than inside the change-evidence block.
+      'evidenceGate: ',
+      'evidenceGateReason: ',
+      '### Change Evidence',
+      'sourceSnapshotId: ',
+      'contextHash: ',
+      'allowedEvidenceIndexDigest: ',
+      'diffBaseRef: ',
+      'truncation: ',
+      'evidenceScope: ',
+      '#### Evidence Ref Grammar',
+      '#### Changed Files',
+      '#### Dropped From Evidence',
+      '#### Unstaged Diff',
+      '#### Staged Diff',
+      '#### Committed Diff',
+      '### Allowed Evidence Refs',
+      '### Unavailable Evidence',
+      '### Git Status',
+      '### Included Files',
+    ];
+    let cursor = -1;
+    for (const marker of expected) {
+      const at = prompt.indexOf(marker, cursor + 1);
+      assert.ok(at > cursor, `context marker out of order or missing: ${marker}`);
+      cursor = at;
+    }
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('the vacuous-pass rule also covers the no-active-lenses return', async () => {
+  // A scope-file drop plus a scope that selects no lens used to complete with an empty report and the
+  // scope agent's own summary — a degraded review that read as a clean one.
+  const dropped = await runCodeReview({ marker: 'SCOPE_NO_LENSES', refPolicy: 'lenient' });
+  assert.equal(dropped.snapshot.status, 'failed');
+  assert.match(dropped.snapshot.error, /no candidate survived 1 unsupported-evidence drop\(s\) at scope selection \(no active lenses\)/);
+  assert.match(dropped.snapshot.error, /inconclusive, not clean/);
+
+  // Control: no drop and no lens still completes, so the guard keys on drops rather than on emptiness.
+  const clean = await runCodeReview({ marker: 'SCOPE_NO_LENSES_CLEAN', refPolicy: 'lenient' });
+  assert.equal(clean.snapshot.status, 'completed', clean.snapshot.error ?? '');
+  assert.equal(clean.snapshot.result.degraded, null);
+  assert.equal(clean.snapshot.result.findings.length, 0);
+});
+
+test('a drive-letter absolute cited path is structural at every policy', async () => {
+  for (const refPolicy of ['lenient', 'strict']) {
+    const { snapshot } = await runCodeReview({ marker: 'DRIVE_ABSOLUTE_REF', refPolicy });
+    assert.equal(snapshot.status, 'failed', refPolicy);
+    assert.match(snapshot.error, /structural/, refPolicy);
+    assert.match(snapshot.error, /references a path outside the workspace: C:\/Users\/someone\/outside\.md/, refPolicy);
+  }
+});
+
+test('refPolicy lenient leaves a clean run unchanged (degraded absent)', async () => {
+  const lenient = await runCodeReview({ marker: 'CLEAN_RUN', refPolicy: 'lenient' });
+  const strict = await runCodeReview({ marker: 'CLEAN_RUN', refPolicy: 'strict' });
+  assert.equal(lenient.snapshot.status, 'completed', lenient.snapshot.error ?? '');
+  assert.equal(lenient.snapshot.result.degraded, null);
+  assert.equal(lenient.snapshot.result.stats.refDrops, 0);
+  assert.equal(lenient.snapshot.result.findings.length, strict.snapshot.result.findings.length);
+  assert.equal(lenient.snapshot.result.summary, strict.snapshot.result.summary);
+});
+
+test('refPolicy lenient drops one scope file, and fails when every scope file drops', async () => {
+  const partial = await runCodeReview({ marker: 'SCOPE_FILE_PARTIAL', refPolicy: 'lenient' });
+  assert.equal(partial.snapshot.status, 'completed', partial.snapshot.error ?? '');
+  assert.equal(partial.snapshot.result.degraded.refDrops, 1);
+  assert.equal(partial.snapshot.result.degraded.entries[0].stage, 'scope.files');
+  // The second scope file is the one that dropped; the first survived and the review proceeded.
+  assert.match(partial.snapshot.result.degraded.entries[0].label, /scope\.files\[1\]/);
+  assert.ok(partial.snapshot.result.findings.length >= 1);
+
+  const all = await runCodeReview({ marker: 'SCOPE_FILE_ALL_INVALID', refPolicy: 'lenient' });
+  assert.equal(all.snapshot.status, 'failed');
+  assert.match(all.snapshot.error, /every scope file was dropped as unsupported evidence/);
+
+  const strict = await runCodeReview({ marker: 'SCOPE_FILE_PARTIAL', refPolicy: 'strict' });
+  assert.equal(strict.snapshot.status, 'failed');
+  assert.match(strict.snapshot.error, /references unsupported file/);
+});
+
+test('refPolicy lenient keeps a workspace-escaping path fatal (structural, not a grammar slip)', async () => {
+  for (const refPolicy of ['lenient', 'strict']) {
+    const { snapshot } = await runCodeReview({ marker: 'TRAVERSAL_REF', refPolicy });
+    assert.equal(snapshot.status, 'failed', refPolicy);
+    assert.match(snapshot.error, /structural/, refPolicy);
+    assert.match(snapshot.error, /references a path outside the workspace: \.\.\/outside\.md/, refPolicy);
+  }
+});
+
+test('refPolicy lenient keeps lens decisions fatal (a premise is not an item)', async () => {
+  const { snapshot, backend } = await runCodeReview({ marker: 'SCOPE_DECISION_INVALID', refPolicy: 'lenient' });
+  assert.equal(snapshot.status, 'failed');
+  assert.match(snapshot.error, /includes unsupported decision ref file:outside\.md/);
+  // It fails at scope, before any finder or verifier spends.
+  assert.equal(backend.requests.length, 1);
+});
+
+test('code-review still fails closed on a ref whose path is not in evidence (normalization control)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'docs'), { recursive: true });
+    await writeFile(join(root, 'docs', 'client-package-plan.md'), 'The platform token owns authority.\n');
+
+    const launch = await runtime.launch({
+      name: 'code-review',
+      args: { prompt: 'INVALID_EVIDENCE_REF Review docs/client-package-plan.md.' },
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.match(snapshot.error, /includes unsupported evidence ref file:outside\.md/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('an extension-only gate failure names --evidence-scope all', async () => {
+  // Telling a Java-only repository to "change a file whose extension is in the allowlist" hides the
+  // supported answer and reads as "rename your code".
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src', 'App.java'), 'class App {}\n');
+
+    const report = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.equal(report.evidence.gated, true);
+    assert.match(report.evidence.reason, /pass --evidence-scope all to forgive the extension allowlist/);
+    assert.doesNotMatch(
+      report.evidence.reason,
+      /change a file whose extension is in the evidence allowlist/,
+      'the extension-only case must not offer the rename remedy at all',
+    );
+
+    // Control: add an excluded-dir drop, so the rules are mixed and the generic remedy leads again.
+    await mkdir(join(root, 'dist'), { recursive: true });
+    await writeFile(join(root, 'dist', 'bundle.js'), 'export const bundled = 1;\n');
+    const mixed = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.match(mixed.evidence.reason, /change a file whose extension is in the evidence allowlist/);
+    assert.match(mixed.evidence.reason, /or pass --evidence-scope all to forgive the extension allowlist for those paths/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('built-in code-review gate names the rule that dropped each changed path', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await mkdir(join(root, 'dist'), { recursive: true });
+    await writeFile(join(root, 'src', 'App.java'), 'class App {}\n');
+    await writeFile(join(root, 'Dockerfile'), 'FROM scratch\n');
+    await writeFile(join(root, 'dist', 'bundle.js'), 'export const built = 1;\n');
+
+    const launch = await runtime.launch({
+      name: 'code-review',
+      args: { prompt: 'Review the pending change.' },
+    });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.match(snapshot.error, /git status reported 3 changed path\(s\), all dropped before becoming evidence/);
+    assert.match(snapshot.error, /2 by extension-not-allowed/);
+    assert.match(snapshot.error, /src\/App\.java/);
+    assert.match(snapshot.error, /Dockerfile/);
+    assert.match(snapshot.error, /1 by excluded-dir/);
+    assert.match(snapshot.error, /dist\/bundle\.js/);
+    assert.equal(backend.requests.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('workspace evidence discloses dropped paths and the ref grammar to the reviewer', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src', 'App.java'), 'class App {}\n');
+    await writeFile(join(root, 'notes.md'), 'A pending note.\n');
+
+    const launch = await runtime.launch({
+      name: 'code-review',
+      args: { prompt: 'Review the pending change.' },
+    });
+    await collectEvents(runtime, launch.taskId);
+    // The gate opened on notes.md, so the scope agent ran and received the evidence context.
+    assert.ok(backend.requests.length >= 1);
+    const prompt = backend.requests[0].messages.map((message) => message.content).join('\n');
+    assert.match(prompt, /#### Dropped From Evidence/);
+    assert.match(prompt, /src\/App\.java \(extension-not-allowed: not citable, contents withheld\)/);
+    assert.match(prompt, /#### Evidence Ref Grammar/);
+    assert.match(prompt, /Do not append a line/);
+    assert.match(prompt, /per-file hunk index, not a line number/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('built-in code-review reviews a committed range when diffBaseRef resolves on a clean tree', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'shipped.ts'), 'export const shipped = 1;\n');
+    await gitLines(root, ['add', 'shipped.ts']);
+    await gitLines(root, ['commit', '-m', 'ship']);
+
+    const launch = await runtime.launch({
+      name: 'code-review',
+      args: { prompt: 'Review the last commit.', diffBaseRef: 'HEAD~1' },
+    });
+    await collectEvents(runtime, launch.taskId);
+    // Gate opened from the committed range alone: the working tree is clean.
+    assert.ok(backend.requests.length >= 1);
+    const prompt = backend.requests[0].messages.map((message) => message.content).join('\n');
+    assert.match(prompt, /evidenceGate: open/);
+    assert.match(prompt, /file:shipped\.ts/);
+    assert.match(prompt, /diff:committed:shipped\.ts/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a clean tree without diffBaseRef stays gated (negative control for committed-range review)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'shipped.ts'), 'export const shipped = 1;\n');
+    await gitLines(root, ['add', 'shipped.ts']);
+    await gitLines(root, ['commit', '-m', 'ship']);
+
+    const launch = await runtime.launch({ name: 'code-review', args: { prompt: 'Review.' } });
+    await collectEvents(runtime, launch.taskId);
+    const snapshot = runtime.get(launch.taskId);
+    assert.equal(snapshot.status, 'failed');
+    assert.match(snapshot.error, /no reviewable change evidence in the working tree/);
+    assert.equal(backend.requests.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('evidenceScope all admits extension-excluded sources and only those (both directions)', async () => {
+  for (const scope of ['default', 'all']) {
+    const backend = new FakeSubagentBackend();
+    const { runtime, root } = await createRuntime({ backend, runtimeOptions: { evidenceScope: scope } });
+    try {
+      await initializeGitRepo(root);
+      await mkdir(join(root, 'src'), { recursive: true });
+      await mkdir(join(root, 'dist'), { recursive: true });
+      await writeFile(join(root, 'src', 'App.java'), 'class App {}\n');
+      await writeFile(join(root, 'dist', 'bundle.js'), 'export const built = 1;\n');
+
+      const report = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review.' } });
+      if (scope === 'default') {
+        assert.equal(report.evidence.gated, true);
+        assert.equal(report.evidence.allowedFileRefs, 0);
+      } else {
+        assert.equal(report.evidence.gated, false);
+        assert.equal(report.evidence.allowedEvidenceRefs.includes('file:src/App.java'), true);
+        // 'all' forgives the extension rule and nothing else.
+        assert.equal(report.evidence.allowedEvidenceRefs.some((ref) => ref.includes('dist/bundle.js')), false);
+        assert.deepEqual(report.evidence.dropped, [{ path: 'dist/bundle.js', rule: 'excluded-dir' }]);
+      }
+      // A preflight preview never spends an agent.
+      assert.equal(backend.requests.length, 0);
+    } finally {
+      await runtime.close();
+    }
+  }
+});
+
+test('validateWorkflowInput reports the evidence precondition and rejects unreadable args', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src', 'App.java'), 'class App {}\n');
+
+    const gated = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review.' } });
+    assert.equal(gated.evidence.gated, true);
+    assert.match(gated.evidence.reason, /1 by extension-not-allowed \(src\/App\.java\)/);
+    assert.deepEqual(gated.evidence.dropped, [{ path: 'src/App.java', rule: 'extension-not-allowed' }]);
+
+    await writeFile(join(root, 'src', 'app.ts'), 'export const app = 1;\n');
+    const ready = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review.' } });
+    assert.equal(ready.evidence.gated, false);
+    assert.equal(ready.evidence.allowedFileRefs, 1);
+    assert.equal(ready.evidence.reason, undefined);
+
+    // The free pre-check also answers the request-contract question.
+    await assert.rejects(
+      () => runtime.validateWorkflowInput({ name: 'code-review', args: { promt: 'typo' } }),
+      /unknown workflow arg "promt"/,
+    );
+    // A non-evidence built-in reports no evidence section at all.
+    const task = await runtime.validateWorkflowInput({ name: 'task', args: { prompt: 'Analyze.' } });
+    assert.equal(task.evidence, undefined);
+    assert.equal(backend.requests.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('built-in request contract rejects unreadable args at launch with value, cause, and remediation', async () => {
+  const rejections = [
+    {
+      label: 'unknown key with a near match',
+      args: { promt: 'review the auth path' },
+      value: /unknown workflow arg "promt" for built-in "code-review"/,
+      cause: /would be silently ignored \(3 accepted keys: prompt, level, diffBaseRef\)/,
+      remediation: /did you mean "prompt"\?/,
+    },
+    {
+      label: 'unknown key with a prefix match',
+      args: { diffBase: 'HEAD~1' },
+      value: /unknown workflow arg "diffBase"/,
+      cause: /3 accepted keys/,
+      remediation: /did you mean "diffBaseRef"\?/,
+    },
+    {
+      label: 'unknown key with no near match',
+      args: { reviewDepth: 'max' },
+      value: /unknown workflow arg "reviewDepth"/,
+      cause: /would be silently ignored/,
+      remediation: /remove it, or use one of the accepted keys/,
+    },
+    {
+      label: 'unsupported enum value',
+      args: { level: 'medium' },
+      value: /workflow arg "level" for built-in "code-review" has an unsupported value "medium"/,
+      cause: /not one of the 2 supported values \("high", "xhigh"\), and an unrecognized value silently selects "xhigh"/,
+      remediation: /pass one of "high" or "xhigh" \(case-insensitive\)/,
+    },
+    {
+      label: 'wrong prompt type',
+      args: { prompt: 123 },
+      value: /workflow arg "prompt" for built-in "code-review" is not a non-empty string/,
+      cause: /received number, which the workflow would silently replace with its default/,
+      remediation: /omit "prompt" to accept the default deliberately/,
+    },
+    {
+      label: 'args that are not an object',
+      args: [],
+      value: /workflow args for built-in "code-review" must be a JSON object/,
+      cause: /received an array/,
+      remediation: /pass an object with the 3 accepted keys/,
+    },
+    {
+      label: 'unresolvable diffBaseRef',
+      args: { diffBaseRef: 'no-such-ref' },
+      value: /workflow arg "diffBaseRef" for built-in "code-review" does not resolve to a commit: "no-such-ref"/,
+      cause: /git rev-parse --verify rejected it in /,
+      remediation: /omit "diffBaseRef" to review only the working tree/,
+    },
+  ];
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
+    for (const rejection of rejections) {
+      let message = '';
+      try {
+        await runtime.launch({ name: 'code-review', args: rejection.args });
+        assert.fail(`expected rejection for ${rejection.label}`);
+      } catch (err) {
+        message = err.message;
+      }
+      assert.match(message, rejection.value, rejection.label);
+      assert.match(message, rejection.cause, rejection.label);
+      assert.match(message, rejection.remediation, rejection.label);
+    }
+    // Rejections happen before any journal or spend.
+    assert.equal(backend.requests.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('built-in request contract accepts documented args (negative control) and honors level case-insensitively', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
+
+    const accepted = [
+      { args: { prompt: 'Review pending.ts', level: 'high' }, effort: 'medium' },
+      { args: { prompt: 'Review pending.ts', level: 'HIGH' }, effort: 'medium' },
+      { args: { prompt: 'Review pending.ts', level: 'xhigh' }, effort: 'xhigh' },
+      { args: { prompt: 'Review pending.ts' }, effort: 'xhigh' },
+    ];
+    for (const entry of accepted) {
+      backend.requests.length = 0;
+      const launch = await runtime.launch({ name: 'code-review', args: entry.args });
+      await collectEvents(runtime, launch.taskId);
+      assert.ok(backend.requests.length >= 1, JSON.stringify(entry.args));
+      assert.equal(backend.requests[0].reasoningEffort, entry.effort, JSON.stringify(entry.args));
+    }
   } finally {
     await runtime.close();
   }
@@ -2845,6 +4489,8 @@ async function createRuntime({ backend, runtimeOptions = {} }) {
       nestedWorkflows: runtimeOptions.nestedWorkflows,
       agentTypes: runtimeOptions.agentTypes,
       builtinWorkflows: runtimeOptions.builtinWorkflows,
+      evidenceScope: runtimeOptions.evidenceScope,
+      refPolicy: runtimeOptions.refPolicy,
       journalDurability: runtimeOptions.journalDurability,
     }),
   };
@@ -2907,7 +4553,7 @@ class FakeSubagentBackend {
         });
       }
       if (isReviewScopeSchema(schema)) {
-        return structuredToolResult(fakeReviewScope());
+        return structuredToolResult(fakeReviewScope(workflowPrompt));
       }
       if (isReviewFinderSchema(schema)) {
         if (/Code-review Finder[\s\S]*Lens key: security-boundary/.test(workflowPrompt)) await sleep(80);
@@ -2998,18 +4644,40 @@ function fakePhasePlan(prompt) {
   };
 }
 
-function fakeReviewScope() {
+function fakeReviewScope(prompt = '') {
+  const files = /SCOPE_FILE_ALL_INVALID/.test(prompt)
+    ? ['outside.md']
+    : /SCOPE_FILE_PARTIAL/.test(prompt)
+      ? ['docs/client-package-plan.md', 'outside.md']
+      : ['docs/client-package-plan.md'];
+  const decisionRef = /SCOPE_DECISION_INVALID/.test(prompt) ? 'file:outside.md' : 'file:docs/client-package-plan.md';
+  // The sweep finder's prompt carries the scope block but not the user prompt, so a sweep marker has
+  // to travel through scope.instructions.
+  const sweepMarker = /SWEEP_ONLY_DROP/.test(prompt)
+    ? 'SWEEP_ONLY_DROP'
+    : /SWEEP_RESCUE/.test(prompt) ? 'SWEEP_RESCUE' : '';
+  // A scope that selects no lens at all reaches the early return, which must obey the same
+  // vacuous-pass rule as candidate verification.
+  if (/SCOPE_NO_LENSES/.test(prompt)) {
+    return {
+      files: /SCOPE_NO_LENSES_CLEAN/.test(prompt) ? ['docs/client-package-plan.md'] : ['docs/client-package-plan.md', 'outside.md'],
+      summary: 'No lens applies to this change.',
+      instructions: '',
+      lensDecisions: [],
+      lenses: [],
+    };
+  }
   return {
-    files: ['docs/client-package-plan.md'],
+    files,
     summary: 'Review the client package plan and authority binding claims.',
-    instructions: 'Prioritize material runtime contract and boundary risks.',
+    instructions: `Prioritize material runtime contract and boundary risks. ${sweepMarker}`.trim(),
     lensDecisions: [
       {
         seedId: 'cross-file-contract',
         action: 'select',
         selectedLensId: 'runtime-contract',
         reasonCategory: 'matched_change',
-        decisionRefs: ['file:docs/client-package-plan.md'],
+        decisionRefs: [decisionRef],
         reason: 'The plan changes runtime and package contract behavior.',
       },
       {
@@ -3017,7 +4685,7 @@ function fakeReviewScope() {
         action: 'select',
         selectedLensId: 'security-boundary',
         reasonCategory: 'prompt_risk',
-        decisionRefs: ['file:docs/client-package-plan.md'],
+        decisionRefs: [decisionRef],
         reason: 'Authority binding requires boundary review.',
       },
     ],
@@ -3039,7 +4707,51 @@ function fakeReviewScope() {
 }
 
 function fakeReviewFinder(prompt) {
-  if (/Code-review Sweep Finder/.test(prompt) || /Lens key: security-boundary/.test(prompt)) {
+  const sweep = /Code-review Sweep Finder/.test(prompt);
+  // Lens finders stay empty and only the sweep emits, so a drop can appear after the point where the
+  // vacuous-pass guard used to run.
+  if (/SWEEP_ONLY_DROP/.test(prompt)) {
+    return sweep
+      ? {
+        candidates: [{
+          file: 'docs/client-package-plan.md',
+          line: 1,
+          summary: 'Sweep candidate citing evidence that does not exist.',
+          failureScenario: 'A sweep-only drop must not produce a completed review.',
+          evidenceRefs: ['file:outside.md'],
+          kind: 'coverage',
+        }],
+      }
+      : { candidates: [] };
+  }
+  // A lens candidate drops and the sweep then supplies a usable one: the guard must not have failed
+  // the run before the sweep had its chance.
+  if (/SWEEP_RESCUE/.test(prompt)) {
+    // Only the first lens emits, so exactly one drop is expected.
+    if (!sweep && /Lens key: security-boundary/.test(prompt)) return { candidates: [] };
+    return sweep
+      ? {
+        candidates: [{
+          file: 'docs/client-package-plan.md',
+          line: 3,
+          summary: 'Sweep candidate citing evidence that exists.',
+          failureScenario: 'It must survive and be reported.',
+          evidenceRefs: ['file:docs/client-package-plan.md'],
+          kind: 'coverage',
+        }],
+      }
+      : {
+        candidates: [{
+          file: 'docs/client-package-plan.md',
+          line: 1,
+          summary: 'Lens candidate citing evidence that does not exist.',
+          failureScenario: 'It is dropped under lenient policy.',
+          evidenceRefs: ['file:outside.md'],
+          kind: 'contract',
+        }],
+      };
+  }
+  if (sweep || /Lens key: security-boundary/.test(prompt)) {
     return { candidates: [] };
   }
   if (/INVALID_EVIDENCE_REF/.test(prompt)) {
@@ -3050,6 +4762,136 @@ function fakeReviewFinder(prompt) {
         summary: 'This candidate intentionally references unsupported evidence.',
         failureScenario: 'The workflow should fail before verification.',
         evidenceRefs: ['file:outside.md'],
+        kind: 'contract',
+      }],
+    };
+  }
+  // The two ref shapes observed in real rejected runs: a file: ref with a line number appended, and
+  // a diff:unstaged: guess for a path that exists only as file: (an untracked file).
+  if (/VERIFIER_BAD_REF/.test(prompt)) {
+    return {
+      candidates: [
+        {
+          file: 'docs/client-package-plan.md',
+          line: 1,
+          summary: 'This candidate is verified normally.',
+          failureScenario: 'It must survive its sibling verifier being dropped.',
+          evidenceRefs: ['file:docs/client-package-plan.md'],
+          kind: 'contract',
+        },
+        {
+          file: 'docs/client-package-plan.md',
+          line: 3,
+          summary: 'VERIFIER_BAD_REF_MARK this candidate gets a verifier that cites unsupported evidence.',
+          failureScenario: 'The verifier result is dropped while the run continues.',
+          evidenceRefs: ['file:docs/client-package-plan.md'],
+          kind: 'coverage',
+        },
+      ],
+    };
+  }
+  if (/DRIVE_RELATIVE_REF/.test(prompt)) {
+    return {
+      candidates: [{
+        file: 'docs/client-package-plan.md',
+        line: 1,
+        summary: 'This candidate cites a drive-RELATIVE name, which is a legal POSIX filename.',
+        failureScenario: 'It must be an ordinary unsupported-evidence drop, not a structural violation.',
+        evidenceRefs: ['file:C:foo.md'],
+        kind: 'contract',
+      }],
+    };
+  }
+  if (/DRIVE_ABSOLUTE_REF/.test(prompt)) {
+    return {
+      candidates: [{
+        file: 'docs/client-package-plan.md',
+        line: 1,
+        summary: 'This candidate cites a drive-letter absolute path.',
+        failureScenario: 'A drive-absolute path escapes the workspace exactly like a POSIX absolute path.',
+        evidenceRefs: ['file:C:/Users/someone/outside.md'],
+        kind: 'contract',
+      }],
+    };
+  }
+  if (/TRAVERSAL_REF/.test(prompt)) {
+    return {
+      candidates: [{
+        file: 'docs/client-package-plan.md',
+        line: 1,
+        summary: 'This candidate cites a path that escapes the workspace.',
+        failureScenario: 'A structural violation must not be degraded into a drop.',
+        evidenceRefs: ['file:../outside.md'],
+        kind: 'contract',
+      }],
+    };
+  }
+  if (/COLON_INDEX_REF_PLAIN/.test(prompt)) {
+    return {
+      candidates: [{
+        file: 'issue.md',
+        line: 1,
+        summary: 'Same kind mismatch, ordinary filename.',
+        failureScenario: 'This one always normalized; it is the control for the colon-suffix case.',
+        evidenceRefs: ['diff:unstaged:issue.md'],
+        kind: 'contract',
+      }],
+    };
+  }
+  if (/COLON_INDEX_REF/.test(prompt)) {
+    return {
+      candidates: [{
+        file: 'issue:123',
+        line: 1,
+        summary: 'This candidate cites a real file whose name ends in a colon and digits.',
+        failureScenario: 'The kind is wrong, but the path is exact: normalization must not read ":123" as an index.',
+        evidenceRefs: ['diff:unstaged:issue:123'],
+        kind: 'contract',
+      }],
+    };
+  }
+  if (/PARTIAL_INVALID_REF/.test(prompt)) {
+    return {
+      candidates: [
+        {
+          file: 'docs/client-package-plan.md',
+          line: 1,
+          summary: 'This candidate cites a path that is not in evidence at all.',
+          failureScenario: 'Under lenient it is dropped; under strict it fails the run.',
+          evidenceRefs: ['file:outside.md'],
+          kind: 'contract',
+        },
+        {
+          file: 'docs/client-package-plan.md',
+          line: 3,
+          summary: 'This candidate cites evidence that exists.',
+          failureScenario: 'It must survive a sibling candidate being dropped.',
+          evidenceRefs: ['file:docs/client-package-plan.md'],
+          kind: 'contract',
+        },
+      ],
+    };
+  }
+  if (/LINE_SUFFIX_REF/.test(prompt)) {
+    return {
+      candidates: [{
+        file: 'docs/client-package-plan.md:1',
+        line: 1,
+        summary: 'This candidate cites a file ref with a line number appended.',
+        failureScenario: 'A caller reading the report needs the cited path to resolve.',
+        evidenceRefs: ['file:docs/client-package-plan.md:1'],
+        kind: 'contract',
+      }],
+    };
+  }
+  if (/KIND_MISMATCH_REF/.test(prompt)) {
+    return {
+      candidates: [{
+        file: 'docs/client-package-plan.md',
+        line: 1,
+        summary: 'This candidate guesses a diff ref kind that this snapshot never produced.',
+        failureScenario: 'A caller reading the report needs the cited path to resolve.',
+        evidenceRefs: ['diff:unstaged:docs/client-package-plan.md'],
         kind: 'contract',
       }],
     };
@@ -3078,6 +4920,16 @@ function fakeReviewFinder(prompt) {
 
 function fakeReviewVerifier(prompt) {
   const second = /candidate_runtime-contract_2|candidate_sweep_2/.test(prompt);
+  // Only the second candidate's verifier cites unsupported evidence, so one verifier result is
+  // dropped while the run still completes — the case where attempt accounting used to under-report.
+  if (/VERIFIER_BAD_REF_MARK/.test(prompt)) {
+    return {
+      verdict: 'CONFIRMED',
+      evidence: 'This verifier cites a path that is not in evidence.',
+      evidenceRefs: ['file:outside.md'],
+      severity: 'P2',
+    };
+  }
   return {
     verdict: 'CONFIRMED',
     evidence: second

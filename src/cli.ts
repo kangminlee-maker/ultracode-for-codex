@@ -10,7 +10,7 @@ import { createInterface } from 'node:readline/promises';
 import { CodexSubagentBackend } from './codex/subagent-backend.js';
 import { probeCodexSetup } from './codex/setup-probe.js';
 import { WorkflowTaskRegistry, isRetryableFailureReason } from './runtime/workflow-runtime.js';
-import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, isAgentConcurrencyKeyword, isAgentFileWrite, isAgentTypes, isAgentWebSearch, isNestedWorkflows, isWorktreeRetention, parseAgentMcpServerList } from './runtime/types.js';
+import { EVIDENCE_SCOPE_VALUES, REF_POLICY_VALUES, SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, isAgentConcurrencyKeyword, isAgentFileWrite, isAgentTypes, isAgentWebSearch, isEvidenceScope, isNestedWorkflows, isRefPolicy, isWorktreeRetention, parseAgentMcpServerList } from './runtime/types.js';
 import { loadAgentTypeRegistry } from './codex/agent-type-registry.js';
 import { codexSourceHome } from './codex/model-catalog.js';
 import { ultracodePackageVersion } from './runtime/package-info.js';
@@ -35,11 +35,13 @@ import {
   workflowDefaultAgentConcurrency,
   workflowDefaultNestedWorkflows,
   workflowDefaultAgentWebSearch,
+  workflowDefaultEvidenceScope,
+  workflowDefaultRefPolicy,
   workflowDefaultAgentFileWrite,
   workflowDefaultAgentMcpServers,
   workflowDefaultAgentTypes,
 } from './settings.js';
-import type { AgentConcurrency, AgentFileWrite, AgentMcpServers, AgentTypes, AgentWebSearch, NestedWorkflows, ReasoningEffort, ResolvedAgentType, Verbosity, WorktreeRetention } from './runtime/types.js';
+import type { AgentConcurrency, AgentFileWrite, AgentMcpServers, AgentTypes, AgentWebSearch, EvidenceScope, NestedWorkflows, ReasoningEffort, RefPolicy, ResolvedAgentType, Verbosity, WorktreeRetention } from './runtime/types.js';
 import type { WorkflowExecutionMode, WorkflowPermissionPolicy, WorkflowProgressMode } from './settings.js';
 import type {
   WorkflowEvent,
@@ -119,6 +121,19 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   const agentConcurrency = parseAgentConcurrency(options.agentConcurrency);
   const budgetTotal = parseBudget(options.budget);
   const nestedWorkflows = parseNestedWorkflows(options.nestedWorkflows);
+  const evidenceScope = parseEvidenceScope(options.evidenceScope);
+  const refPolicy = parseRefPolicy(options.refPolicy);
+  const progressMode = parseProgressMode(options.progress);
+  // With --progress jsonl on an attached run, stderr IS the event stream, and the background launcher
+  // redirects its child's stderr straight into progress.jsonl — so a plain notice there makes the file
+  // invalid JSONL and is counted as a malformed line. A background PARENT writes to the user's terminal,
+  // so it keeps the readable form.
+  const streamsJsonlEvents = executionMode !== 'background' && progressMode === 'jsonl';
+  // A loosened ref policy must not run unnoticed. Built-ins bypass the permission gate, so there is no
+  // prompt to carry this; announcing the resolved value catches a policy left on in settings.json too.
+  if (refPolicy !== 'strict') {
+    emitLaunchNotice(streamsJsonlEvents, `ref-policy=${refPolicy} — a review can complete with findings dropped; the result's degraded block lists them. Use --ref-policy strict to fail the run instead.`);
+  }
   const agentWebSearch = parseAgentWebSearch(options.agentWebSearch);
   const agentFileWrite = parseAgentFileWrite(options.agentFileWrite);
   const agentMcpServers = parseAgentMcpServers(options.agentMcp);
@@ -131,7 +146,6 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   const heartbeatMs = parseNonNegativeIntOption(options.heartbeatMs, workflowDefaultHeartbeatMs(), 'heartbeat-ms');
   const retryLimit = parseRetryLimit(options.retryLimit);
   const permissionPolicy = parsePermissionPolicy(options.permission);
-  const progressMode = parseProgressMode(options.progress);
   const input = await inputPromise;
   const resumeModel = input.resumeFromRunId && !options.model
     ? await resolveResumeBackendModel(cwd, input.resumeFromRunId)
@@ -144,7 +158,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
     || (input.resumeFromRunId ? await resumeUsedAgentTypes(cwd, input.resumeFromRunId) : false)
       ? 'enabled'
       : 'disabled';
-  const agentTypes = agentTypesGate === 'enabled' ? await loadEnabledAgentTypeRegistry() : undefined;
+  const agentTypes = agentTypesGate === 'enabled' ? await loadEnabledAgentTypeRegistry(streamsJsonlEvents) : undefined;
   const reasoningEffort = parseReasoningEffort(options.reasoningEffort);
   const backend = new CodexSubagentBackend({
     command: options.command,
@@ -167,6 +181,8 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
     agentConcurrency,
     budgetTotal,
     nestedWorkflows,
+    evidenceScope,
+    refPolicy,
     agentTypes,
   });
 
@@ -210,11 +226,17 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
 async function withPreflightRegistry<T>(
   cwd: string,
   fn: (runtime: WorkflowTaskRegistry) => Promise<T>,
+  evidenceScope?: EvidenceScope,
+  // The ref policy is part of the built-in script text, so validation must resolve the same script
+  // (and therefore the same scriptHash) the run would.
+  refPolicy?: RefPolicy,
 ): Promise<T> {
   const runtime = new WorkflowTaskRegistry({
     backend: PREFLIGHT_BACKEND,
     cwd,
     requestTimeoutMs: 0,
+    ...(evidenceScope ? { evidenceScope } : {}),
+    ...(refPolicy ? { refPolicy } : {}),
   });
   try {
     return await fn(runtime);
@@ -228,11 +250,23 @@ async function validateWorkflowCommand(
   cwd: string,
   options: ParsedOptions,
 ): Promise<number> {
-  const report = await withPreflightRegistry(cwd, (runtime) => runtime.validateWorkflowInput(input));
+  const report = await withPreflightRegistry(
+    cwd,
+    (runtime) => runtime.validateWorkflowInput(input),
+    parseEvidenceScope(options.evidenceScope),
+    parseRefPolicy(options.refPolicy),
+  );
   if (wantsPlain(options)) {
     process.stdout.write(`[validate] ${report.workflowName} (${report.workflowSource}) agents=${report.agentCallSites} schema=${report.schemaCallSites} keyed=${report.keyedCallSites}\n`);
     for (const warning of report.warnings) {
       process.stdout.write(`[validate] warning: ${warning}\n`);
+    }
+    if (report.evidence) {
+      process.stdout.write(`[validate] evidence: ${report.evidence.gated ? 'gated' : 'ready'} fileRefs=${report.evidence.allowedFileRefs} evidenceRefs=${report.evidence.allowedEvidenceRefs.length}\n`);
+      if (report.evidence.reason) process.stdout.write(`[validate] evidence: ${report.evidence.reason}\n`);
+      for (const dropped of report.evidence.dropped) {
+        process.stdout.write(`[validate] dropped: ${dropped.path} (${dropped.rule})\n`);
+      }
     }
   } else {
     process.stdout.write(`${JSON.stringify({
@@ -267,10 +301,17 @@ async function resumeUsedAgentTypes(cwd: string, runId: string): Promise<boolean
 // Load the native Codex agent-type registry (only when --agent-types is on), surfacing any skipped
 // files on stderr. Returns a map (possibly empty) so the runtime can distinguish gate-on-empty
 // ("unknown type") from gate-off (undefined → "requires --agent-types").
-async function loadEnabledAgentTypeRegistry(): Promise<ReadonlyMap<string, ResolvedAgentType>> {
+async function loadEnabledAgentTypeRegistry(streamsJsonlEvents: boolean): Promise<ReadonlyMap<string, ResolvedAgentType>> {
   const { registry, warnings } = await loadAgentTypeRegistry(join(codexSourceHome(), 'agents'));
-  for (const warning of warnings) process.stderr.write(`ultracode: ${warning}\n`);
+  for (const warning of warnings) emitLaunchNotice(streamsJsonlEvents, warning);
   return registry;
+}
+
+// One channel decision for every launch notice. Adding a plain write anywhere on this path reintroduces
+// the malformed-line defect, so notices go through here.
+function emitLaunchNotice(streamsJsonlEvents: boolean, message: string): void {
+  if (streamsJsonlEvents) writeJsonlProgress({ event: 'workflow.notice', summary: message });
+  else process.stderr.write(`ultracode: ${message}\n`);
 }
 
 const PREFLIGHT_BACKEND = {
@@ -309,6 +350,8 @@ interface ParsedOptions {
   readonly agentConcurrency?: string;
   readonly nestedWorkflows?: string;
   readonly agentWebSearch?: string;
+  readonly evidenceScope?: string;
+  readonly refPolicy?: string;
   readonly agentFileWrite?: string;
   readonly agentMcp?: string;
   readonly agentTypes?: string;
@@ -2141,6 +2184,20 @@ function parseAgentWebSearch(value: string | undefined): AgentWebSearch {
   throw new Error("agent-web-search must be 'disabled' or 'enabled'.");
 }
 
+function parseRefPolicy(value: string | undefined): RefPolicy {
+  if (value === undefined) return workflowDefaultRefPolicy();
+  const normalized = value.trim();
+  if (isRefPolicy(normalized)) return normalized;
+  throw new Error(`ref-policy must be one of ${REF_POLICY_VALUES.join(', ')}.`);
+}
+
+function parseEvidenceScope(value: string | undefined): EvidenceScope {
+  if (value === undefined) return workflowDefaultEvidenceScope();
+  const normalized = value.trim();
+  if (isEvidenceScope(normalized)) return normalized;
+  throw new Error(`evidence-scope must be one of ${EVIDENCE_SCOPE_VALUES.join(', ')}.`);
+}
+
 function parseAgentFileWrite(value: string | undefined): AgentFileWrite {
   if (value === undefined) return workflowDefaultAgentFileWrite();
   if (isAgentFileWrite(value)) return value;
@@ -2242,6 +2299,8 @@ Options:
   --worktree-retention <preserve-all|remove-clean>  Reclaim unchanged completed isolated worktrees. Default: settings.json (${workflowDefaultWorktreeRetention()}).
   --agent-concurrency <unbounded|auto|N>  Bound concurrent agent dispatches per run. 'auto' = min(16, cores-2). Default: settings.json (${String(workflowDefaultAgentConcurrency())}).
   --nested-workflows <disabled|enabled>  Let a workflow run a built-in or inline child via workflow(). Default: settings.json (${workflowDefaultNestedWorkflows()}).
+  --evidence-scope <default|all>      Which changed paths may become citable review evidence. 'all' forgives only the extension allowlist (so .java/.rb/.sql projects are reviewable); excluded dirs, runtime state, and unsafe paths stay out. Run-level; re-pass on resume. Default: settings.json (${workflowDefaultEvidenceScope()}).
+  --ref-policy <strict|lenient>       What happens to a cited evidence ref that resolves to no path in evidence. 'strict' fails the run; 'lenient' drops that one candidate, discloses it in the result's degraded block, and fails only if every candidate dropped. Lens decisions and structural violations stay fatal either way. Built-in workflows are not permission-gated, so a policy switch is NOT confirmed by a prompt: a non-default policy is announced on stderr at launch instead. Default: settings.json (${workflowDefaultRefPolicy()}).
   --agent-web-search <disabled|enabled>  Let workflow subagents use the native web_search tool (run-level; re-pass on resume; results aren't reproducible on re-run). Default: settings.json (${workflowDefaultAgentWebSearch()}).
   --agent-file-write <disabled|enabled>  Let worktree-isolated subagents write files (write_file/str_replace, confined to the worktree; run-level; re-pass on resume). Default: settings.json (${workflowDefaultAgentFileWrite()}).
   --agent-mcp <server1,server2,...>  Let subagents call the named Codex MCP servers (allowlist; provisioned from your config.toml + auto-approved; run-level; re-pass on resume). Off when empty. Default: settings.json (${JSON.stringify(workflowDefaultAgentMcpServers())}).

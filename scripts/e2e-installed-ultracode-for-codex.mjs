@@ -67,6 +67,7 @@ try {
   await assertInstalledModelProfiles(installedCli);
   await assertNpmExecRun();
   await assertBackgroundDefault(installedCli);
+  await assertLaunchNoticeChannel(installedCli);
   await assertCliSmoke(installedCli);
   await assertBuiltinPlanProgress(installedCli);
   const codeReviewRun = await assertBuiltinCodeReviewJsonl(installedCli);
@@ -376,6 +377,42 @@ function installedProjectPermissionWorkflowSource() {
   description: "Verify packaged project workflow permission review"
 };
 return { source: "installed-project", value: args.value };`;
+}
+
+// A launch notice must not break the channel it is written to. The background launcher redirects its
+// child's stderr straight into progress.jsonl, so an unconditional plain line there made the file invalid
+// JSONL and was counted as a malformed line. The parent still writes the readable form to the terminal.
+async function assertLaunchNoticeChannel(installedCli) {
+  const result = runCli(installedCli, [
+    '--script',
+    'export const meta = { name: "installed-notice-channel" };\nreturn { ok: true };',
+    '--permission',
+    'allow',
+    '--ref-policy',
+    'lenient',
+  ]);
+  assert.equal(result.status, 0);
+  // The human launching it still gets a readable warning.
+  assert.match(result.stderr, /ultracode: ref-policy=lenient/);
+  const launch = JSON.parse(result.stdout);
+
+  await waitForJsonFile(launch.resultPath, REQUEST_TIMEOUT_MS);
+  const progress = await waitForProgressFile(launch.progressPath, REQUEST_TIMEOUT_MS);
+  const notice = assertProgressEvent(progress, 'workflow.notice');
+  assert.match(notice.summary, /ref-policy=lenient/);
+
+  // Every line, not just the ones the reader understood: the defect was a line that is not JSON at all.
+  const raw = await readFile(launch.progressPath, 'utf8');
+  const lines = raw.split('\n').filter(Boolean);
+  assert.ok(lines.length > 0);
+  for (const line of lines) {
+    JSON.parse(line);
+  }
+
+  const statusResult = runCliCommand(installedCli, 'status', [launch.jobId, '--cwd', consumerDir]);
+  assert.equal(statusResult.status, 0);
+  const status = JSON.parse(statusResult.stdout);
+  assert.equal(status.malformedProgressLineCount, 0);
 }
 
 async function assertBackgroundDefault(installedCli) {
