@@ -837,6 +837,54 @@ test('refPolicy lenient still fails when every candidate is dropped (no vacuous 
   assert.match(snapshot.error, /includes unsupported evidence ref file:outside\.md/);
 });
 
+test('the change-evidence context has a pinned section order', async () => {
+  // The cross-family review's highest-severity issue was that this context changed unconditionally
+  // while the change claimed byte-identity. Identity with the previous release is genuinely broken and
+  // is now disclosed; this test pins the CURRENT shape so the next accidental change to what agents
+  // see — and therefore to contextHash and the agent cache keys derived from it — fails loudly here.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'docs'), { recursive: true });
+    await writeFile(join(root, 'docs', 'client-package-plan.md'), 'The platform token owns authority.\n');
+
+    const launch = await runtime.launch({ name: 'code-review', args: { prompt: 'Review.' } });
+    await collectEvents(runtime, launch.taskId);
+    assert.ok(backend.requests.length >= 1);
+    const prompt = backend.requests[0].messages.map((message) => message.content).join('\n');
+
+    const expected = [
+      'sourceSnapshotId: ',
+      'contextHash: ',
+      'allowedEvidenceIndexDigest: ',
+      'diffBaseRef: ',
+      'truncation: ',
+      'evidenceScope: ',
+      'evidenceGate: ',
+      'evidenceGateReason: ',
+      '#### Evidence Ref Grammar',
+      '#### Changed Files',
+      '#### Dropped From Evidence',
+      '#### Unstaged Diff',
+      '#### Staged Diff',
+      '#### Committed Diff',
+      '### Allowed Evidence Refs',
+      '### Unavailable Evidence',
+      '### Git Status',
+      '### Included Files',
+    ];
+    let cursor = -1;
+    for (const marker of expected) {
+      const at = prompt.indexOf(marker, cursor + 1);
+      assert.ok(at > cursor, `context marker out of order or missing: ${marker}`);
+      cursor = at;
+    }
+  } finally {
+    await runtime.close();
+  }
+});
+
 test('the vacuous-pass rule also covers the no-active-lenses return', async () => {
   // A scope-file drop plus a scope that selects no lens used to complete with an empty report and the
   // scope agent's own summary — a degraded review that read as a clean one.
