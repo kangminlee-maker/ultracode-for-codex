@@ -944,11 +944,24 @@ async function validateBuiltinRequestArgs(name: string, args: unknown, cwd: stri
   }
   for (const key of contract.arrays ?? []) {
     if (record[key] === undefined) continue;
-    if (!Array.isArray(record[key])) {
+    const value = record[key];
+    if (!Array.isArray(value)) {
       throw requestContractError(
         `workflow arg "${key}" for built-in "${name}" is not an array`,
-        `received ${typeof record[key]}, which the workflow would read as zero entries`,
+        `received ${typeof value}, which the workflow would read as zero entries`,
         `pass a JSON array of values for "${key}"`,
+      );
+    }
+    // Container shape alone is not the contract. A null, object, or blank element used to be string-
+    // coerced into an agent prompt, so a deterministically meaningless request reached spend.
+    for (const [index, entry] of value.entries()) {
+      if (typeof entry === 'string' && entry.trim()) continue;
+      throw requestContractError(
+        `workflow arg "${key}[${index}]" for built-in "${name}" is not a usable string`,
+        typeof entry === 'string'
+          ? 'received an empty or whitespace-only string, which would spend an agent on an empty prompt'
+          : `received ${entry === null ? 'null' : Array.isArray(entry) ? 'an array' : typeof entry}, which the workflow would coerce to text before sending it to an agent`,
+        `pass a non-empty string at index ${index} of "${key}", or remove that entry`,
       );
     }
   }
@@ -1217,25 +1230,63 @@ function assertNoVacuousPass(survivingCount, stage) {
 // rose while stats.dropped.unsupportedEvidence stayed 0 and the two accountings contradicted each other.
 // The committed design (docs/20260727-r6-ref-drop-policy-design.md) keeps stats.dropped the single drop
 // surface and preserves the provenance that the candidate existed and why it left.
+// Three different lifecycle events reach this recorder: scope narrowing, a rejected candidate, and a lost
+// verifier result. Folding them into one candidate-shaped row made the audit record misstate which one
+// happened, so the subject travels with the drop.
+function refDropSubject(stage) {
+  if (stage === "scope.files") return "scope_file";
+  if (stage === "verifier" || stage === "sweep-verifier") return "verifier_result";
+  return "candidate";
+}
+function boundedDropText(value, limit) {
+  const rendered = text(value == null ? "" : value);
+  return rendered.length > limit ? rendered.slice(0, limit) + " (truncated)" : rendered;
+}
+// What was lost, not only that something was. A degraded result that cannot name the suspected defect
+// leaves the reader unable to judge the omission or target a rerun.
+function refDropSubjectProjection(subject, raw) {
+  if (subject === "scope_file") return { candidateId: "", file: boundedDropText(raw, 200), claim: "" };
+  if (raw == null || typeof raw !== "object") return { candidateId: "", file: "", claim: "" };
+  const inner = raw.candidate && typeof raw.candidate === "object" ? raw.candidate : raw;
+  return {
+    candidateId: boundedDropText(raw.candidateId || "", 120),
+    file: boundedDropText(inner.file || "", 200),
+    claim: boundedDropText(inner.summary || "", 300)
+  };
+}
 function refDropDecisionRows() {
   const rows = [];
   for (let index = 0; index < refDrops.length; index += 1) {
     const drop = refDrops[index];
+    // Scope narrowing is not a candidate decision. Recording it as one made stats.dropped and
+    // synthesis.decisions claim a candidate was rejected when review scope was trimmed instead.
+    if (drop.subject === "scope_file") continue;
     rows.push({
-      candidateId: drop.stage + ":" + drop.label,
+      candidateId: drop.dropped.candidateId || drop.stage + ":" + drop.label,
       candidateDigest: "",
       action: "drop",
       reasonCategory: drop.reasonCategory,
       reason: drop.reason,
+      droppedSubject: drop.subject,
+      droppedFile: drop.dropped.file,
+      droppedClaim: drop.dropped.claim,
       mergeCandidates: [],
       severity: ""
     });
   }
   return rows;
 }
-function recordRefDrop(stage, label, err) {
+function recordRefDrop(stage, label, err, droppedSubject) {
   const reason = text(err && err.message ? err.message : err);
-  refDrops.push({ stage: stage, label: label, reasonCategory: "unsupported_evidence", reason: reason });
+  const subject = refDropSubject(stage);
+  refDrops.push({
+    stage: stage,
+    label: label,
+    subject: subject,
+    reasonCategory: "unsupported_evidence",
+    reason: reason,
+    dropped: refDropSubjectProjection(subject, droppedSubject)
+  });
   return reason;
 }
 function stripTrailingIndex(value) {
@@ -1354,7 +1405,7 @@ function validateScope(scope) {
       keptFiles.push(scope.files[index]);
     } catch (err) {
       if (!refLenient || isStructuralFailure(err)) throw err;
-      recordRefDrop("scope.files", "scope.files[" + index + "]", err);
+      recordRefDrop("scope.files", "scope.files[" + index + "]", err, scope.files[index]);
     }
   }
   // A narrowed scope is reviewable; an empty one is not — reporting zero findings from no files
@@ -1458,7 +1509,7 @@ function reviewLensStage(lens) {
         candidate = validateCandidate(capped[index], "candidate " + lens.lensKey + "/" + index);
       } catch (err) {
         if (!refLenient || isStructuralFailure(err)) throw err;
-        recordRefDrop("candidate", lens.lensKey + "/" + index, err);
+        recordRefDrop("candidate", lens.lensKey + "/" + index, err, capped[index]);
         continue;
       }
       const candidateDigest = hash({
@@ -1506,7 +1557,7 @@ function reviewLensStage(lens) {
           verifier = validateVerifier(verifierResults[index], "verifier " + envelopes[index].candidateId);
         } catch (err) {
           if (!refLenient || isStructuralFailure(err)) throw err;
-          recordRefDrop("verifier", envelopes[index].candidateId, err);
+          recordRefDrop("verifier", envelopes[index].candidateId, err, envelopes[index]);
           continue;
         }
         verified.push({
@@ -1557,7 +1608,7 @@ function reviewSweepCandidates(lens, rawCandidates) {
       candidate = validateCandidate(rawCandidates[index], "sweep candidate " + index);
     } catch (err) {
       if (!refLenient || isStructuralFailure(err)) throw err;
-      recordRefDrop("sweep-candidate", "sweep/" + index, err);
+      recordRefDrop("sweep-candidate", "sweep/" + index, err, rawCandidates[index]);
       continue;
     }
     const candidateDigest = hash({
@@ -1602,7 +1653,7 @@ function reviewSweepCandidates(lens, rawCandidates) {
         sweepVerifier = validateVerifier(verifierResults[index], "sweep verifier " + index);
       } catch (err) {
         if (!refLenient || isStructuralFailure(err)) throw err;
-        recordRefDrop("sweep-verifier", "sweep/" + index, err);
+        recordRefDrop("sweep-verifier", "sweep/" + index, err, envelopes[index]);
         continue;
       }
       verified.push({
@@ -1957,7 +2008,7 @@ return {
   },
   // A drop must never present as a clean review. When nothing survived, the summary says so.
   summary: findings.length === 0 && refDrops.length > 0
-    ? "Inconclusive: " + refDrops.length + " candidate(s) dropped as unsupported evidence and no finding survived. This is not a clean review."
+    ? "Inconclusive: " + refDrops.length + " review item(s) dropped as unsupported evidence and no finding survived. This is not a clean review."
     : synthesis.summary,
   findings: findings,
   degraded: refDrops.length > 0
@@ -2433,8 +2484,9 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     const builtinName = resolved.workflowSource === 'built_in'
       ? resolved.name ?? resolved.scriptMetadata?.workflowName
       : undefined;
-    // Validation is the free pre-check, so it answers the same two questions a launch answers:
-    // is the request readable, and would it have anything to work on.
+    // Validation is the free pre-check, so it answers the same questions a launch answers: is the request
+    // readable, would the run be refused outright, and would it have anything to work on.
+    this.assertPersistedBuiltinPolicyMatches(resolved, builtinName);
     if (builtinName) {
       await validateBuiltinRequestArgs(builtinName, input.args, cwd);
     }
@@ -2562,28 +2614,34 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     const promotedName = resolved.workflowSource === 'built_in'
       ? resolved.name ?? resolved.scriptMetadata?.workflowName
       : undefined;
-    // A promoted scriptPath executes the PERSISTED script, whose ref policy is baked into its text. The
-    // resume shapes above are refused on a mismatch, but a direct --script-path launch reached here
-    // unchecked: it ran the source policy while stderr and the journal recorded the requested one, and a
-    // later resume then trusted that false record. The dangerous direction is a lenient script launched
-    // under strict — the review completes with candidates dropped where a real strict run fails.
-    if (promotedName && resolved.scriptPath && resolved.scriptMetadata) {
-      const identity = this.builtinIdentityFor(promotedName, resolved.scriptMetadata.scriptHash);
-      if (identity?.policySensitive && identity.policy !== currentPolicy) {
-        throw identity.policy === undefined
-          ? requestContractError(
-            `--script-path launch of built-in "${promotedName}" under --ref-policy ${currentPolicy}`,
-            'the persisted script does not match any ref-policy variant this version generates, so the policy it would execute under cannot be shown to be the requested one',
-            `launch it by name (--name ${promotedName}) so the current policy's script is generated`,
-          )
-          : requestContractError(
-            `--script-path launch of built-in "${promotedName}" under --ref-policy ${currentPolicy}`,
-            `the persisted script was generated under --ref-policy ${identity.policy}, and that policy is baked into its text, so it would execute under ${identity.policy} while this run reports ${currentPolicy}`,
-            `pass --ref-policy ${identity.policy} to run the persisted script as written, or launch by name (--name ${promotedName}) to generate the ${currentPolicy} script`,
-          );
-      }
-    }
+    this.assertPersistedBuiltinPolicyMatches(resolved, promotedName);
     return promotedName;
+  }
+
+  // A promoted scriptPath executes the PERSISTED script, whose ref policy is baked into its text: it would
+  // run the source policy while stderr and the journal record the requested one, and a later resume would
+  // trust that false record. This lives apart from the launch path because `--validate` promotes the same
+  // scriptPath and must answer the same question — a preflight that approves what launch deterministically
+  // rejects is worse than no preflight.
+  private assertPersistedBuiltinPolicyMatches(
+    resolved: ResolvedWorkflowLaunchInput,
+    promotedName: string | undefined,
+  ): void {
+    if (!promotedName || !resolved.scriptPath || !resolved.scriptMetadata) return;
+    const currentPolicy = this.options.refPolicy ?? 'strict';
+    const identity = this.builtinIdentityFor(promotedName, resolved.scriptMetadata.scriptHash);
+    if (!identity?.policySensitive || identity.policy === currentPolicy) return;
+    throw identity.policy === undefined
+      ? requestContractError(
+        `--script-path launch of built-in "${promotedName}" under --ref-policy ${currentPolicy}`,
+        'the persisted script does not match any ref-policy variant this version generates, so the policy it would execute under cannot be shown to be the requested one',
+        `launch it by name (--name ${promotedName}) so the current policy's script is generated`,
+      )
+      : requestContractError(
+        `--script-path launch of built-in "${promotedName}" under --ref-policy ${currentPolicy}`,
+        `the persisted script was generated under --ref-policy ${identity.policy}, and that policy is baked into its text, so it would execute under ${identity.policy} while this run reports ${currentPolicy}`,
+        `pass --ref-policy ${identity.policy} to run the persisted script as written, or launch by name (--name ${promotedName}) to generate the ${currentPolicy} script`,
+      );
   }
 
   // Identity comes from the source journal's run.started entry, which is the only place that records
@@ -4829,11 +4887,11 @@ async function buildWorkspaceContext(
     if (usedBytes + blockBytes > options.maxBytes) {
       if (fileBlocks.length > 0) break;
       fileBlocks.push(block.slice(0, options.maxBytes));
-      includedPaths.add(workspacePathKey(candidate));
+      includedPaths.add(candidate);
       break;
     }
     fileBlocks.push(block);
-    includedPaths.add(workspacePathKey(candidate));
+    includedPaths.add(candidate);
     usedBytes += blockBytes;
   }
   // Selection is done, so readability is decided: the evidence can now publish its refs.
@@ -5067,7 +5125,11 @@ async function buildChangeEvidenceContext(
     staged: staged.truncated,
     committed: committed.truncated,
   };
-  const hunkPathKeys = new Set(hunkPaths.map(workspacePathKey));
+  // EXACT identity, not the normalized comparison key. `a/b.ts` and `a\\b.ts` are two different legal
+  // POSIX files that share a key, so a normalized lookup let the readable one authorize a `file:` ref for
+  // the other — publishing a citation licence for content that was never shown. Normalization stays for
+  // admission and exclusion comparisons, where coalescing is intended.
+  const hunkPathSet = new Set(hunkPaths);
   // A `file:` ref is a licence to cite the file's contents, so it may only be published for a path the
   // reviewer can actually read: one whose content block was included, or whose diff retained a hunk. A
   // truncated committed range or an exhausted file budget used to leave a citable ref for a change no
@@ -5075,10 +5137,7 @@ async function buildChangeEvidenceContext(
   // citations to an unseen file. Readability is only known after file selection, so the projection that
   // publishes refs is deferred to finalize().
   const finalize = (includedPaths: ReadonlySet<string>): ChangeEvidenceContext => {
-  const readablePaths = admittedPaths.filter((path) => {
-    const key = workspacePathKey(path);
-    return includedPaths.has(key) || hunkPathKeys.has(key);
-  });
+  const readablePaths = admittedPaths.filter((path) => includedPaths.has(path) || hunkPathSet.has(path));
   const withheldPathCount = admittedPaths.length - readablePaths.length;
   const evidenceUnavailable = withheldPathCount > 0
     ? [...unavailableEvidence, `unavailable:file-evidence:${withheldPathCount}:no-content-block-or-hunk`]

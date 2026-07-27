@@ -154,6 +154,33 @@ the project uses [semantic versioning](https://semver.org/).
   malformed progress line. An attached JSONL run emits them as a `workflow.notice` event; a background
   parent, whose stderr is the user's terminal, keeps the readable line.
 
+### Fixed (independent cross-kind review)
+
+A nine-lens review by a different reviewer kind found five material issues in the merged work above.
+Each was re-verified against the code before it was acted on; two of them had been introduced by the
+previous round's own repairs.
+
+- **Two paths that share a normalized comparison key no longer lend each other readability.** `sub/a.ts`
+  and `sub\a.ts` are different legal POSIX files whose keys collide, so a readable one authorized a
+  `file:` ref for an unreadable one — publishing a citation licence for content that was never shown,
+  which is precisely what the readability rule exists to prevent. Readability is now decided on exact
+  path identity; normalization remains for admission and exclusion comparisons, where coalescing is
+  intended.
+- **`run --validate` applies the persisted-built-in ref-policy guard that `run` applies.** The guard lived
+  only on the launch path, so a preflight could report a `--script-path` launch valid while the identical
+  launch was deterministically refused. A preflight that approves what launch rejects is worse than none.
+- **A scope-file drop is no longer recorded as a candidate decision.** Every runtime ref drop was folded
+  into the candidate-decision shape, so `stats.dropped.unsupportedEvidence` and `synthesis.decisions`
+  claimed a candidate had been rejected when review scope had been narrowed instead. Drops now carry a
+  `subject` (`scope_file` / `candidate` / `verifier_result`); only candidate-lifecycle drops become
+  decision rows, while `stats.refDrops` stays the authoritative count of all of them.
+- **A degraded result names what was lost.** `degraded.entries` (and the matching decision rows) now carry
+  a bounded projection of the dropped item — its candidate id, file, and claim — so a reader can judge the
+  omission and target a rerun instead of only learning that coverage degraded.
+- **`batch` prompt array elements are validated before spend.** `prompts: ["ok", null]` passed the
+  container-shape check and the invalid element was string-coerced into an agent prompt. Each element must
+  now be a non-empty string, and the rejection names the failing index.
+
 ## [0.6.1] - 2026-07-18
 
 ### Fixed
