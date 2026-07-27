@@ -786,6 +786,101 @@ test('code-review normalizes ref grammar mistakes instead of discarding the run'
   }
 });
 
+async function runCodeReview({ marker, refPolicy }) {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { refPolicy } });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'docs'), { recursive: true });
+    await writeFile(join(root, 'docs', 'client-package-plan.md'), 'The platform token owns authority.\n');
+    const launch = await runtime.launch({
+      name: 'code-review',
+      args: { prompt: `${marker} Review docs/client-package-plan.md.` },
+    });
+    await collectEvents(runtime, launch.taskId);
+    return { snapshot: runtime.get(launch.taskId), backend };
+  } finally {
+    await runtime.close();
+  }
+}
+
+test('refPolicy lenient drops the unusable candidate and keeps the rest of the review', async () => {
+  const { snapshot } = await runCodeReview({ marker: 'PARTIAL_INVALID_REF', refPolicy: 'lenient' });
+  assert.equal(snapshot.status, 'completed', snapshot.error ?? '');
+  assert.equal(snapshot.result.stats.refDrops, 1);
+  assert.equal(snapshot.result.degraded.refDrops, 1);
+  assert.equal(snapshot.result.degraded.entries[0].stage, 'candidate');
+  assert.equal(snapshot.result.degraded.entries[0].reasonCategory, 'unsupported_evidence');
+  assert.match(snapshot.result.degraded.entries[0].reason, /unsupported evidence ref file:outside\.md/);
+  // The sibling candidate survived, so the review still reports.
+  assert.ok(snapshot.result.findings.length >= 1);
+  for (const finding of snapshot.result.findings) {
+    assert.ok(finding.evidenceRefs.every((ref) => !ref.includes('outside.md')));
+  }
+});
+
+test('refPolicy strict fails the same run (lenient flag is wired, not inert)', async () => {
+  const { snapshot, backend } = await runCodeReview({ marker: 'PARTIAL_INVALID_REF', refPolicy: 'strict' });
+  assert.equal(snapshot.status, 'failed');
+  assert.match(snapshot.error, /includes unsupported evidence ref file:outside\.md/);
+  // Strict is also the default: no refPolicy option must behave the same way.
+  const fallback = await runCodeReview({ marker: 'PARTIAL_INVALID_REF', refPolicy: undefined });
+  assert.equal(fallback.snapshot.status, 'failed');
+  assert.ok(backend.requests.length >= 1);
+});
+
+test('refPolicy lenient still fails when every candidate is dropped (no vacuous pass)', async () => {
+  const { snapshot } = await runCodeReview({ marker: 'INVALID_EVIDENCE_REF', refPolicy: 'lenient' });
+  assert.equal(snapshot.status, 'failed');
+  assert.match(snapshot.error, /every candidate was dropped as unsupported evidence \(1 drop\(s\)\)/);
+  assert.match(snapshot.error, /includes unsupported evidence ref file:outside\.md/);
+});
+
+test('refPolicy lenient leaves a clean run unchanged (degraded absent)', async () => {
+  const lenient = await runCodeReview({ marker: 'CLEAN_RUN', refPolicy: 'lenient' });
+  const strict = await runCodeReview({ marker: 'CLEAN_RUN', refPolicy: 'strict' });
+  assert.equal(lenient.snapshot.status, 'completed', lenient.snapshot.error ?? '');
+  assert.equal(lenient.snapshot.result.degraded, null);
+  assert.equal(lenient.snapshot.result.stats.refDrops, 0);
+  assert.equal(lenient.snapshot.result.findings.length, strict.snapshot.result.findings.length);
+  assert.equal(lenient.snapshot.result.summary, strict.snapshot.result.summary);
+});
+
+test('refPolicy lenient drops one scope file, and fails when every scope file drops', async () => {
+  const partial = await runCodeReview({ marker: 'SCOPE_FILE_PARTIAL', refPolicy: 'lenient' });
+  assert.equal(partial.snapshot.status, 'completed', partial.snapshot.error ?? '');
+  assert.equal(partial.snapshot.result.degraded.refDrops, 1);
+  assert.equal(partial.snapshot.result.degraded.entries[0].stage, 'scope.files');
+  // The second scope file is the one that dropped; the first survived and the review proceeded.
+  assert.match(partial.snapshot.result.degraded.entries[0].label, /scope\.files\[1\]/);
+  assert.ok(partial.snapshot.result.findings.length >= 1);
+
+  const all = await runCodeReview({ marker: 'SCOPE_FILE_ALL_INVALID', refPolicy: 'lenient' });
+  assert.equal(all.snapshot.status, 'failed');
+  assert.match(all.snapshot.error, /every scope file was dropped as unsupported evidence/);
+
+  const strict = await runCodeReview({ marker: 'SCOPE_FILE_PARTIAL', refPolicy: 'strict' });
+  assert.equal(strict.snapshot.status, 'failed');
+  assert.match(strict.snapshot.error, /references unsupported file/);
+});
+
+test('refPolicy lenient keeps a workspace-escaping path fatal (structural, not a grammar slip)', async () => {
+  for (const refPolicy of ['lenient', 'strict']) {
+    const { snapshot } = await runCodeReview({ marker: 'TRAVERSAL_REF', refPolicy });
+    assert.equal(snapshot.status, 'failed', refPolicy);
+    assert.match(snapshot.error, /structural/, refPolicy);
+    assert.match(snapshot.error, /references a path outside the workspace: \.\.\/outside\.md/, refPolicy);
+  }
+});
+
+test('refPolicy lenient keeps lens decisions fatal (a premise is not an item)', async () => {
+  const { snapshot, backend } = await runCodeReview({ marker: 'SCOPE_DECISION_INVALID', refPolicy: 'lenient' });
+  assert.equal(snapshot.status, 'failed');
+  assert.match(snapshot.error, /includes unsupported decision ref file:outside\.md/);
+  // It fails at scope, before any finder or verifier spends.
+  assert.equal(backend.requests.length, 1);
+});
+
 test('code-review still fails closed on a ref whose path is not in evidence (normalization control)', async () => {
   const backend = new FakeSubagentBackend();
   const { runtime, root } = await createRuntime({ backend });
@@ -3169,6 +3264,7 @@ async function createRuntime({ backend, runtimeOptions = {} }) {
       agentTypes: runtimeOptions.agentTypes,
       builtinWorkflows: runtimeOptions.builtinWorkflows,
       evidenceScope: runtimeOptions.evidenceScope,
+      refPolicy: runtimeOptions.refPolicy,
       journalDurability: runtimeOptions.journalDurability,
     }),
   };
@@ -3231,7 +3327,7 @@ class FakeSubagentBackend {
         });
       }
       if (isReviewScopeSchema(schema)) {
-        return structuredToolResult(fakeReviewScope());
+        return structuredToolResult(fakeReviewScope(workflowPrompt));
       }
       if (isReviewFinderSchema(schema)) {
         if (/Code-review Finder[\s\S]*Lens key: security-boundary/.test(workflowPrompt)) await sleep(80);
@@ -3322,9 +3418,15 @@ function fakePhasePlan(prompt) {
   };
 }
 
-function fakeReviewScope() {
+function fakeReviewScope(prompt = '') {
+  const files = /SCOPE_FILE_ALL_INVALID/.test(prompt)
+    ? ['outside.md']
+    : /SCOPE_FILE_PARTIAL/.test(prompt)
+      ? ['docs/client-package-plan.md', 'outside.md']
+      : ['docs/client-package-plan.md'];
+  const decisionRef = /SCOPE_DECISION_INVALID/.test(prompt) ? 'file:outside.md' : 'file:docs/client-package-plan.md';
   return {
-    files: ['docs/client-package-plan.md'],
+    files,
     summary: 'Review the client package plan and authority binding claims.',
     instructions: 'Prioritize material runtime contract and boundary risks.',
     lensDecisions: [
@@ -3333,7 +3435,7 @@ function fakeReviewScope() {
         action: 'select',
         selectedLensId: 'runtime-contract',
         reasonCategory: 'matched_change',
-        decisionRefs: ['file:docs/client-package-plan.md'],
+        decisionRefs: [decisionRef],
         reason: 'The plan changes runtime and package contract behavior.',
       },
       {
@@ -3341,7 +3443,7 @@ function fakeReviewScope() {
         action: 'select',
         selectedLensId: 'security-boundary',
         reasonCategory: 'prompt_risk',
-        decisionRefs: ['file:docs/client-package-plan.md'],
+        decisionRefs: [decisionRef],
         reason: 'Authority binding requires boundary review.',
       },
     ],
@@ -3380,6 +3482,40 @@ function fakeReviewFinder(prompt) {
   }
   // The two ref shapes observed in real rejected runs: a file: ref with a line number appended, and
   // a diff:unstaged: guess for a path that exists only as file: (an untracked file).
+  if (/TRAVERSAL_REF/.test(prompt)) {
+    return {
+      candidates: [{
+        file: 'docs/client-package-plan.md',
+        line: 1,
+        summary: 'This candidate cites a path that escapes the workspace.',
+        failureScenario: 'A structural violation must not be degraded into a drop.',
+        evidenceRefs: ['file:../outside.md'],
+        kind: 'contract',
+      }],
+    };
+  }
+  if (/PARTIAL_INVALID_REF/.test(prompt)) {
+    return {
+      candidates: [
+        {
+          file: 'docs/client-package-plan.md',
+          line: 1,
+          summary: 'This candidate cites a path that is not in evidence at all.',
+          failureScenario: 'Under lenient it is dropped; under strict it fails the run.',
+          evidenceRefs: ['file:outside.md'],
+          kind: 'contract',
+        },
+        {
+          file: 'docs/client-package-plan.md',
+          line: 3,
+          summary: 'This candidate cites evidence that exists.',
+          failureScenario: 'It must survive a sibling candidate being dropped.',
+          evidenceRefs: ['file:docs/client-package-plan.md'],
+          kind: 'contract',
+        },
+      ],
+    };
+  }
   if (/LINE_SUFFIX_REF/.test(prompt)) {
     return {
       candidates: [{

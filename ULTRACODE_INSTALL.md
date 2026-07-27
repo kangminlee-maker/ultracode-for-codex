@@ -339,6 +339,10 @@ Useful controls:
   normalized before rejection (a trailing line number is stripped, and a
   mismatched ref kind resolves through the cited path), so only a path that is
   not in the evidence snapshot still fails closed.
+- under `--ref-policy lenient` a ref that still resolves to no path in evidence drops
+  that one candidate rather than the run, and the result reports `degraded` plus
+  `stats.refDrops`; a run whose candidates all dropped still fails, and lens decisions
+  and structural violations remain fatal at every policy.
 - `run --validate` is the zero-token pre-check: it validates the request contract
   and, for `code-review`, reports the change-evidence precondition — whether the
   gate would open, the allowed evidence refs, and every dropped path with its

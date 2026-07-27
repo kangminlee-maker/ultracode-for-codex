@@ -5,7 +5,7 @@ import { availableParallelism, homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { createContext, runInContext } from 'node:vm';
-import type { AgentConcurrency, EvidenceScope, NestedWorkflows, ReasoningEffort, ResolvedAgentType, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
+import type { AgentConcurrency, EvidenceScope, NestedWorkflows, ReasoningEffort, RefPolicy, ResolvedAgentType, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
 import { SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort, isSubagentFailure } from './types.js';
 import { AgentConcurrencyPool } from './agent-concurrency-pool.js';
 import {
@@ -433,6 +433,11 @@ interface WorkflowTaskRegistryOptions {
   // Which changed paths may become citable evidence. Omitted or 'default' keeps the extension
   // allowlist on the evidence path (current behavior); 'all' forgives only that rule.
   readonly evidenceScope?: EvidenceScope;
+  // What happens to a cited ref that normalization cannot resolve to a path in evidence. Omitted or
+  // 'strict' fails the run (current behavior); 'lenient' drops that one candidate and discloses it.
+  // Baked into the built-in script text, so a policy change changes the script hash: the permission
+  // grant and the resume cache are policy-scoped rather than silently carried over.
+  readonly refPolicy?: RefPolicy;
   // Resolved agent-type registry (PG-AGENTTYPE). Omitted/empty leaves `agent({agentType})` inert:
   // a script that uses it fails loud. When present (the CLI loads it only under --agent-types),
   // runAgent resolves a named type's model/effort/persona for that one call. The map is keyed by the
@@ -733,7 +738,7 @@ const DEFAULT_BUILTIN_WORKFLOWS: readonly BuiltinWorkflow[] = [
   },
   {
     name: 'code-review',
-    script: codeReviewBuiltinWorkflowScript(),
+    script: codeReviewBuiltinWorkflowScript('strict'),
   },
   {
     name: 'batch',
@@ -759,6 +764,23 @@ return await parallel(prompts.map((prompt, index) => () => agent(
 )));`,
   },
 ];
+
+// The built-in list is policy-scoped because the ref policy is baked into the code-review script
+// text: a different policy is a different script (different hash), so the permission grant and the
+// resume cache stay bound to the policy they were made under. Memoized per policy (two values).
+const BUILTIN_WORKFLOWS_BY_REF_POLICY = new Map<RefPolicy, readonly BuiltinWorkflow[]>([
+  ['strict', DEFAULT_BUILTIN_WORKFLOWS],
+]);
+
+function defaultBuiltinWorkflows(refPolicy: RefPolicy): readonly BuiltinWorkflow[] {
+  const cached = BUILTIN_WORKFLOWS_BY_REF_POLICY.get(refPolicy);
+  if (cached) return cached;
+  const built = DEFAULT_BUILTIN_WORKFLOWS.map((workflow) => workflow.name === 'code-review'
+    ? { ...workflow, script: codeReviewBuiltinWorkflowScript(refPolicy) }
+    : workflow);
+  BUILTIN_WORKFLOWS_BY_REF_POLICY.set(refPolicy, built);
+  return built;
+}
 
 // Per-built-in request contract. Built-in scripts read `args` ad hoc with silent fallbacks, so an
 // unknown or mistyped key used to be swallowed: `{"promt":"…"}` ran the DEFAULT prompt and reported
@@ -922,7 +944,7 @@ async function validateBuiltinRequestArgs(name: string, args: unknown, cwd: stri
   }
 }
 
-function codeReviewBuiltinWorkflowScript(): string {
+function codeReviewBuiltinWorkflowScript(refPolicy: RefPolicy): string {
   return `export const meta = {
   name: "code-review",
   description: "Run a dynamic evidence-bound code review workflow"
@@ -1112,6 +1134,40 @@ function failUnsupportedRef(prefix, value, refSet) {
 // Exact match first, then a trailing numeric index, then the path. A path that is not in evidence
 // still fails: the anti-fabrication property is unchanged.
 let normalizedRefCount = 0;
+// Ref policy (R6). "strict" fails the run on a ref that normalization cannot resolve to a path in
+// evidence. "lenient" drops the one candidate that cited it and lets the rest of the review stand.
+// What stays fatal at every policy: lens decisions (the review's premises, not its items) and any
+// structural violation. A drop is never silent — it lands in refDrops and in the result's "degraded"
+// block, and a run whose candidates were ALL dropped fails rather than reporting a clean review.
+const refLenient = ${refPolicy === 'lenient' ? 'true' : 'false'};
+const refDrops = [];
+// A path that escapes the workspace is a decidable structural violation, not a grammar slip: it is
+// refused at every policy, and a lenient drop must re-raise it rather than swallow the one signal
+// that says the reviewer fabricated a traversal path.
+function failStructural(message) {
+  throw "code-review invalid (structural): " + message;
+}
+function isStructuralFailure(err) {
+  return text(err && err.message ? err.message : err).indexOf("code-review invalid (structural): ") === 0;
+}
+function assertPathSafe(value, label) {
+  const raw = text(value);
+  // fromCharCode(92) avoids a backslash escape inside this generated script.
+  const normalized = raw.split(String.fromCharCode(92)).join("/");
+  if (
+    normalized.indexOf("../") === 0
+    || normalized.indexOf("/../") >= 0
+    || normalized === ".."
+    || normalized.charAt(0) === "/"
+  ) {
+    failStructural(label + " references a path outside the workspace: " + raw);
+  }
+}
+function recordRefDrop(stage, label, err) {
+  const reason = text(err && err.message ? err.message : err);
+  refDrops.push({ stage: stage, label: label, reasonCategory: "unsupported_evidence", reason: reason });
+  return reason;
+}
 function stripTrailingIndex(value) {
   const at = value.lastIndexOf(":");
   if (at < 1 || at === value.length - 1) return value;
@@ -1152,6 +1208,8 @@ function allowedPathRefs() {
 }
 function normalizeEvidenceRef(ref) {
   if (allowedEvidenceRefMap[ref]) return ref;
+  const citedPath = evidenceRefPath(ref);
+  if (citedPath) assertPathSafe(citedPath, "evidence ref");
   const stripped = stripTrailingIndex(ref);
   if (stripped !== ref && allowedEvidenceRefMap[stripped]) {
     normalizedRefCount += 1;
@@ -1167,6 +1225,7 @@ function normalizeEvidenceRef(ref) {
 }
 function normalizeFilePath(file) {
   const raw = text(file);
+  assertPathSafe(raw.indexOf("file:") === 0 ? raw.slice(5) : raw, "file ref");
   const withoutPrefix = raw.indexOf("file:") === 0 ? raw.slice(5) : raw;
   if (allowedFileRefMap["file:" + withoutPrefix]) {
     if (withoutPrefix !== raw) normalizedRefCount += 1;
@@ -1209,7 +1268,22 @@ function selectedDecisionMatches(decision, lens) {
   return selected === lens.lensKey || selected === normalizeKey(lens.id, lens.lensKey);
 }
 function validateScope(scope) {
-  for (let index = 0; index < scope.files.length; index += 1) validateFileAt(scope.files, index, "scope.files[" + index + "]");
+  const keptFiles = [];
+  for (let index = 0; index < scope.files.length; index += 1) {
+    try {
+      validateFileAt(scope.files, index, "scope.files[" + index + "]");
+      keptFiles.push(scope.files[index]);
+    } catch (err) {
+      if (!refLenient || isStructuralFailure(err)) throw err;
+      recordRefDrop("scope.files", "scope.files[" + index + "]", err);
+    }
+  }
+  // A narrowed scope is reviewable; an empty one is not — reporting zero findings from no files
+  // would be a vacuous pass.
+  if (scope.files.length > 0 && keptFiles.length === 0) {
+    fail("every scope file was dropped as unsupported evidence (" + refDrops.length + " drop(s)); first: " + refDrops[0].reason);
+  }
+  scope.files = keptFiles;
   for (let index = 0; index < scope.lensDecisions.length; index += 1) {
     assertDecisionRefs(scope.lensDecisions[index].decisionRefs, "scope.lensDecisions[" + index + "]");
   }
@@ -1300,7 +1374,14 @@ function reviewLensStage(lens) {
     const capped = rawCandidates.slice(0, caps.maxCandidatesPerLens);
     const envelopes = [];
     for (let index = 0; index < capped.length; index += 1) {
-      const candidate = validateCandidate(capped[index], "candidate " + lens.lensKey + "/" + index);
+      let candidate;
+      try {
+        candidate = validateCandidate(capped[index], "candidate " + lens.lensKey + "/" + index);
+      } catch (err) {
+        if (!refLenient || isStructuralFailure(err)) throw err;
+        recordRefDrop("candidate", lens.lensKey + "/" + index, err);
+        continue;
+      }
       const candidateDigest = hash({
         sourceSnapshotId: sourceSnapshotId,
         contextHash: contextHash,
@@ -1340,6 +1421,14 @@ function reviewLensStage(lens) {
       const verified = [];
       for (let index = 0; index < envelopes.length; index += 1) {
         if (verifierResults[index] == null) fail("missing verifier result for " + envelopes[index].candidateId);
+        let verifier;
+        try {
+          verifier = validateVerifier(verifierResults[index], "verifier " + envelopes[index].candidateId);
+        } catch (err) {
+          if (!refLenient || isStructuralFailure(err)) throw err;
+          recordRefDrop("verifier", envelopes[index].candidateId, err);
+          continue;
+        }
         verified.push({
           candidateId: envelopes[index].candidateId,
           candidateIndex: envelopes[index].candidateIndex,
@@ -1347,7 +1436,7 @@ function reviewLensStage(lens) {
           lensKey: envelopes[index].lensKey,
           lensTitle: envelopes[index].lensTitle,
           candidate: envelopes[index].candidate,
-          verifier: validateVerifier(verifierResults[index], "verifier " + envelopes[index].candidateId)
+          verifier: verifier
         });
       }
       return verified;
@@ -1383,7 +1472,14 @@ function runSweep(kept, refutedCount) {
 function reviewSweepCandidates(lens, rawCandidates) {
   const envelopes = [];
   for (let index = 0; index < rawCandidates.length; index += 1) {
-    const candidate = validateCandidate(rawCandidates[index], "sweep candidate " + index);
+    let candidate;
+    try {
+      candidate = validateCandidate(rawCandidates[index], "sweep candidate " + index);
+    } catch (err) {
+      if (!refLenient || isStructuralFailure(err)) throw err;
+      recordRefDrop("sweep-candidate", "sweep/" + index, err);
+      continue;
+    }
     const candidateDigest = hash({
       sourceSnapshotId: sourceSnapshotId,
       contextHash: contextHash,
@@ -1420,6 +1516,14 @@ function reviewSweepCandidates(lens, rawCandidates) {
     const verified = [];
     for (let index = 0; index < envelopes.length; index += 1) {
       if (verifierResults[index] == null) fail("missing sweep verifier result");
+      let sweepVerifier;
+      try {
+        sweepVerifier = validateVerifier(verifierResults[index], "sweep verifier " + index);
+      } catch (err) {
+        if (!refLenient || isStructuralFailure(err)) throw err;
+        recordRefDrop("sweep-verifier", "sweep/" + index, err);
+        continue;
+      }
       verified.push({
         candidateId: envelopes[index].candidateId,
         candidateIndex: envelopes[index].candidateIndex,
@@ -1427,7 +1531,7 @@ function reviewSweepCandidates(lens, rawCandidates) {
         lensKey: envelopes[index].lensKey,
         lensTitle: envelopes[index].lensTitle,
         candidate: envelopes[index].candidate,
-        verifier: validateVerifier(verifierResults[index], "sweep verifier " + index)
+        verifier: sweepVerifier
       });
     }
     return verified;
@@ -1620,7 +1724,10 @@ if (activeLenses.length === 0) {
     summary: scope.summary,
     findings: [],
     synthesis: { mode: "script_fallback", fallbackReason: "no active lenses", decisions: [] },
-    stats: { finders: 0, candidates: 0, verifierAttempts: 0, verified: 0, refuted: 0, invalid: 0, reported: 0, normalizedRefs: normalizedRefCount, dropped: droppedStats([]) }
+    degraded: refDrops.length > 0
+      ? { refDrops: refDrops.length, entries: refDrops.slice(0, 20), truncated: refDrops.length > 20 }
+      : null,
+    stats: { finders: 0, candidates: 0, verifierAttempts: 0, verified: 0, refuted: 0, invalid: 0, reported: 0, normalizedRefs: normalizedRefCount, refDrops: refDrops.length, dropped: droppedStats([]) }
   };
 }
 announcePhasePlan({
@@ -1645,11 +1752,18 @@ phase("Verify");
 const lensResults = await pipeline(activeLenses, reviewLensStage);
 const verifiedCandidates = [];
 for (let lensIndex = 0; lensIndex < lensResults.length; lensIndex += 1) {
+  // Still fatal: a lens chain that failed for any reason other than a per-item ref drop (an agent
+  // failure, a structural violation, a count mismatch) is not something a review can degrade past.
   if (lensResults[lensIndex] && lensResults[lensIndex].failed) fail(lensResults[lensIndex].error);
   if (lensResults[lensIndex] == null) fail("lens review failed for " + activeLenses[lensIndex].lensKey);
   for (let candidateIndex = 0; candidateIndex < lensResults[lensIndex].length; candidateIndex += 1) {
     verifiedCandidates.push(lensResults[lensIndex][candidateIndex]);
   }
+}
+// Vacuous-pass guard: drops with nothing left to verify is "could not judge", not "found nothing",
+// so it fails instead of completing with an empty, reassuring report.
+if (refDrops.length > 0 && verifiedCandidates.length === 0) {
+  fail("every candidate was dropped as unsupported evidence (" + refDrops.length + " drop(s)); first: " + refDrops[0].reason);
 }
 const nonRefuted = [];
 let refuted = 0;
@@ -1747,8 +1861,14 @@ return {
     diffBaseRef: diffBaseRef || null,
     truncation: { raw: truncation }
   },
-  summary: synthesis.summary,
+  // A drop must never present as a clean review. When nothing survived, the summary says so.
+  summary: findings.length === 0 && refDrops.length > 0
+    ? "Inconclusive: " + refDrops.length + " candidate(s) dropped as unsupported evidence and no finding survived. This is not a clean review."
+    : synthesis.summary,
   findings: findings,
+  degraded: refDrops.length > 0
+    ? { refDrops: refDrops.length, entries: refDrops.slice(0, 20), truncated: refDrops.length > 20 }
+    : null,
   synthesis: {
     mode: synthesis.mode,
     fallbackReason: synthesis.fallbackReason,
@@ -1763,6 +1883,7 @@ return {
     invalid: 0,
     reported: findings.length,
     normalizedRefs: normalizedRefCount,
+    refDrops: refDrops.length,
     dropped: droppedStats(decisionRows)
   }
 };`;
@@ -2853,7 +2974,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     requestedName: string,
     available: Set<string>,
   ): ResolvedWorkflowLaunchInput | null {
-    for (const workflow of this.options.builtinWorkflows ?? DEFAULT_BUILTIN_WORKFLOWS) {
+    for (const workflow of this.options.builtinWorkflows ?? defaultBuiltinWorkflows(this.options.refPolicy ?? 'strict')) {
       const name = workflow.name.trim();
       if (!name) continue;
       available.add(name);

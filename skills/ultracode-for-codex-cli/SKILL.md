@@ -116,6 +116,11 @@ CLI behavior:
   request contract (accepted keys `prompt`, `level`, `diffBaseRef`; unknown or
   mistyped keys and unsupported values are rejected at launch) and reports whether
   the evidence gate would open, with each dropped path and the rule that dropped it;
+- `--ref-policy lenient` drops a single candidate whose cited ref resolves to no path
+  in evidence, instead of failing the run; the result carries a `degraded` block and
+  `stats.refDrops`. An all-dropped run still fails (no vacuous pass), lens decisions and
+  structural violations stay fatal, and the policy changes the built-in script hash so a
+  switch requires a fresh permission decision;
 - `--evidence-scope all` forgives only the evidence extension allowlist, making
   `.java`/`.rb`/`.sql` repositories reviewable; excluded directories, runtime state,
   and unsafe paths stay out at every scope;

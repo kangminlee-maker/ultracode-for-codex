@@ -46,6 +46,16 @@ export function isEvidenceScope(value: unknown): value is EvidenceScope {
   return typeof value === 'string' && (EVIDENCE_SCOPE_VALUES as readonly string[]).includes(value);
 }
 
+// What happens to a cited evidence ref that survives normalization but still resolves to no path in
+// the evidence snapshot. `strict` (the current default) fails the run, byte-identical to today.
+// `lenient` drops that one candidate, records it, and lets the rest of the review stand — while the
+// premises of the review (lens decisions) and structural violations stay hard failures.
+export type RefPolicy = 'strict' | 'lenient';
+export const REF_POLICY_VALUES: readonly RefPolicy[] = ['strict', 'lenient'];
+export function isRefPolicy(value: unknown): value is RefPolicy {
+  return typeof value === 'string' && (REF_POLICY_VALUES as readonly string[]).includes(value);
+}
+
 // Gate for the subagent web_search tool. `disabled` (the current default) keeps
 // `web_search="disabled"` at every Codex config site, byte-identical to today; `enabled`
 // flips it to `"live"` so workflow subagents can use the native Responses web_search tool.

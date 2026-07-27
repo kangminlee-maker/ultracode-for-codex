@@ -27,6 +27,14 @@ the project uses [semantic versioning](https://semver.org/).
   selection keeps its own allowlist.
 - `code-review` reviews a committed range on a clean tree: a resolvable `diffBaseRef`
   now contributes file refs, so `diffBaseRef..HEAD` alone can open the evidence gate.
+- `--ref-policy <strict|lenient>` (settings: `workflow.refPolicy`, default `strict`).
+  Under `lenient`, a cited ref that normalization cannot resolve to a path in evidence
+  drops that one candidate instead of the run, and the result carries a `degraded`
+  block plus `stats.refDrops`. A run whose candidates were ALL dropped still fails, so
+  a degraded run can never present as a clean review. Lens decisions (the review's
+  premises) and structural violations stay fatal at every policy. The policy is baked
+  into the built-in script text, so switching it changes the script hash and needs a
+  fresh permission decision rather than silently reusing a grant or a resume cache.
 - Evidence context discloses `#### Dropped From Evidence` (paths the reviewer can see
   in git status but may not cite) and `#### Evidence Ref Grammar`.
 

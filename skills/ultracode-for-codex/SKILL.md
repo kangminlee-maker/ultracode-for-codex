@@ -219,6 +219,15 @@ repository of `.java`/`.rb`/`.sql`/`.kt` sources reports a closed gate by
 default. Pass `--evidence-scope all` to forgive that one rule; excluded
 directories, runtime state, and unsafe paths stay out at every scope.
 
+A cited ref is normalized before rejection (a trailing line number is stripped, a
+mismatched ref kind resolves through the cited path), so only a path absent from
+the evidence snapshot fails. `--ref-policy lenient` additionally drops just that
+candidate instead of the run and reports it in the result's `degraded` block — but
+a run whose candidates all dropped still fails, so a degraded run never reads as a
+clean review. Lens decisions and structural violations stay fatal either way, and
+switching the policy changes the script hash, so it needs a fresh permission
+decision.
+
 Review is review-only. After synthesizing findings, present them ranked by
 severity and stop. Do not apply fixes, edit files, or start an implementation
 phase off the back of a review — even when a fix looks obvious. Ask the user
