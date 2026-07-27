@@ -94,7 +94,7 @@ FakeSubagent 백엔드(첫 호출에서 즉시 예외)로 실제 런타임을 �
 file:notes.md
 ```
 
-즉 **`.java`·`Dockerfile`·`dist/*`의 변경은 리뷰에 아예 보이지 않습니다.** 게이트는 `notes.md` 하나로 통과하지만, 리뷰 대상은 `notes.md`뿐입니다.
+즉 **`.java`·`Dockerfile`·`dist/*`는 인용 가능한 증거가 되지 못합니다.** 게이트는 `notes.md` 하나로 통과하지만, 리뷰 대상은 `notes.md`뿐입니다. 다만 "보이지 않는다"는 아니라는 점이 중요합니다 — 제외 디렉터리 밖의 `.java`·`Dockerfile`은 `### Git Status` 절에 이름이 그대로 나오고, 내용과 인용만 막힙니다(4.6-(3)). `dist/*`는 status에서도 마스킹됩니다.
 
 경로 필터의 경계도 19개 파일을 한 워킹트리에 놓고 허용목록을 덤프해 확인했습니다:
 
@@ -133,17 +133,19 @@ git -C /path/to/project status --short --untracked-files=all
 # 0) 최초 1회 준비 확인 (설치·인증·모델 지원 여부)
 npm exec --no -- ultracode-for-codex setup || ultracode-for-codex setup
 
-# 1) 리뷰 실행 (백그라운드)
+# 1) 리뷰 실행 (백그라운드). --execution 기본값은 settings.json(background)이지만
+#    예시가 설정에 의존하지 않도록 명시합니다.
 npm exec -- ultracode-for-codex run \
   --accept-llm-guide=v1 \
   --name code-review \
+  --execution background \
   --cwd /path/to/project \
   --args '{"prompt":"방금 바꾼 인증 경로의 정합성과 회귀 위험을 리뷰","level":"high"}' \
   --permission allow
 
 # 2) 진행 상황 / 결과
 npm exec -- ultracode-for-codex status <jobId> --cwd /path/to/project
-npm exec -- ultracode-for-codex logs <jobId> --tail --cwd /path/to/project
+npm exec -- ultracode-for-codex logs <jobId> --tail 40 --cwd /path/to/project   # --tail 은 값 필수
 npm exec -- ultracode-for-codex result <jobId> --cwd /path/to/project
 ```
 
@@ -256,7 +258,7 @@ npm exec -- ultracode-for-codex result <jobId> --cwd /path/to/project
 
 한 문장으로 줄여야 한다면:
 
-> `code-review`는 워킹트리의 미커밋 변경만 리뷰하며, 리뷰할 변경 증거가 없으면 에이전트 실행 전에 실패합니다.
+> `code-review`는 워킹트리의 미커밋 변경을 리뷰하며(`diffBaseRef`를 주면 그 커밋 구간도 함께), 리뷰할 변경 증거가 없으면 에이전트 실행 전에 실패합니다.
 
 "git 리포지토리가 없으면"이라는 전제조건 표현은 쓰지 마십시오. 구현에 그런 검사가 없고, 실패 원인을 사용자가 잘못 진단하게 만듭니다.
 
