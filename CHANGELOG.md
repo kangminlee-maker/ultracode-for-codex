@@ -77,6 +77,35 @@ the project uses [semantic versioning](https://semver.org/).
   path — so a grammar slip no longer discards a whole run's agent results. A path
   that is not in the evidence snapshot still fails closed. `stats.normalizedRefs`
   counts the normalizations.
+- **The evidence gate now keys on readability, not on the existence of a ref.** A path counts as
+  reviewable only if the reviewer can actually see it: it produced an included content block, or it
+  produced a diff hunk. Previously the gate opened as soon as a `file:` ref existed, so three separate
+  shapes of the same defect let agents spend on a change they could not read — an untracked file larger
+  than `maxFileBytes` (no content block, and an untracked file has no patch), an evidence-only path that
+  lost the `maxFiles` budget to ordinary changed files, and a committed-range path crowded out by the
+  directory walk. When paths were admitted but none is readable, the gate closes with a distinct reason
+  (`no readable change evidence in the working tree: …`) naming the count and the remedies (reduce the
+  change, raise the workspace-context budget, or stage the file so a diff exists).
+- Evidence paths are selected for included-file blocks ahead of every other budget candidate, and among
+  them the paths with **no** diff hunk go first — a hunk already shows the reviewer the change, while an
+  untracked file's only visibility is its content block.
+- `evidenceGate:` / `evidenceGateReason:` moved from inside `### Change Evidence` to the workspace-context
+  header, because the gate is now decided after file selection. `run --validate` reports the same verdict
+  by running the same builder, so the preflight and the run cannot diverge.
+
+### Fixed
+
+- `--validate` and the run no longer answer from two different code paths: the preview builds the full
+  workspace context (including file selection) instead of re-deriving evidence on its own.
+- A commit range that touched only unsafe filenames no longer reports "git status reported no changed or
+  untracked paths". The closed-gate reason now accounts for the excluded names (count only — the names
+  themselves are never interpolated into the prompt).
+- A committed filename containing a backslash (legal on POSIX) keeps its raw name in `file:` refs.
+  Normalizing it to a slash named a nested path that does not exist, so the ref could be neither read
+  nor cited. Normalization is still applied for comparison keys only.
+- The `(none)` placeholder the context prints when no commit range was accepted is no longer read back as
+  a range: it is truthy, so `provenance.diffBaseRef` reported `"(none)"` and the file-ref diagnostic
+  claimed a `(none)..HEAD` range that was never reviewed.
 
 ## [0.6.1] - 2026-07-18
 

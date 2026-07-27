@@ -1690,7 +1690,10 @@ const context = await workspaceContext({
   includeDiff: true,
   diffBaseRef: workflowInput.diffBaseRef
 });
-const diffBaseRef = firstLineValue(context, "diffBaseRef: ");
+const diffBaseRefRaw = firstLineValue(context, "diffBaseRef: ");
+// The context writes "(none)" when no range was accepted, and that sentinel is truthy: it was reaching
+// provenance and the file-ref descriptor as if a range existed.
+const diffBaseRef = diffBaseRefRaw === "(none)" ? "" : diffBaseRefRaw;
 const allowedEvidenceRefs = sectionLines(context, "### Allowed Evidence Refs", ["### Unavailable Evidence", "### Git Status"]);
 const unavailableEvidenceRefs = sectionLines(context, "### Unavailable Evidence", ["### Git Status"]);
 const allowedEvidenceRefMap = objectMap(allowedEvidenceRefs);
@@ -2432,22 +2435,19 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       includeDiff: true,
       ...(typeof diffBaseRef === 'string' && diffBaseRef.trim() ? { diffBaseRef: diffBaseRef.trim() } : {}),
     });
-    const root = await workspaceContextRoot(cwd);
-    const runtimeStateExcludedPaths = workspaceRuntimeStateExcludedPaths(root);
-    const status = await collectWorkspaceGitStatus(root, runtimeStateExcludedPaths);
-    const evidence = await buildChangeEvidenceContext(
-      root,
-      status.paths,
-      options,
-      status.unavailableEvidence,
-      runtimeStateExcludedPaths,
-      // The preview must answer for the scope the run would actually use, or it stops being a
-      // pre-check and becomes a second opinion.
-      this.options.evidenceScope ?? 'default',
-    );
+    // The whole builder, not a re-derivation: the gate now depends on which files were readable within
+    // the budget, so a preview that skipped file selection would answer a different question.
+    const built = await buildWorkspaceContext(cwd, options, this.options.evidenceScope ?? 'default');
+    const { evidence, gate } = built;
+    // includeDiff was requested and this built-in consumes change evidence, so the builder must have
+    // produced both. Reporting `undefined` instead would tell the caller this review has no evidence
+    // precondition — a clean preflight for a run that would then gate.
+    if (!evidence || !gate) {
+      throw new Error(`change-evidence preview for ${name} produced no evidence context (includeDiff was requested)`);
+    }
     return {
-      gated: !evidence.gateOpen,
-      ...(evidence.gateOpen ? {} : { reason: evidence.gateReason }),
+      gated: !gate.open,
+      ...(gate.open ? {} : { reason: gate.reason }),
       allowedFileRefs: evidence.allowedFileRefs.length,
       allowedEvidenceRefs: evidence.allowedEvidenceRefs,
       dropped: evidence.droppedPaths,
@@ -3608,11 +3608,11 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     if (ctx.controller.signal.aborted || ctx.task.status !== 'running') {
       throw workflowInputError('Workflow is aborted.');
     }
-    return await buildWorkspaceContext(
+    return (await buildWorkspaceContext(
       this.options.cwd ?? process.cwd(),
       normalizeWorkspaceContextOptions(options),
       this.options.evidenceScope ?? 'default',
-    );
+    )).text;
   }
 
   // Resolve an `agent({agentType})` selection (PG-AGENTTYPE). Undefined selection → undefined (no
@@ -4707,11 +4707,17 @@ async function collectWorkspaceGitStatus(
   return { display, paths, unavailableEvidence };
 }
 
+interface WorkspaceContextResult {
+  readonly text: string;
+  readonly evidence?: ChangeEvidenceContext;
+  readonly gate?: { readonly open: boolean; readonly reason: string };
+}
+
 async function buildWorkspaceContext(
   cwd: string,
   options: WorkspaceContextOptions,
   evidenceScope: EvidenceScope = 'default',
-): Promise<string> {
+): Promise<WorkspaceContextResult> {
   const root = await workspaceContextRoot(cwd);
   const runtimeStateExcludedPaths = workspaceRuntimeStateExcludedPaths(root);
   const status = await collectWorkspaceGitStatus(root, runtimeStateExcludedPaths);
@@ -4735,10 +4741,20 @@ async function buildWorkspaceContext(
   // else — the gate would open and agents would spend blind. Everything else (the directory walk,
   // priority files, query mentions) keeps the prompt-budget allowlist.
   const evidenceFilePaths = new Set((changeEvidence?.filePaths ?? []).map(workspacePathKey));
+  // Evidence paths lead, and within them the ones with NO hunk lead again. A path that produced a hunk
+  // is visible through the diff even without a content block; an untracked file has no patch at all, so
+  // a content block is the only way the reviewer can see it. Ordering it last reproduced the
+  // blind-review path for exactly the files an evidence scope was widened to admit.
+  const evidenceHunkPaths = new Set((changeEvidence?.hunkPaths ?? []).map(workspacePathKey));
+  const evidenceCandidates = [...(changeEvidence?.filePaths ?? [])].sort((left, right) => {
+    const leftHasHunk = evidenceHunkPaths.has(workspacePathKey(left)) ? 1 : 0;
+    const rightHasHunk = evidenceHunkPaths.has(workspacePathKey(right)) ? 1 : 0;
+    return leftHasHunk - rightHasHunk;
+  });
   const candidates = uniqueStrings([
+    ...evidenceCandidates,
     ...explicitPaths,
     ...changedPaths,
-    ...(changeEvidence?.filePaths ?? []),
     ...WORKSPACE_CONTEXT_PRIORITY_FILES,
     ...listedPaths,
   ]).filter((path) => {
@@ -4749,6 +4765,7 @@ async function buildWorkspaceContext(
       : shouldIncludeWorkspaceContextPath(path, runtimeStateExcludedPaths);
   });
   const fileBlocks: string[] = [];
+  const includedPaths = new Set<string>();
   let usedBytes = 0;
   for (const candidate of candidates) {
     if (fileBlocks.length >= options.maxFiles) break;
@@ -4758,17 +4775,22 @@ async function buildWorkspaceContext(
     if (usedBytes + blockBytes > options.maxBytes) {
       if (fileBlocks.length > 0) break;
       fileBlocks.push(block.slice(0, options.maxBytes));
+      includedPaths.add(workspacePathKey(candidate));
       break;
     }
     fileBlocks.push(block);
+    includedPaths.add(workspacePathKey(candidate));
     usedBytes += blockBytes;
   }
-  return [
+  const gate = changeEvidence ? changeEvidenceGate(changeEvidence, includedPaths) : undefined;
+  const text = [
     '## Workspace Context',
     `Root: ${root}`,
-    ...(changeEvidence ? [
+    ...(changeEvidence && gate ? [
       `Source Snapshot: ${changeEvidence.sourceSnapshotId}`,
       `Context Hash: ${changeEvidence.contextHash}`,
+      `evidenceGate: ${gate.open ? 'open' : 'closed'}`,
+      `evidenceGateReason: ${gate.reason || '(none)'}`,
       '',
       '### Change Evidence',
       changeEvidence.text,
@@ -4786,6 +4808,7 @@ async function buildWorkspaceContext(
     '### Included Files',
     fileBlocks.length ? fileBlocks.join('\n\n') : '(no readable text files selected)',
   ].join('\n');
+  return { text, ...(changeEvidence ? { evidence: changeEvidence } : {}), ...(gate ? { gate } : {}) };
 }
 
 export interface EvidenceDroppedPath {
@@ -4805,9 +4828,11 @@ interface ChangeEvidenceContext {
   // Paths behind the file refs. buildWorkspaceContext prioritizes these for included-file blocks, so a
   // committed-range path — which never appears in git status — is still shown to the reviewer.
   readonly filePaths: readonly string[];
+  readonly hunkPaths: readonly string[];
   readonly droppedPaths: readonly EvidenceDroppedPath[];
-  readonly gateOpen: boolean;
-  readonly gateReason: string;
+  readonly statusPathCount: number;
+  readonly hasDiffBaseRef: boolean;
+  readonly unsafeCommittedNames: number;
 }
 
 interface GitStatusPathParse {
@@ -4882,6 +4907,7 @@ async function buildChangeEvidenceContext(
   }), excludedDiffPaths, runtimeStateExcludedPaths, evidenceScope);
   let committed: BoundedGitText = { text: '', truncated: false };
   let committedRangePaths: readonly string[] = [];
+  let unsafeCommittedNames = 0;
   let acceptedDiffBaseRef = '';
   if (options.diffBaseRef) {
     const baseCommit = await gitOutput(root, ['rev-parse', '--verify', `${options.diffBaseRef}^{commit}`]).catch((err) => {
@@ -4914,14 +4940,16 @@ async function buildChangeEvidenceContext(
           const names: string[] = [];
           let unsafe = 0;
           for (const raw of text.split('\0').filter(Boolean)) {
-            const path = workspacePathKey(raw);
-            // Same predicate the git-status parser applies. A committed name carrying a newline, an
-            // escape, or a bidi control would otherwise reach a file: ref and be interpolated into the
-            // structured prompt, where it can break section and ref boundaries.
-            if (isWorkspaceEvidencePathSafe(path)) names.push(path);
+            // Git's raw name is the identity. workspacePathKey rewrites a backslash to a slash, which on
+            // POSIX turns a legal file into a nonexistent nested path, so the ref would point somewhere
+            // that cannot be read or cited. Normalization stays for comparison only.
+            if (isWorkspaceEvidencePathSafe(raw)) names.push(raw);
             else unsafe += 1;
           }
-          if (unsafe > 0) unavailableEvidence.push(`unavailable:diff-committed-name:${unsafe}:unsafe-path`);
+          if (unsafe > 0) {
+            unavailableEvidence.push(`unavailable:diff-committed-name:${unsafe}:unsafe-path`);
+            unsafeCommittedNames += unsafe;
+          }
           return uniqueStrings(names);
         },
         (err: unknown) => {
@@ -4944,7 +4972,11 @@ async function buildChangeEvidenceContext(
     { kind: 'staged', value: staged },
     { kind: 'committed', value: committed },
   ] as const;
-  const diffRefs = diffEvidence.flatMap((entry) => diffEvidenceRefs(entry.kind, entry.value.text, runtimeStateExcludedPaths, evidenceScope));
+  const diffRefResults = diffEvidence.map((entry) => diffEvidenceRefs(entry.kind, entry.value.text, runtimeStateExcludedPaths, evidenceScope));
+  const diffRefs = diffRefResults.flatMap((entry) => entry.refs);
+  // Paths that produced at least one hunk. A path with no readable content block and no hunk gives the
+  // reviewer a ref and nothing to look at, which is why the gate is decided after file selection now.
+  const hunkPaths = uniqueStrings(diffRefResults.flatMap((entry) => entry.hunkPaths));
   // A file ref is what the review harness validates its scope and findings against, so a
   // diffBaseRef range that touched a file has to contribute one too — otherwise a committed-only
   // review collects committed diff evidence it is then forbidden to cite. Taken from a NUL-delimited
@@ -4958,14 +4990,6 @@ async function buildChangeEvidenceContext(
   // diagnostic names the paths it can act on and counts only those — runtime state and unsafe paths
   // are not the caller's changes, and counting them would report a clean tree as "3 paths dropped".
   const callerReportableDrops = droppedPaths.filter((entry) => droppedPathNameable(entry));
-  const gateOpen = fileRefs.length > 0;
-  const gateReason = gateOpen
-    ? ''
-    : changeEvidenceGateReason(
-      changedPaths.length + callerReportableDrops.length,
-      callerReportableDrops,
-      Boolean(acceptedDiffBaseRef),
-    );
   const sourceSnapshotId = `git:${head}:${fullHash([
     gitStatus,
     unstaged.text,
@@ -4993,8 +5017,6 @@ async function buildChangeEvidenceContext(
     `diffBaseRef: ${acceptedDiffBaseRef || '(none)'}`,
     `truncation: ${JSON.stringify(truncation)}`,
     `evidenceScope: ${evidenceScope}`,
-    `evidenceGate: ${gateOpen ? 'open' : 'closed'}`,
-    `evidenceGateReason: ${gateReason || '(none)'}`,
     '',
     '#### Evidence Ref Grammar',
     EVIDENCE_REF_GRAMMAR_NOTE,
@@ -5024,9 +5046,11 @@ async function buildChangeEvidenceContext(
     text: sections.join('\n'),
     allowedFileRefs: fileRefs,
     filePaths: uniqueStrings([...changedPaths, ...committedPaths]),
+    hunkPaths,
     droppedPaths: callerReportableDrops,
-    gateOpen,
-    gateReason,
+    statusPathCount: changedPaths.length + callerReportableDrops.length,
+    hasDiffBaseRef: Boolean(acceptedDiffBaseRef),
+    unsafeCommittedNames,
   };
 }
 
@@ -5079,10 +5103,38 @@ function describeDroppedPathSample(rule: WorkspaceContextDropRule, paths: readon
 // The gate rule and its diagnostic live together in the runtime: the built-in script fails with this
 // message verbatim, and `--validate` reports it without spending an agent, so neither can drift from
 // the predicate that produced it.
+// The gate asks whether the reviewer can actually SEE a change, not whether a ref exists. Three rounds
+// of review found instances of the same defect — a gate opening on a ref whose content and diff were
+// both absent — so admission is decided here, after file selection, from readable evidence.
+function changeEvidenceGate(
+  evidence: ChangeEvidenceContext,
+  includedPaths: ReadonlySet<string>,
+): { readonly open: boolean; readonly reason: string } {
+  const hunkPaths = new Set(evidence.hunkPaths.map(workspacePathKey));
+  const readable = evidence.filePaths.filter((path) => {
+    const key = workspacePathKey(path);
+    return includedPaths.has(key) || hunkPaths.has(key);
+  });
+  if (readable.length > 0) return { open: true, reason: '' };
+  const admittedButUnreadable = evidence.filePaths.length;
+  return {
+    open: false,
+    reason: admittedButUnreadable > 0
+      ? `no readable change evidence in the working tree: ${admittedButUnreadable} changed path(s) were admitted but none produced readable evidence — no content block fit the file/byte budget and no diff hunk was available (an untracked file has no patch); reduce the change, raise the workspace context budget, or stage the file so a diff exists`
+      : changeEvidenceGateReason(
+        evidence.statusPathCount,
+        evidence.droppedPaths,
+        evidence.hasDiffBaseRef,
+        evidence.unsafeCommittedNames,
+      ),
+  };
+}
+
 function changeEvidenceGateReason(
   statusPathCount: number,
   droppedPaths: readonly EvidenceDroppedPath[],
   hasDiffBaseRef: boolean,
+  unsafeCommittedNames = 0,
 ): string {
   const byRule = new Map<WorkspaceContextDropRule, string[]>();
   for (const entry of droppedPaths) {
@@ -5090,9 +5142,12 @@ function changeEvidenceGateReason(
     paths.push(entry.path);
     byRule.set(entry.rule, paths);
   }
+  const unsafeNote = unsafeCommittedNames > 0
+    ? `; ${unsafeCommittedNames} committed name(s) were excluded as unsafe paths (not named here)`
+    : '';
   const cause = droppedPaths.length === 0
     ? statusPathCount === 0
-      ? 'git status reported no changed or untracked paths'
+      ? `git status reported no changed or untracked paths${unsafeNote}`
       : `git status reported ${statusPathCount} path(s), none of which produced a file ref`
     : `git status reported ${statusPathCount} changed path(s), all dropped before becoming evidence — ${[...byRule]
         .map(([rule, paths]) => `${paths.length} by ${rule}${describeDroppedPathSample(rule, paths)}`)
@@ -5166,13 +5221,21 @@ function workspaceContextDiffPathAllowed(
   return evidencePathAllowed(key, runtimeStateExcludedPaths, evidenceScope) && !workspacePathExcludedBySet(key, excludedPaths);
 }
 
+interface DiffEvidenceRefs {
+  readonly refs: readonly string[];
+  // Paths that produced at least one hunk. The gate needs these, and only this loop knows the path a
+  // hunk belongs to — recovering it by re-parsing the ref string would duplicate the ref grammar.
+  readonly hunkPaths: readonly string[];
+}
+
 function diffEvidenceRefs(
   kind: string,
   diff: string,
   runtimeStateExcludedPaths: ReadonlySet<string>,
   evidenceScope: EvidenceScope = 'default',
-): readonly string[] {
+): DiffEvidenceRefs {
   const refs: string[] = [];
+  const hunkPaths: string[] = [];
   let currentPath = '';
   let hunkIndex = 0;
   for (const line of diff.split(/\r?\n/)) {
@@ -5186,9 +5249,10 @@ function diffEvidenceRefs(
     if (currentPath && evidencePathAllowed(currentPath, runtimeStateExcludedPaths, evidenceScope) && line.startsWith('@@')) {
       hunkIndex += 1;
       refs.push(`hunk:${kind}:${currentPath}:${hunkIndex}`);
+      if (hunkIndex === 1) hunkPaths.push(currentPath);
     }
   }
-  return refs;
+  return { refs, hunkPaths };
 }
 
 interface GitDiffHeader {

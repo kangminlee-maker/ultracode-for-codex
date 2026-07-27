@@ -606,6 +606,9 @@ test('built-in code-review runs dynamic lens finders, candidate verifiers, sweep
     assert.equal(snapshot.result.stats.verifierAttempts, 2);
     assert.equal(snapshot.result.stats.reported, 1);
     assert.match(snapshot.result.provenance.sourceSnapshotId, /^git:[0-9a-f]{40}:sha256:[0-9a-f]{64}$/);
+    // No range was requested. The context prints "(none)" for display, and that string is truthy, so
+    // reading it unguarded reported a commit range that was never reviewed.
+    assert.equal(snapshot.result.provenance.diffBaseRef, null);
     const planEvent = events.find((event) => event.type === 'workflow.plan.ready');
     assert.equal(planEvent.mode, 'phase_parallel');
     assert.equal(planEvent.phases.length, 1);
@@ -1296,6 +1299,68 @@ test('a committed path containing a space survives into the evidence gate', asyn
   }
 });
 
+test('the gate refuses to open when an admitted path produced nothing readable', async () => {
+  // An untracked file larger than the byte budget yields no content block, and an untracked file has no
+  // patch either — so a ref existed while the reviewer had nothing to look at. The gate is now decided
+  // from readable evidence, not from the presence of a ref.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { evidenceScope: 'all' } });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    // maxFileBytes defaults to 12_000; workspaceContextFileBlock yields nothing for a larger file.
+    await writeFile(join(root, 'src', 'Huge.java'), `class Huge { ${'/* pad */'.repeat(4000)} }\n`);
+
+    const report = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.equal(report.evidence.gated, true);
+    assert.match(report.evidence.reason, /none produced readable evidence/);
+
+    const launch = await runtime.launch({ name: 'code-review', args: { prompt: 'Review it' } });
+    await collectEvents(runtime, launch.taskId);
+    assert.equal(runtime.get(launch.taskId).status, 'failed');
+    assert.equal(backend.requests.length, 0, 'no agent may spend when nothing is readable');
+
+    // Control: a small file of the same admitted kind opens the gate, so the rule keys on readability.
+    await writeFile(join(root, 'src', 'Small.java'), 'class Small { void ok() {} }\n');
+    const ready = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.equal(ready.evidence.gated, false);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('an evidence path is read before ordinary budget candidates', async () => {
+  // With 24 ordinary allowlisted changed paths ahead of it, an evidence-only path used to lose the
+  // maxFiles budget and reach the reviewer as a ref with no contents.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { evidenceScope: 'all' } });
+  try {
+    await initializeGitRepo(root);
+    // 30 tracked files with uncommitted edits: each has a hunk, so the reviewer can see them through
+    // the diff even without a content block. They fill the maxFiles budget (24) on their own.
+    for (let index = 0; index < 30; index += 1) {
+      const name = `a${String(index).padStart(2, '0')}.ts`;
+      await writeFile(join(root, name), `export const f${index} = ${index};\n`);
+    }
+    await gitLines(root, ['add', '-A']);
+    await gitLines(root, ['commit', '-m', 'tracked']);
+    for (let index = 0; index < 30; index += 1) {
+      await writeFile(join(root, `a${String(index).padStart(2, '0')}.ts`), `export const f${index} = ${index + 1};\n`);
+    }
+    // Untracked: git produces no patch for it, so a content block is the only way it can be seen.
+    await writeFile(join(root, 'zz.java'), 'class Zz { void late() {} }\n');
+
+    const launch = await runtime.launch({ name: 'code-review', args: { prompt: 'Review the change' } });
+    await collectEvents(runtime, launch.taskId);
+    assert.ok(backend.requests.length >= 1);
+    const prompt = backend.requests[0].messages.map((message) => message.content).join('\n');
+    assert.match(prompt, /--- zz\.java \(/, 'the evidence path must be read before the budget fills');
+    assert.match(prompt, /void late\(\)/);
+  } finally {
+    await runtime.close();
+  }
+});
+
 test('evidenceScope all shows the admitted file contents, not just its path', async () => {
   // An untracked .java has no unstaged patch, so if the budget allowlist also removed it from the
   // included files the gate would open and agents would spend with a path and a status and nothing
@@ -1361,6 +1426,9 @@ test('an unsafe committed filename is excluded and reported', async () => {
     await writeFile(join(root, 'safe.ts'), 'export const safe = 1;\n');
     // A newline in the name is exactly what the git-status parser already refuses.
     await writeFile(join(root, 'un\nsafe.ts'), 'export const unsafe = 1;\n');
+    // Legal on POSIX, and safe by the same predicate: a backslash is not a control character. Normalizing
+    // it to a slash would name a nested path that does not exist, so the ref could not be read or cited.
+    await writeFile(join(root, 'back\\slash.ts'), 'export const literal = 1;\n');
     await gitLines(root, ['add', '-A']);
     await gitLines(root, ['commit', '-m', 'both']);
 
@@ -1369,6 +1437,8 @@ test('an unsafe committed filename is excluded and reported', async () => {
       args: { prompt: 'Review the last commit.', diffBaseRef: 'HEAD~1' },
     });
     assert.equal(report.evidence.allowedEvidenceRefs.includes('file:safe.ts'), true);
+    assert.equal(report.evidence.allowedEvidenceRefs.includes('file:back\\slash.ts'), true);
+    assert.equal(report.evidence.allowedEvidenceRefs.includes('file:back/slash.ts'), false);
     for (const ref of report.evidence.allowedEvidenceRefs) {
       assert.ok(!ref.includes('\n'), `unsafe name reached a ref: ${JSON.stringify(ref)}`);
     }
@@ -1376,6 +1446,18 @@ test('an unsafe committed filename is excluded and reported', async () => {
       report.evidence.unavailableEvidence.some((token) => token.includes('diff-committed-name')),
       JSON.stringify(report.evidence.unavailableEvidence),
     );
+
+    // A range whose only touched name is unsafe produces no ref at all. The gate must close, and the
+    // reason must account for the exclusion instead of claiming git reported nothing changed.
+    await writeFile(join(root, 'un\nsafe.ts'), 'export const unsafe = 2;\n');
+    await gitLines(root, ['add', '-A']);
+    await gitLines(root, ['commit', '-m', 'unsafe only']);
+    const gated = await runtime.validateWorkflowInput({
+      name: 'code-review',
+      args: { prompt: 'Review the last commit.', diffBaseRef: 'HEAD~1' },
+    });
+    assert.equal(gated.evidence.gated, true);
+    assert.match(gated.evidence.reason, /1 committed name\(s\) were excluded as unsafe paths/);
   } finally {
     await runtime.close();
   }
@@ -1719,14 +1801,17 @@ test('the change-evidence context has a pinned section order', async () => {
     const prompt = backend.requests[0].messages.map((message) => message.content).join('\n');
 
     const expected = [
+      // The gate now sits in the top-level header, because it is decided after file selection rather
+      // than inside the change-evidence block.
+      'evidenceGate: ',
+      'evidenceGateReason: ',
+      '### Change Evidence',
       'sourceSnapshotId: ',
       'contextHash: ',
       'allowedEvidenceIndexDigest: ',
       'diffBaseRef: ',
       'truncation: ',
       'evidenceScope: ',
-      'evidenceGate: ',
-      'evidenceGateReason: ',
       '#### Evidence Ref Grammar',
       '#### Changed Files',
       '#### Dropped From Evidence',
