@@ -1082,6 +1082,21 @@ test('an unidentifiable source is refused for a policy switch only when nesting 
     await nested.close();
   }
 
+  // Control: with an injected (static) registry no child can vary by policy, so nesting must not make
+  // the policy relevant at all.
+  const injectedNested = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    refPolicy: 'lenient', nestedWorkflows: 'enabled',
+    builtinWorkflows: [{ name: 'only-static', script: 'export const meta = { name: "only-static", description: "s" };\nreturn {};' }],
+  });
+  try {
+    const resumed = await injectedNested.launch({ resumeFromRunId: runId });
+    await collectEvents(injectedNested, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(injectedNested.get(resumed.taskId).status));
+  } finally {
+    await injectedNested.close();
+  }
+
   // Control: the same policy switch without nesting is allowed, so the refusal is not blanket.
   const notNested = new WorkflowTaskRegistry({
     backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'lenient',
@@ -1245,6 +1260,96 @@ test('a journal with no recorded ref policy is unprovable, not assumed strict', 
     await assert.rejects(
       () => strictRuntime.launch({ resumeFromRunId: preFieldRunId }),
       /does not record the ref policy it ran under/,
+    );
+  } finally {
+    await strictRuntime.close();
+  }
+});
+
+test('a committed path containing a space survives into the evidence gate', async () => {
+  // `diff --git a/foo bar.ts b/foo bar.ts` does not quote the space, so deriving committed paths from
+  // the patch header lost the path and the gate then reported "no changed paths" for a valid range.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'foo bar.ts'), 'export const spaced = 1;\n');
+    await gitLines(root, ['add', '--', 'foo bar.ts']);
+    await gitLines(root, ['commit', '-m', 'spaced']);
+
+    const report = await runtime.validateWorkflowInput({
+      name: 'code-review',
+      args: { prompt: 'Review the last commit.', diffBaseRef: 'HEAD~1' },
+    });
+    assert.equal(report.evidence.gated, false);
+    assert.equal(report.evidence.allowedEvidenceRefs.includes('file:foo bar.ts'), true,
+      JSON.stringify(report.evidence.allowedEvidenceRefs));
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('validation promotes a persisted built-in scriptPath like the launch path does', async () => {
+  // Passing the persisted scriptPath used to skip both the contract and the evidence preview, so the
+  // advertised zero-token pre-check disagreed with what a launch would do.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
+    const launch = await runtime.launch({ name: 'code-review', args: { prompt: 'Review pending.ts' } });
+    await collectEvents(runtime, launch.taskId);
+    const scriptPath = runtime.get(launch.taskId).scriptPath;
+    assert.ok(typeof scriptPath === 'string');
+
+    // The contract applies through the promoted path.
+    await assert.rejects(
+      () => runtime.validateWorkflowInput({ scriptPath, args: { prompt: 'x', level: 'medium' } }),
+      /workflow arg "level" for built-in "code-review" has an unsupported value "medium"/,
+    );
+    // And so does the evidence preview.
+    const report = await runtime.validateWorkflowInput({ scriptPath, args: { prompt: 'Review pending.ts' } });
+    assert.equal(report.workflowSource, 'built_in');
+    assert.ok(report.evidence, 'a promoted built-in must still get an evidence preview');
+    assert.equal(report.evidence.gated, false);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('an unmatched injected script under a built-in name is unknown provenance, not insensitive', async () => {
+  // The source ran the real policy-sensitive code-review under lenient; the resuming runtime injects a
+  // DIFFERENT script under that name. Duplicating the injected script per policy made it look
+  // insensitive and skipped the policy check entirely.
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-unmatched-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  await initializeGitRepo(root);
+  await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
+  const source = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'lenient',
+  });
+  let runId;
+  try {
+    const first = await source.launch({ name: 'code-review', args: { prompt: 'Review pending.ts' } });
+    await collectEvents(source, first.taskId);
+    runId = source.get(first.taskId).runId;
+  } finally {
+    await source.close();
+  }
+
+  const impostor = {
+    name: 'code-review',
+    script: 'export const meta = { name: "code-review", description: "impostor" };\nreturn { impostor: true };',
+  };
+  const strictRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    builtinWorkflows: [impostor],
+  });
+  try {
+    await assert.rejects(
+      () => strictRuntime.launch({ resumeFromRunId: runId }),
+      /under --ref-policy lenient, whose cached agent results were produced under different failure semantics/,
     );
   } finally {
     await strictRuntime.close();

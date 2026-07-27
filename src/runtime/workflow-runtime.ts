@@ -2379,16 +2379,28 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     if (Object.prototype.hasOwnProperty.call(input, 'resumeFromRunId')) {
       throw workflowInputError('Workflow validation does not accept resumeFromRunId.');
     }
-    const resolved = await this.resolveLaunchInput(input);
+    let resolved = await this.resolveLaunchInput(input);
     const cwd = this.options.cwd ?? process.cwd();
+    const parsed = parseInlineWorkflowScript(resolved.script);
+    // Promote a persisted scriptPath back to built_in first, exactly as launch does. Without this a
+    // preview of a persisted built-in skipped both the contract and the evidence gate while the real
+    // launch applied them — the preview would disagree with execution, which is its whole promise.
+    resolved = await this.resolveTrustedScriptPathMetadata(
+      resolved,
+      parsed,
+      workflowScriptHash(resolved.script),
+      workflowRequestedIsolationModes(resolved.script),
+    );
+    const builtinName = resolved.workflowSource === 'built_in'
+      ? resolved.name ?? resolved.scriptMetadata?.workflowName
+      : undefined;
     // Validation is the free pre-check, so it answers the same two questions a launch answers:
     // is the request readable, and would it have anything to work on.
-    if (resolved.workflowSource === 'built_in' && resolved.name) {
-      await validateBuiltinRequestArgs(resolved.name, input.args, cwd);
+    if (builtinName) {
+      await validateBuiltinRequestArgs(builtinName, input.args, cwd);
     }
-    const parsed = parseInlineWorkflowScript(resolved.script);
-    const evidence = resolved.workflowSource === 'built_in' && resolved.name
-      ? await this.previewChangeEvidence(resolved.name, input.args, cwd)
+    const evidence = builtinName
+      ? await this.previewChangeEvidence(builtinName, input.args, cwd)
       : undefined;
     return {
       workflowName: parsed.meta.name,
@@ -2483,10 +2495,11 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       // Policy matters when the source's script could differ by policy: proven for a recognized
       // built-in, unknown for one this registry does not ship (so fail closed), and for a non-built-in
       // source only when nesting could have run a built-in child with script-agnostic call keys.
-      const relevanceFromNesting = !identity && !sourceIsBuiltin && this.nestedWorkflows;
+      const relevanceFromNesting = !identity && !sourceIsBuiltin
+        && this.nestedWorkflows && this.registryHasPolicySensitiveBuiltin();
       const policyRelevant = identity
         ? identity.policySensitive
-        : sourceIsBuiltin || this.nestedWorkflows;
+        : sourceIsBuiltin || relevanceFromNesting;
       if (policyRelevant && sourcePolicy !== currentPolicy) {
         const subject = identity
           ? `built-in "${identity.name}"`
@@ -2545,9 +2558,26 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     if (variants.length === 0) return undefined;
     const policySensitive = variants.some((variant) => variant.script !== variants[0].script);
     const matched = variants.find((variant) => workflowScriptHash(variant.script) === scriptHash);
+    if (!matched && !policySensitive) return undefined;
+    // One script for every policy AND no match means the source ran something else under this name, so
+    // its provenance is unknown — claiming "insensitive" there would skip the policy check for a source
+    // that may well have been the policy-sensitive built-in.
     return matched && policySensitive
       ? { name, policySensitive, policy: matched.policy }
       : { name, policySensitive };
+  }
+
+  // Whether any built-in the live registry can hand a nested child varies by ref policy. An injected
+  // registry is static, so no child obtainable from it can change with the policy and refusing a
+  // parent's cross-policy resume would be over-refusal.
+  private registryHasPolicySensitiveBuiltin(): boolean {
+    if (this.options.builtinWorkflows) return false;
+    const names = new Set(defaultBuiltinWorkflows('strict').map((entry) => entry.name));
+    for (const name of names) {
+      const variants = this.builtinScriptVariants(name);
+      if (variants.some((variant) => variant.script !== variants[0].script)) return true;
+    }
+    return false;
   }
 
   private async resumeSourceStartedEntry(
@@ -4819,6 +4849,7 @@ async function buildChangeEvidenceContext(
     return { text: '', truncated: false };
   }), excludedDiffPaths, runtimeStateExcludedPaths, evidenceScope);
   let committed: BoundedGitText = { text: '', truncated: false };
+  let committedRangePaths: readonly string[] = [];
   let acceptedDiffBaseRef = '';
   if (options.diffBaseRef) {
     const baseCommit = await gitOutput(root, ['rev-parse', '--verify', `${options.diffBaseRef}^{commit}`]).catch((err) => {
@@ -4838,10 +4869,25 @@ async function buildChangeEvidenceContext(
         unavailableEvidence.push(unavailableGitEvidence('diff-committed', err, options.diffBaseRef));
         return { text: '', truncated: false };
       });
+      committedRangePaths = await gitOutputRaw(root, [
+        'diff',
+        '--name-only',
+        '-z',
+        '--no-ext-diff',
+        '--find-renames',
+        `${baseCommit}..HEAD`,
+        '--',
+      ]).then(
+        (text) => uniqueStrings(text.split('\0').filter(Boolean).map(workspacePathKey)),
+        (err: unknown) => {
+          unavailableEvidence.push(unavailableGitEvidence('diff-committed-names', err, options.diffBaseRef));
+          return [];
+        },
+      );
       // A committed-range path never appears in git status, so unless it is classified here the diff
       // filter discards it silently and the gate reports "git status found no changes" for a range
       // that did contain files.
-      for (const path of gitDiffHeaderPaths(rawCommitted.text)) {
+      for (const path of committedRangePaths) {
         const rule = workspaceContextPathVerdict(path, runtimeStateExcludedPaths);
         if (rule !== undefined && !evidenceScopeForgives(rule, evidenceScope)) recordDroppedPath(path, rule);
       }
@@ -4856,11 +4902,10 @@ async function buildChangeEvidenceContext(
   const diffRefs = diffEvidence.flatMap((entry) => diffEvidenceRefs(entry.kind, entry.value.text, runtimeStateExcludedPaths, evidenceScope));
   // A file ref is what the review harness validates its scope and findings against, so a
   // diffBaseRef range that touched a file has to contribute one too — otherwise a committed-only
-  // review collects committed diff evidence it is then forbidden to cite. Derived from the same
-  // diff refs (not a second parser) and inert when no diffBaseRef resolved.
-  const committedPaths = diffRefs
-    .filter((ref) => ref.startsWith('diff:committed:'))
-    .map((ref) => ref.slice('diff:committed:'.length));
+  // review collects committed diff evidence it is then forbidden to cite. Taken from a NUL-delimited
+  // name listing rather than the patch header: `diff --git a/foo bar.ts b/foo bar.ts` does not quote
+  // spaces, so a header parser cannot split it and the path (and the whole gate) would be lost.
+  const committedPaths = committedRangePaths.filter((path) => evidencePathAllowed(path, runtimeStateExcludedPaths, evidenceScope));
   const fileRefs = uniqueStrings([...changedPaths, ...committedPaths].map((path) => `file:${path}`));
   const allowedEvidenceRefs = uniqueStrings([...fileRefs, ...diffRefs]);
   const allowedEvidenceIndexDigest = fullHash(allowedEvidenceRefs.join('\n'));
@@ -5073,18 +5118,6 @@ function workspaceContextDiffPathAllowed(
   if (!path || path === '/dev/null') return true;
   const key = workspacePathKey(path);
   return evidencePathAllowed(key, runtimeStateExcludedPaths, evidenceScope) && !workspacePathExcludedBySet(key, excludedPaths);
-}
-
-// Every path a diff touches, before any admission filtering. Uses the one diff-header parser.
-function gitDiffHeaderPaths(diff: string): readonly string[] {
-  const paths: string[] = [];
-  for (const line of diff.split(/\r?\n/)) {
-    const header = parseGitDiffHeader(line);
-    if (!header) continue;
-    const path = header.newPath && header.newPath !== '/dev/null' ? header.newPath : header.oldPath;
-    if (path && path !== '/dev/null') paths.push(workspacePathKey(path));
-  }
-  return uniqueStrings(paths);
 }
 
 function diffEvidenceRefs(
