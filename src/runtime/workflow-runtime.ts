@@ -795,33 +795,9 @@ interface BuiltinResumeIdentity {
   readonly policy?: RefPolicy;
 }
 
-function builtinPolicySensitive(name: string): boolean | undefined {
-  const scripts = REF_POLICY_VALUES
-    .map((policy) => defaultBuiltinWorkflows(policy).find((entry) => entry.name === name)?.script)
-    .filter((script): script is string => script !== undefined);
-  if (scripts.length === 0) return undefined;
-  return scripts.some((script) => script !== scripts[0]);
-}
 
-function builtinResumeIdentity(
-  name: string | undefined,
-  matchesScript: (script: string) => boolean,
-): BuiltinResumeIdentity | undefined {
-  if (!name) return undefined;
-  const policySensitive = builtinPolicySensitive(name);
-  if (policySensitive === undefined) return undefined;
-  const variants: { readonly policy: RefPolicy; readonly script: string }[] = [];
-  for (const policy of REF_POLICY_VALUES) {
-    const workflow = defaultBuiltinWorkflows(policy).find((entry) => entry.name === name);
-    if (workflow) variants.push({ policy, script: workflow.script });
-  }
-  const matched = variants.find((variant) => matchesScript(variant.script));
-  // A name this version still ships is a built-in even when its recorded script matches no current
-  // variant (an older generator): the contract still applies, only the script-derived policy is lost.
-  return matched && policySensitive
-    ? { name, policySensitive, policy: matched.policy }
-    : { name, policySensitive };
-}
+
+
 
 function defaultBuiltinWorkflows(refPolicy: RefPolicy): readonly BuiltinWorkflow[] {
   const cached = BUILTIN_WORKFLOWS_BY_REF_POLICY.get(refPolicy);
@@ -2275,14 +2251,12 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         runtime: {
           schemaVersion: 1,
           cwd: this.options.cwd ?? process.cwd(),
-          // Recorded only when it differs from the legacy default. A reader from before this field
-          // rejects unknown runtime keys, so emitting it unconditionally would make every new journal
-          // unreadable after a downgrade; this way only an opt-in lenient run loses that compatibility.
-          // Absence therefore means strict, which is sound: no released version could produce a lenient
-          // run, because the policy did not exist.
-          ...(this.options.refPolicy && this.options.refPolicy !== 'strict'
-            ? { refPolicy: this.options.refPolicy }
-            : {}),
+          // Always recorded. Omitting it for the default made absence ambiguous — an intermediate build
+          // of this branch could write a lenient run with no field — and a resume then inferred strict
+          // and replayed lenient results. Provability wins over rollback convenience: a journal written
+          // here needs this version or newer to resume, which the CHANGELOG states as the migration
+          // boundary rather than leaving it to inference.
+          refPolicy: this.options.refPolicy ?? 'strict',
           ...(this.options.backend.model !== SUBAGENT_MODEL_PLACEHOLDER
             ? { model: this.options.backend.model }
             : {}),
@@ -2496,20 +2470,20 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
       const started = await this.resumeSourceStartedEntry(resumePlan.sourceTask);
       const sourceIsBuiltin = started.workflowSource === 'built_in';
       const identity = sourceIsBuiltin
-        ? builtinResumeIdentity(started.workflowName, (script) => workflowScriptHash(script) === started.scriptHash)
+        ? this.builtinIdentityFor(started.workflowName, started.scriptHash)
         : undefined;
-      // The journal is the proof. An ABSENT field means strict — sound because no released version could
-      // produce a lenient run, and this version omits the field only for strict. An explicitly recorded
-      // value this version does not recognize (a newer policy, or tampering the chain would catch) is
-      // NOT downgraded to a script-hash guess: it is unprovable and refused.
+      // The journal is the proof. An absent field means the run predates this field, NOT that it was
+      // strict: an intermediate build of this branch could write a lenient run with no field, so the
+      // script-derived policy is the only fallback and its absence stays unprovable. An explicitly
+      // recorded value this version does not recognize is likewise unprovable, never guessed.
       const journaledPolicy = started.runtime?.refPolicy;
       const sourcePolicy = journaledPolicy === undefined
-        ? identity?.policy ?? 'strict'
+        ? identity?.policy
         : isRefPolicy(journaledPolicy) ? journaledPolicy : undefined;
-      // Policy matters for an identified policy-sensitive built-in; for a built-in this version no
-      // longer recognizes (removed, renamed, or supplied through builtinWorkflows) it matters too —
-      // treating it as irrelevant ignored even a journaled mismatch; and for a non-built-in source only
-      // when nesting could have run a built-in child whose call keys are script-agnostic.
+      // Policy matters when the source's script could differ by policy: proven for a recognized
+      // built-in, unknown for one this registry does not ship (so fail closed), and for a non-built-in
+      // source only when nesting could have run a built-in child with script-agnostic call keys.
+      const relevanceFromNesting = !identity && !sourceIsBuiltin && this.nestedWorkflows;
       const policyRelevant = identity
         ? identity.policySensitive
         : sourceIsBuiltin || this.nestedWorkflows;
@@ -2523,7 +2497,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
           ? requestContractError(
             `resume of run ${runId} under --ref-policy ${currentPolicy}`,
             `the source run executed ${subject} and does not record the ref policy it ran under, so its cached agent results cannot be shown to match ${currentPolicy}`,
-            `start a fresh run under ${currentPolicy} without --resume-from-run-id${identity ? '' : ', or resume without --nested-workflows'}`,
+            `start a fresh run under ${currentPolicy} without --resume-from-run-id${relevanceFromNesting ? ', or resume without --nested-workflows' : ''}`,
           )
           : requestContractError(
             `resume of run ${runId} under --ref-policy ${currentPolicy}`,
@@ -2546,6 +2520,36 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   // that copies a built-in, and would silently skip the contract for a genuine built-in whose script
   // an upgrade changed. Requiring workflowSource === 'built_in' fixes the first; policyUnproven
   // reports the second instead of ignoring it.
+  // Policy sensitivity is a property of the registry actually in use, not of the default built-ins. An
+  // injected `builtinWorkflows` list is static — one script for every policy — so nothing in it can
+  // depend on the ref policy, and refusing its cross-policy resume would be pure over-refusal.
+  private builtinScriptVariants(name: string): readonly { readonly policy: RefPolicy; readonly script: string }[] {
+    const injected = this.options.builtinWorkflows;
+    if (injected) {
+      const workflow = injected.find((entry) => entry.name === name);
+      return workflow ? REF_POLICY_VALUES.map((policy) => ({ policy, script: workflow.script })) : [];
+    }
+    const variants: { readonly policy: RefPolicy; readonly script: string }[] = [];
+    for (const policy of REF_POLICY_VALUES) {
+      const workflow = defaultBuiltinWorkflows(policy).find((entry) => entry.name === name);
+      if (workflow) variants.push({ policy, script: workflow.script });
+    }
+    return variants;
+  }
+
+  // A name this registry still ships is a built-in even when the recorded script matches no variant (an
+  // older generator): the contract still applies, only the script-derived policy is lost.
+  private builtinIdentityFor(name: string, scriptHash: string): BuiltinResumeIdentity | undefined {
+    if (!name) return undefined;
+    const variants = this.builtinScriptVariants(name);
+    if (variants.length === 0) return undefined;
+    const policySensitive = variants.some((variant) => variant.script !== variants[0].script);
+    const matched = variants.find((variant) => workflowScriptHash(variant.script) === scriptHash);
+    return matched && policySensitive
+      ? { name, policySensitive, policy: matched.policy }
+      : { name, policySensitive };
+  }
+
   private async resumeSourceStartedEntry(
     sourceTask: WorkflowResumeSource,
   ): Promise<Extract<WorkflowJournalEntry, { readonly kind: 'workflow.run.started' }>> {

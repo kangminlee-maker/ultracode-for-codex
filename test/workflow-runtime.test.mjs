@@ -9,6 +9,7 @@ import { WorkflowTaskRegistry, isRetryableFailureReason } from '../dist/runtime/
 import { SubagentFailure } from '../dist/runtime/types.js';
 import {
   WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
+  WorkflowJournalWriter,
   computeWorkflowAgentCallKey,
   readWorkflowJournal,
   workflowJournalPath,
@@ -1186,10 +1187,112 @@ test('a built-in this version no longer recognizes is still policy-checked', asy
   }
 });
 
-test('the journal records the ref policy only when it is not the legacy default', async () => {
-  // A reader from before this field rejects unknown runtime keys, so a default run must keep writing a
-  // journal that an older version can still parse. Only an opt-in lenient run records the field.
-  for (const [refPolicy, expected] of [[undefined, false], ['strict', false], ['lenient', true]]) {
+test('a journal with no recorded ref policy is unprovable, not assumed strict', async () => {
+  // The only population that can carry no field is a run from before the field existed — including an
+  // intermediate build of this branch, where lenient WAS possible. Inferring strict there would let a
+  // strict resume replay lenient cached results, so absence must stay unprovable.
+  // Built by writing a journal that copies a real run's started entry with runtime.refPolicy omitted;
+  // the writer owns the hash chain, so this is a real journal, not a hand-forged one.
+  const legacy = {
+    name: 'code-review',
+    script: 'export const meta = { name: "code-review", description: "intermediate build" };\nreturn { legacy: true };',
+  };
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-prefield-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  const source = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    builtinWorkflows: [legacy], refPolicy: 'lenient',
+  });
+  let started;
+  try {
+    const first = await source.launch({ name: 'code-review', args: {} });
+    await collectEvents(source, first.taskId);
+    const snapshot = source.get(first.taskId);
+    const journal = await readWorkflowJournal(workflowJournalPath(snapshot.transcriptDir));
+    started = journal.entries.find((entry) => entry.kind === 'workflow.run.started');
+    assert.equal(started.runtime.refPolicy, 'lenient');
+  } finally {
+    await source.close();
+  }
+
+  // Same started entry, minus the policy field.
+  const preFieldRunId = 'run_00000000-0000-4000-8000-00000000beef';
+  const transcriptDir = join(stateDir, 'subagents', 'workflows', preFieldRunId);
+  const writer = await WorkflowJournalWriter.create({
+    transcriptDir, taskId: 'task_prefield', runId: preFieldRunId,
+  });
+  const { refPolicy, ...runtimeWithoutPolicy } = started.runtime;
+  assert.equal(refPolicy, 'lenient');
+  await writer.append({
+    kind: 'workflow.run.started',
+    workflowName: started.workflowName,
+    workflowSource: started.workflowSource,
+    ...(started.workflowSourcePath ? { workflowSourcePath: started.workflowSourcePath } : {}),
+    scriptPath: started.scriptPath,
+    scriptHash: started.scriptHash,
+    args: started.args,
+    runtime: runtimeWithoutPolicy,
+  });
+  await writer.append({
+    kind: 'workflow.run.failed', reason: 'workflow_failed', message: 'intermediate build', durationMs: 1,
+  });
+
+  const strictRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+  });
+  try {
+    await assert.rejects(
+      () => strictRuntime.launch({ resumeFromRunId: preFieldRunId }),
+      /does not record the ref policy it ran under/,
+    );
+  } finally {
+    await strictRuntime.close();
+  }
+});
+
+test('an injected built-in present in both runtimes resumes across policies', async () => {
+  // An injected builtinWorkflows list is static — one script for every policy — so nothing in it can
+  // depend on the ref policy and refusing its cross-policy resume is pure over-refusal. Contrast with
+  // the gone-review case above, where the resuming runtime does not ship the name at all.
+  const shared = {
+    name: 'shared-review',
+    script: 'export const meta = { name: "shared-review", description: "policy-independent" };\nreturn { shared: true };',
+  };
+  const root = await mkdtemp(join(tmpdir(), 'workflow-resume-injected-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  const source = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    builtinWorkflows: [shared], refPolicy: 'lenient',
+  });
+  let runId;
+  try {
+    const first = await source.launch({ name: 'shared-review', args: {} });
+    await collectEvents(source, first.taskId);
+    runId = source.get(first.taskId).runId;
+    assert.ok(runId);
+  } finally {
+    await source.close();
+  }
+
+  const strictRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    builtinWorkflows: [shared],
+  });
+  try {
+    const resumed = await strictRuntime.launch({ resumeFromRunId: runId });
+    await collectEvents(strictRuntime, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(strictRuntime.get(resumed.taskId).status));
+  } finally {
+    await strictRuntime.close();
+  }
+});
+
+test('the journal always records the ref policy', async () => {
+  // Recorded unconditionally: omitting it for the default made absence ambiguous, because an
+  // intermediate build could write a lenient run with no field, and a resume then inferred strict.
+  for (const [refPolicy, expected] of [[undefined, 'strict'], ['strict', 'strict'], ['lenient', 'lenient']]) {
     const root = await mkdtemp(join(tmpdir(), 'workflow-journal-policy-'));
     tempDirs.push(root);
     const runtime = new WorkflowTaskRegistry({
@@ -1202,12 +1305,7 @@ test('the journal records the ref policy only when it is not the legacy default'
       const snapshot = runtime.get(launch.taskId);
       const journal = await readWorkflowJournal(workflowJournalPath(snapshot.transcriptDir));
       const started = journal.entries.find((entry) => entry.kind === 'workflow.run.started');
-      assert.equal(
-        Object.prototype.hasOwnProperty.call(started.runtime, 'refPolicy'),
-        expected,
-        `refPolicy=${String(refPolicy)}`,
-      );
-      if (expected) assert.equal(started.runtime.refPolicy, 'lenient');
+      assert.equal(started.runtime.refPolicy, expected, `refPolicy=${String(refPolicy)}`);
     } finally {
       await runtime.close();
     }
