@@ -92,6 +92,15 @@ the project uses [semantic versioning](https://semver.org/).
 - `evidenceGate:` / `evidenceGateReason:` moved from inside `### Change Evidence` to the workspace-context
   header, because the gate is now decided after file selection. `run --validate` reports the same verdict
   by running the same builder, so the preflight and the run cannot diverge.
+- **A `file:` ref is published only for a path the reviewer can read**, and the gate is now that same
+  rule ("is any file ref publishable?"). Publication and admission can no longer disagree: previously a
+  truncated `diffBaseRef..HEAD` range or an exhausted file budget left a citable ref for a change no
+  agent received, and because some other path was readable the gate opened and validation accepted the
+  citation. Withheld paths are disclosed as `unavailable:file-evidence:<n>:no-content-block-or-hunk`.
+- An evidence-gate failure whose drops are **all** `extension-not-allowed` now leads with
+  `--evidence-scope all` instead of "change a file whose extension is in the allowlist" — for a
+  Java-only repository the old text hid the supported answer and read as "rename your code". Mixed-rule
+  failures keep the generic remedy and mention the scope flag second.
 
 ### Fixed
 
@@ -106,6 +115,22 @@ the project uses [semantic versioning](https://semver.org/).
 - The `(none)` placeholder the context prints when no commit range was accepted is no longer read back as
   a range: it is truthy, so `provenance.diffBaseRef` reported `"(none)"` and the file-ref diagnostic
   claimed a `(none)..HEAD` range that was never reviewed.
+- A direct `--script-path` launch of a persisted built-in is refused when the script's baked-in ref policy
+  differs from the requested one. Promotion classifies such a launch as the built-in, but only the resume
+  shapes were policy-checked, so the run executed the source policy while stderr and the journal recorded
+  the requested one — and a later resume trusted that false record. The dangerous direction was a lenient
+  script under requested `strict`: the review completes with candidates dropped where a real strict run
+  fails. Refusal names the policy that generated the script and both ways out (pass that policy, or launch
+  by name to generate the current one).
+- A path that one `git status` entry reports as a safe change is no longer also treated as excluded
+  because a **different** entry mentioned it in an excluded position (an unsafe rename source pointing at
+  it). It was in both the accepted and the excluded list, and every consumer that asked "is this
+  excluded?" won, so the file lost its content block and its diff while still being listed as changed.
+  The parser now single-sources the exclusion.
+- A filename with a leading or trailing space keeps its identity. Two normalizers renamed it to a file
+  that does not exist — the shared `uniqueStrings` dedup (which trims) and the workspace path resolver —
+  while its `file:` ref kept the true name, so the reviewer held a citation licence for a file the runtime
+  had just failed to read. Path lists now dedup without trimming.
 
 ## [0.6.1] - 2026-07-18
 

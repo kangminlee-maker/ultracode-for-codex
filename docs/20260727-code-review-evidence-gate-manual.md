@@ -52,6 +52,15 @@ if (firstLineValue(context, "evidenceGate: ") === "closed") {
 
 둘 다 아니면 리뷰어는 경로 이름만 받고 볼 것이 없으므로, 게이트는 닫힙니다. 이 기준은 파일 선택(프롬프트 예산 배분) **이후에** 평가되고, 그래서 증거 경로가 예산 경쟁에서 먼저 선택됩니다 — 그중에서도 hunk가 없는 경로(미추적 파일은 patch가 없습니다)가 우선입니다.
 
+**같은 기준이 인용 허가에도 적용됩니다.** `file:<path>` ref는 "이 파일 내용을 인용해도 된다"는 허가이므로, 읽을 수 있는 경로에만 발행됩니다. 그래서 게이트는 곧 "발행 가능한 `file:` ref가 하나라도 있는가"이고, *리뷰 가능성*과 *인용 가능성*이 어긋날 수 없습니다. 인정됐지만 읽히지 않아 보류된 경로는 개수로 공개됩니다:
+
+```
+### Unavailable Evidence
+unavailable:file-evidence:1:no-content-block-or-hunk
+```
+
+이것이 중요한 이유: 예전에는 `diffBaseRef` 구간 diff가 60KB 상한에 잘리거나 파일 예산이 소진되면, 리뷰어가 **받지도 못한** 변경에 대해 인용 가능한 ref가 남았습니다. 다른 경로 하나가 읽히면 게이트는 열리고, 검증은 그 인용을 통과시켰습니다.
+
 닫힌 게이트의 사유 문자열은 **두 종류**이고, 처방이 서로 다릅니다.
 
 | 접두어 | 의미 | 처방 |
@@ -220,7 +229,7 @@ npm exec -- ultracode-for-codex result <jobId> --cwd /path/to/project
 | `--evidence-scope <default\|all>` | `default` (`settings.json: workflow.evidenceScope`) | `all`은 **확장자 허용목록만** 완화합니다. 제외 디렉터리·런타임 상태·안전하지 않은 경로는 어떤 scope에서도 인정되지 않습니다 |
 | `--ref-policy <strict\|lenient>` | `strict` (`settings.json: workflow.refPolicy`) | `lenient`는 증거에서 경로를 찾을 수 없는 인용 하나만 드롭하고 결과에 `degraded` + `stats.refDrops`를 남깁니다. 후보가 **전부** 드롭되면 그 실행은 여전히 실패합니다(깨끗한 리뷰로 위장할 수 없음). 렌즈 판단과 구조 위반은 모든 정책에서 치명적 |
 
-`--ref-policy`가 기본값이 아니면 실행 시 stderr에 공지가 찍힙니다. 정책은 빌트인 스크립트 본문에 박히므로 두 정책의 스크립트 해시가 다르고, **정책이 다른 실행을 resume하는 것은 거부됩니다**.
+`--ref-policy`가 기본값이 아니면 실행 시 stderr에 공지가 찍힙니다. 정책은 빌트인 스크립트 본문에 박히므로 두 정책의 스크립트 해시가 다르고, **정책이 다른 실행을 resume하는 것은 거부됩니다**. 같은 이유로 이미 저장된 스크립트를 `--script-path`로 직접 실행할 때도 정책이 다르면 거부됩니다 — 그러지 않으면 스크립트에 박힌 옛 정책으로 실행되면서 stderr와 저널에는 요청한 정책이 기록되고, 이후 resume이 그 잘못된 기록을 신뢰합니다.
 
 ### 4.3 `--args` 스펙 (`code-review`)
 
@@ -256,6 +265,7 @@ npm exec -- ultracode-for-codex result <jobId> --cwd /path/to/project
 | `no readable change evidence in the working tree: N changed path(s) were admitted but none produced readable evidence …` | 경로는 인정됐지만 읽히지 않음 (예산 초과 + hunk 없음, 또는 바이너리) | `git add`로 diff를 만들거나 변경을 줄이거나 예산을 올리기. 바이너리는 증거 리뷰 불가 |
 | `… includes unsupported evidence ref file:X: not in allowed evidence refs (N entries) …` | 에이전트가 증거에 없는 **경로**를 인용 | 정상적인 페일클로즈. 문법 실수는 이미 정규화로 흡수되므로, 이 메시지는 경로 자체가 없다는 뜻 |
 | `code-review invalid: … rejected value … cause … remediation …` | 요청 계약 위반 (오타 키, 잘못된 `level`, 해석 불가 `diffBaseRef`) | 메시지가 거부된 값과 조치를 그대로 알려줍니다 |
+| `--script-path launch of built-in "code-review" under --ref-policy strict … the persisted script was generated under --ref-policy lenient …` | 저장된 스크립트의 정책과 요청 정책이 다름 | 메시지가 두 출구를 제시합니다 — 그 정책으로 실행하거나, `--name`으로 현재 정책의 스크립트를 새로 생성 |
 | `worktree isolation requires a git repository with at least one commit` | `isolation: "worktree"` 사용 시에만 발생 | git repo + 최초 커밋. `code-review` 자체와 무관 |
 | `setup`이 `loggedIn: false` 보고 | Codex 미인증 | 사용자에게 `!codex login` 요청 |
 
@@ -320,6 +330,8 @@ npm exec -- ultracode-for-codex result <jobId> --cwd /path/to/project
 - **바이너리 파일** (`--evidence-scope all`로 확장자를 완화한 경우) — hunk도 내용 블록도 만들 수 없음. → 증거 기반 리뷰의 대상이 아닙니다.
 
 예산 기본값: `maxFiles` 24, `maxFileBytes` 12,000, `maxBytes` 80,000. 증거 경로는 다른 후보보다 먼저 선택되고, 그중 hunk가 없는 경로가 다시 우선이므로, 파일이 많아도 증거가 예산 경쟁에서 밀려 사라지지는 않습니다.
+
+읽히지 않은 경로는 게이트만 잃는 것이 아니라 **인용 허가도 잃습니다**(`file:` ref 미발행). 다른 파일이 읽혀 게이트가 열린 경우에도 그렇습니다 — 이때 보류 개수는 `unavailable:file-evidence:<n>:no-content-block-or-hunk`로 공개되므로, 리뷰 범위가 좁아졌는지는 이 토큰으로 확인하십시오.
 
 **(5) `--ref-policy`가 실패의 의미를 바꿉니다**
 

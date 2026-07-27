@@ -2527,9 +2527,31 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     }
     // A co-supplied scriptPath carries no `name`, but promotion sets workflowSource from the persisted
     // metadata, which names the built-in actually being executed.
-    return resolved.workflowSource === 'built_in'
+    const promotedName = resolved.workflowSource === 'built_in'
       ? resolved.name ?? resolved.scriptMetadata?.workflowName
       : undefined;
+    // A promoted scriptPath executes the PERSISTED script, whose ref policy is baked into its text. The
+    // resume shapes above are refused on a mismatch, but a direct --script-path launch reached here
+    // unchecked: it ran the source policy while stderr and the journal recorded the requested one, and a
+    // later resume then trusted that false record. The dangerous direction is a lenient script launched
+    // under strict — the review completes with candidates dropped where a real strict run fails.
+    if (promotedName && resolved.scriptPath && resolved.scriptMetadata) {
+      const identity = this.builtinIdentityFor(promotedName, resolved.scriptMetadata.scriptHash);
+      if (identity?.policySensitive && identity.policy !== currentPolicy) {
+        throw identity.policy === undefined
+          ? requestContractError(
+            `--script-path launch of built-in "${promotedName}" under --ref-policy ${currentPolicy}`,
+            'the persisted script does not match any ref-policy variant this version generates, so the policy it would execute under cannot be shown to be the requested one',
+            `launch it by name (--name ${promotedName}) so the current policy's script is generated`,
+          )
+          : requestContractError(
+            `--script-path launch of built-in "${promotedName}" under --ref-policy ${currentPolicy}`,
+            `the persisted script was generated under --ref-policy ${identity.policy}, and that policy is baked into its text, so it would execute under ${identity.policy} while this run reports ${currentPolicy}`,
+            `pass --ref-policy ${identity.policy} to run the persisted script as written, or launch by name (--name ${promotedName}) to generate the ${currentPolicy} script`,
+          );
+      }
+    }
+    return promotedName;
   }
 
   // Identity comes from the source journal's run.started entry, which is the only place that records
@@ -4726,7 +4748,7 @@ async function buildWorkspaceContext(
   const gitStatusPaths = status.paths;
   const gitStatusPathParse = parseGitStatusPaths(gitStatusPaths, runtimeStateExcludedPaths);
   const excludedWorkspacePaths = new Set(gitStatusPathParse.excludedPaths.map(workspacePathKey));
-  const changeEvidence = options.includeDiff
+  const evidenceDraft = options.includeDiff
     ? await buildChangeEvidenceContext(root, gitStatusPaths, options, statusUnavailableEvidence, runtimeStateExcludedPaths, evidenceScope)
     : undefined;
   const explicitPaths = [
@@ -4740,18 +4762,18 @@ async function buildWorkspaceContext(
   // also removed it from the included files the reviewer would see a path and a status and nothing
   // else — the gate would open and agents would spend blind. Everything else (the directory walk,
   // priority files, query mentions) keeps the prompt-budget allowlist.
-  const evidenceFilePaths = new Set((changeEvidence?.filePaths ?? []).map(workspacePathKey));
+  const evidenceFilePaths = new Set((evidenceDraft?.filePaths ?? []).map(workspacePathKey));
   // Evidence paths lead, and within them the ones with NO hunk lead again. A path that produced a hunk
   // is visible through the diff even without a content block; an untracked file has no patch at all, so
   // a content block is the only way the reviewer can see it. Ordering it last reproduced the
   // blind-review path for exactly the files an evidence scope was widened to admit.
-  const evidenceHunkPaths = new Set((changeEvidence?.hunkPaths ?? []).map(workspacePathKey));
-  const evidenceCandidates = [...(changeEvidence?.filePaths ?? [])].sort((left, right) => {
+  const evidenceHunkPaths = new Set((evidenceDraft?.hunkPaths ?? []).map(workspacePathKey));
+  const evidenceCandidates = [...(evidenceDraft?.filePaths ?? [])].sort((left, right) => {
     const leftHasHunk = evidenceHunkPaths.has(workspacePathKey(left)) ? 1 : 0;
     const rightHasHunk = evidenceHunkPaths.has(workspacePathKey(right)) ? 1 : 0;
     return leftHasHunk - rightHasHunk;
   });
-  const candidates = uniqueStrings([
+  const candidates = uniquePaths([
     ...evidenceCandidates,
     ...explicitPaths,
     ...changedPaths,
@@ -4782,7 +4804,9 @@ async function buildWorkspaceContext(
     includedPaths.add(workspacePathKey(candidate));
     usedBytes += blockBytes;
   }
-  const gate = changeEvidence ? changeEvidenceGate(changeEvidence, includedPaths) : undefined;
+  // Selection is done, so readability is decided: the evidence can now publish its refs.
+  const changeEvidence = evidenceDraft?.finalize(includedPaths);
+  const gate = changeEvidence ? changeEvidenceGate(changeEvidence) : undefined;
   const text = [
     '## Workspace Context',
     `Root: ${root}`,
@@ -4825,14 +4849,21 @@ interface ChangeEvidenceContext {
   // Structured projection of the same values the prompt text carries, so `--validate` can report the
   // request's satisfiability without spending an agent and without re-deriving the gate rule.
   readonly allowedFileRefs: readonly string[];
-  // Paths behind the file refs. buildWorkspaceContext prioritizes these for included-file blocks, so a
-  // committed-range path — which never appears in git status — is still shown to the reviewer.
-  readonly filePaths: readonly string[];
-  readonly hunkPaths: readonly string[];
+  // How many paths the admission rules accepted, readable or not. The gate reports this when every one
+  // of them turned out to be unreadable, which is a different failure from "nothing was admitted".
+  readonly admittedPathCount: number;
   readonly droppedPaths: readonly EvidenceDroppedPath[];
   readonly statusPathCount: number;
   readonly hasDiffBaseRef: boolean;
   readonly unsafeCommittedNames: number;
+}
+
+// What the file selector needs before the evidence exists: which paths to prioritize for content
+// blocks, and which of them already have a hunk (so a content block is not their only visibility).
+interface ChangeEvidenceDraft {
+  readonly filePaths: readonly string[];
+  readonly hunkPaths: readonly string[];
+  readonly finalize: (includedPaths: ReadonlySet<string>) => ChangeEvidenceContext;
 }
 
 interface GitStatusPathParse {
@@ -4853,7 +4884,7 @@ async function buildChangeEvidenceContext(
   initialUnavailableEvidence: readonly string[] = [],
   runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
   evidenceScope: EvidenceScope = 'default',
-): Promise<ChangeEvidenceContext> {
+): Promise<ChangeEvidenceDraft> {
   const unavailableEvidence: string[] = [...initialUnavailableEvidence];
   const gitStatusPaths = parseGitStatusPaths(gitStatus, runtimeStateExcludedPaths);
   const changedPaths: string[] = [];
@@ -4950,7 +4981,7 @@ async function buildChangeEvidenceContext(
             unavailableEvidence.push(`unavailable:diff-committed-name:${unsafe}:unsafe-path`);
             unsafeCommittedNames += unsafe;
           }
-          return uniqueStrings(names);
+          return uniquePaths(names);
         },
         (err: unknown) => {
           unavailableEvidence.push(unavailableGitEvidence('diff-committed-names', err, options.diffBaseRef));
@@ -4976,16 +5007,14 @@ async function buildChangeEvidenceContext(
   const diffRefs = diffRefResults.flatMap((entry) => entry.refs);
   // Paths that produced at least one hunk. A path with no readable content block and no hunk gives the
   // reviewer a ref and nothing to look at, which is why the gate is decided after file selection now.
-  const hunkPaths = uniqueStrings(diffRefResults.flatMap((entry) => entry.hunkPaths));
+  const hunkPaths = uniquePaths(diffRefResults.flatMap((entry) => entry.hunkPaths));
   // A file ref is what the review harness validates its scope and findings against, so a
   // diffBaseRef range that touched a file has to contribute one too — otherwise a committed-only
   // review collects committed diff evidence it is then forbidden to cite. Taken from a NUL-delimited
   // name listing rather than the patch header: `diff --git a/foo bar.ts b/foo bar.ts` does not quote
   // spaces, so a header parser cannot split it and the path (and the whole gate) would be lost.
   const committedPaths = committedRangePaths.filter((path) => evidencePathAllowed(path, runtimeStateExcludedPaths, evidenceScope));
-  const fileRefs = uniqueStrings([...changedPaths, ...committedPaths].map((path) => `file:${path}`));
-  const allowedEvidenceRefs = uniqueStrings([...fileRefs, ...diffRefs]);
-  const allowedEvidenceIndexDigest = fullHash(allowedEvidenceRefs.join('\n'));
+  const admittedPaths = uniquePaths([...changedPaths, ...committedPaths]);
   // Two audiences, two projections of the same drop list. The caller owns the repository, so its
   // diagnostic names the paths it can act on and counts only those — runtime state and unsafe paths
   // are not the caller's changes, and counting them would report a clean tree as "3 paths dropped".
@@ -5001,6 +5030,25 @@ async function buildChangeEvidenceContext(
     staged: staged.truncated,
     committed: committed.truncated,
   };
+  const hunkPathKeys = new Set(hunkPaths.map(workspacePathKey));
+  // A `file:` ref is a licence to cite the file's contents, so it may only be published for a path the
+  // reviewer can actually read: one whose content block was included, or whose diff retained a hunk. A
+  // truncated committed range or an exhausted file budget used to leave a citable ref for a change no
+  // agent ever received — the gate opened on some other readable path, and validation then accepted
+  // citations to an unseen file. Readability is only known after file selection, so the projection that
+  // publishes refs is deferred to finalize().
+  const finalize = (includedPaths: ReadonlySet<string>): ChangeEvidenceContext => {
+  const readablePaths = admittedPaths.filter((path) => {
+    const key = workspacePathKey(path);
+    return includedPaths.has(key) || hunkPathKeys.has(key);
+  });
+  const withheldPathCount = admittedPaths.length - readablePaths.length;
+  const evidenceUnavailable = withheldPathCount > 0
+    ? [...unavailableEvidence, `unavailable:file-evidence:${withheldPathCount}:no-content-block-or-hunk`]
+    : unavailableEvidence;
+  const fileRefs = uniqueStrings(readablePaths.map((path) => `file:${path}`));
+  const allowedEvidenceRefs = uniqueStrings([...fileRefs, ...diffRefs]);
+  const allowedEvidenceIndexDigest = fullHash(allowedEvidenceRefs.join('\n'));
   const contextHash = fullHash(JSON.stringify({
     root,
     sourceSnapshotId,
@@ -5008,7 +5056,7 @@ async function buildChangeEvidenceContext(
     acceptedDiffBaseRef,
     truncation,
     allowedEvidenceRefs,
-    unavailableEvidence,
+    unavailableEvidence: evidenceUnavailable,
   }));
   const sections = [
     `sourceSnapshotId: ${sourceSnapshotId}`,
@@ -5042,16 +5090,17 @@ async function buildChangeEvidenceContext(
     sourceSnapshotId,
     contextHash,
     allowedEvidenceRefs,
-    unavailableEvidence,
+    unavailableEvidence: evidenceUnavailable,
     text: sections.join('\n'),
     allowedFileRefs: fileRefs,
-    filePaths: uniqueStrings([...changedPaths, ...committedPaths]),
-    hunkPaths,
+    admittedPathCount: admittedPaths.length,
     droppedPaths: callerReportableDrops,
     statusPathCount: changedPaths.length + callerReportableDrops.length,
     hasDiffBaseRef: Boolean(acceptedDiffBaseRef),
     unsafeCommittedNames,
   };
+  };
+  return { filePaths: admittedPaths, hunkPaths, finalize };
 }
 
 // Runtime-owned grammar note. The allowlist alone does not tell a reviewer which ref KINDS exist for
@@ -5108,15 +5157,11 @@ function describeDroppedPathSample(rule: WorkspaceContextDropRule, paths: readon
 // both absent — so admission is decided here, after file selection, from readable evidence.
 function changeEvidenceGate(
   evidence: ChangeEvidenceContext,
-  includedPaths: ReadonlySet<string>,
 ): { readonly open: boolean; readonly reason: string } {
-  const hunkPaths = new Set(evidence.hunkPaths.map(workspacePathKey));
-  const readable = evidence.filePaths.filter((path) => {
-    const key = workspacePathKey(path);
-    return includedPaths.has(key) || hunkPaths.has(key);
-  });
-  if (readable.length > 0) return { open: true, reason: '' };
-  const admittedButUnreadable = evidence.filePaths.length;
+  // One rule, one place: a file ref is published only for a readable path, so "can this be reviewed?"
+  // and "may this be cited?" cannot disagree.
+  if (evidence.allowedFileRefs.length > 0) return { open: true, reason: '' };
+  const admittedButUnreadable = evidence.admittedPathCount;
   return {
     open: false,
     reason: admittedButUnreadable > 0
@@ -5152,8 +5197,18 @@ function changeEvidenceGateReason(
     : `git status reported ${statusPathCount} changed path(s), all dropped before becoming evidence — ${[...byRule]
         .map(([rule, paths]) => `${paths.length} by ${rule}${describeDroppedPathSample(rule, paths)}`)
         .join('; ')}`;
+  // Name the remediation that actually applies to what was dropped. Telling a Java-only repository to
+  // "change a file whose extension is in the allowlist" hides the supported answer and reads as
+  // "rename your code": --evidence-scope all forgives exactly the extension rule and nothing else.
+  const extensionDropped = byRule.has('extension-not-allowed');
+  const extensionOnly = extensionDropped && byRule.size === 1;
   const remediation = [
-    'change a file whose extension is in the evidence allowlist and outside the excluded directories',
+    extensionOnly
+      ? 'pass --evidence-scope all to forgive the extension allowlist (excluded directories, runtime state, and unsafe paths stay inadmissible)'
+      : 'change a file whose extension is in the evidence allowlist and outside the excluded directories',
+    extensionDropped && !extensionOnly
+      ? 'or pass --evidence-scope all to forgive the extension allowlist for those paths'
+      : undefined,
     hasDiffBaseRef ? undefined : 'or pass diffBaseRef to review a committed range',
     'and re-run `--validate` to confirm before spending',
   ].filter(Boolean).join(', ');
@@ -5393,6 +5448,23 @@ function extractMentionedWorkspacePaths(query: string): readonly string[] {
   return [...out];
 }
 
+// A path that one status entry reported as a safe change is not excluded because a DIFFERENT entry
+// mentioned it in an excluded position — an unsafe rename source pointing at it, for instance. Leaving
+// it in both lists made it citable and unreadable at once: every consumer that asks "is this excluded?"
+// won, so the file lost its content block and its diff while still being listed as changed.
+function gitStatusPathParseResult(
+  paths: readonly string[],
+  excludedPaths: readonly string[],
+  unavailableEvidence: readonly string[],
+): GitStatusPathParse {
+  const accepted = new Set(paths.map(workspacePathKey));
+  return {
+    paths,
+    excludedPaths: excludedPaths.filter((path) => !accepted.has(workspacePathKey(path))),
+    unavailableEvidence,
+  };
+}
+
 function parseGitStatusPaths(
   status: string,
   runtimeStateExcludedPaths: ReadonlySet<string> = EMPTY_WORKSPACE_PATH_EXCLUSIONS,
@@ -5438,7 +5510,7 @@ function parseGitStatusPaths(
     else if (isWorkspaceEvidencePathSafe(path)) excludedPaths.push(path);
     else unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:${renameParts ? 'unsafe-target' : 'unsafe-path'}`);
   }
-  return { paths, excludedPaths, unavailableEvidence };
+  return gitStatusPathParseResult(paths, excludedPaths, unavailableEvidence);
 }
 
 function parseGitStatusPathsZ(
@@ -5477,7 +5549,7 @@ function parseGitStatusPathsZ(
       index += 1;
     }
   }
-  return { paths, excludedPaths, unavailableEvidence };
+  return gitStatusPathParseResult(paths, excludedPaths, unavailableEvidence);
 }
 
 // Bound the `### Git Status` display to a byte budget, keeping whole leading lines (git lists staged
@@ -5735,9 +5807,11 @@ async function resolveWorkspaceContextPath(
   root: string,
   requestedPath: string,
 ): Promise<{ readonly path: string; readonly relativePath: string } | null> {
-  const requested = requestedPath.trim();
-  if (!requested) return null;
-  const candidate = isAbsolute(requested) ? resolve(requested) : resolve(root, requested);
+  // No trim: a leading or trailing space is part of a legal filename. Trimming resolved a real file to a
+  // different, nonexistent path while its evidence ref kept the true name, so the reviewer held a
+  // citation licence for a file the runtime had just failed to read.
+  if (requestedPath === '') return null;
+  const candidate = isAbsolute(requestedPath) ? resolve(requestedPath) : resolve(root, requestedPath);
   if (!pathInsideOrEqual(root, candidate)) return null;
   const canonical = await realpath(candidate).catch(() => null);
   if (!canonical || !pathInsideOrEqual(root, canonical)) return null;
@@ -5833,6 +5907,20 @@ function numberWorkspaceContextLines(text: string): string {
 
 function splitLines(value: string): string[] {
   return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
+// Paths are values, not tokens. uniqueStrings trims, which renames a file whose name has a leading or
+// trailing space into one that does not exist: the ref survived (the `file:` prefix moved the space
+// inward) while the read of the same path failed, so the file was citable and unreadable at once.
+function uniquePaths(values: Iterable<string>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
 }
 
 function uniqueStrings(values: Iterable<string>): string[] {

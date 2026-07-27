@@ -1205,6 +1205,65 @@ test('a built-in this version no longer recognizes is still policy-checked', asy
   }
 });
 
+test('a direct scriptPath launch of a persisted built-in is refused across ref policies', async () => {
+  // The persisted script has its ref policy baked into its text. Promotion classifies the launch as the
+  // built-in, so without this check the run executed the SOURCE policy while stderr and the journal
+  // recorded the requested one — and a later resume trusted that false record. The dangerous direction
+  // is a lenient script under requested strict: the review completes with candidates dropped where a
+  // real strict run fails.
+  const backend = new FakeSubagentBackend();
+  const root = await mkdtemp(join(tmpdir(), 'workflow-scriptpath-policy-'));
+  tempDirs.push(root);
+  const stateDir = join(root, '.ultracode-for-codex');
+  await initializeGitRepo(root);
+  await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
+
+  const lenientRuntime = new WorkflowTaskRegistry({
+    backend, cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'lenient',
+  });
+  let lenientScriptPath;
+  try {
+    const first = await lenientRuntime.launch({ name: 'code-review', args: { prompt: 'Review pending.ts' } });
+    await collectEvents(lenientRuntime, first.taskId);
+    lenientScriptPath = lenientRuntime.get(first.taskId).scriptPath;
+    assert.ok(typeof lenientScriptPath === 'string');
+  } finally {
+    await lenientRuntime.close();
+  }
+
+  const strictRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'strict',
+  });
+  try {
+    await assert.rejects(
+      () => strictRuntime.launch({ scriptPath: lenientScriptPath, args: { prompt: 'Review pending.ts' } }),
+      /the persisted script was generated under --ref-policy lenient/,
+    );
+    await assert.rejects(
+      () => strictRuntime.launch({ scriptPath: lenientScriptPath, args: { prompt: 'Review pending.ts' } }),
+      /pass --ref-policy lenient to run the persisted script as written, or launch by name/,
+    );
+  } finally {
+    await strictRuntime.close();
+  }
+
+  // Control: the policy that actually generated the script launches it, so the check keys on the
+  // mismatch rather than on passing a scriptPath at all. What matters is that the launch is ACCEPTED —
+  // how the review then turns out depends on the fixture's evidence, not on this rule.
+  const sameRuntime = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000, refPolicy: 'lenient',
+  });
+  try {
+    const again = await sameRuntime.launch({ scriptPath: lenientScriptPath, args: { prompt: 'Review pending.ts' } });
+    await collectEvents(sameRuntime, again.taskId);
+    const snapshot = sameRuntime.get(again.taskId);
+    assert.doesNotMatch(snapshot.error ?? '', /persisted script was generated under --ref-policy/);
+    assert.ok(['completed', 'failed'].includes(snapshot.status));
+  } finally {
+    await sameRuntime.close();
+  }
+});
+
 test('a journal with no recorded ref policy is unprovable, not assumed strict', async () => {
   // The only population that can carry no field is a run from before the field existed — including an
   // intermediate build of this branch, where lenient WAS possible. Inferring strict there would let a
@@ -1327,6 +1386,44 @@ test('the gate refuses to open when an admitted path produced nothing readable',
     await writeFile(join(root, 'src', 'Small.java'), 'class Small { void ok() {} }\n');
     const ready = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
     assert.equal(ready.evidence.gated, false);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('an admitted path that cannot be read gets no citable file ref', async () => {
+  // A `file:` ref is a licence to cite the file's contents. When one path is readable the gate opens, so
+  // an unreadable sibling used to keep its ref and validation accepted citations to a change no agent
+  // ever received. Readability now decides publication, not just the gate.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { evidenceScope: 'all' } });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    // Readable: small, so its content block fits. Opens the gate on its own.
+    await writeFile(join(root, 'src', 'Small.java'), 'class Small { void ok() {} }\n');
+    // Unreadable: untracked (no patch) and over maxFileBytes (12,000), so no content block either.
+    await writeFile(join(root, 'src', 'Huge.java'), `class Huge { ${'/* pad */'.repeat(4000)} }\n`);
+
+    const report = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.equal(report.evidence.gated, false, 'the readable path must open the gate');
+    assert.equal(report.evidence.allowedEvidenceRefs.includes('file:src/Small.java'), true);
+    assert.equal(
+      report.evidence.allowedEvidenceRefs.includes('file:src/Huge.java'),
+      false,
+      'an unreadable path must not be citable',
+    );
+    // Withheld, not silently absent: the count is disclosed as unavailable evidence.
+    assert.ok(
+      report.evidence.unavailableEvidence.some((token) => token === 'unavailable:file-evidence:1:no-content-block-or-hunk'),
+      JSON.stringify(report.evidence.unavailableEvidence),
+    );
+
+    // Control: stage the big file so a diff exists, and its ref returns — the rule keys on readability,
+    // not on file size.
+    await gitLines(root, ['add', '--', 'src/Huge.java']);
+    const staged = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.equal(staged.evidence.allowedEvidenceRefs.includes('file:src/Huge.java'), true);
   } finally {
     await runtime.close();
   }
@@ -1922,6 +2019,36 @@ test('code-review still fails closed on a ref whose path is not in evidence (nor
     const snapshot = runtime.get(launch.taskId);
     assert.equal(snapshot.status, 'failed');
     assert.match(snapshot.error, /includes unsupported evidence ref file:outside\.md/);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('an extension-only gate failure names --evidence-scope all', async () => {
+  // Telling a Java-only repository to "change a file whose extension is in the allowlist" hides the
+  // supported answer and reads as "rename your code".
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src', 'App.java'), 'class App {}\n');
+
+    const report = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.equal(report.evidence.gated, true);
+    assert.match(report.evidence.reason, /pass --evidence-scope all to forgive the extension allowlist/);
+    assert.doesNotMatch(
+      report.evidence.reason,
+      /change a file whose extension is in the evidence allowlist/,
+      'the extension-only case must not offer the rename remedy at all',
+    );
+
+    // Control: add an excluded-dir drop, so the rules are mixed and the generic remedy leads again.
+    await mkdir(join(root, 'dist'), { recursive: true });
+    await writeFile(join(root, 'dist', 'bundle.js'), 'export const bundled = 1;\n');
+    const mixed = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.match(mixed.evidence.reason, /change a file whose extension is in the evidence allowlist/);
+    assert.match(mixed.evidence.reason, /or pass --evidence-scope all to forgive the extension allowlist for those paths/);
   } finally {
     await runtime.close();
   }
