@@ -876,11 +876,14 @@ test('a resumed built-in still validates its request contract', async () => {
   await writeFile(join(root, 'pending.ts'), 'export const pending = 1;\n');
   const runtime = new WorkflowTaskRegistry({ backend, cwd: root, stateDir, requestTimeoutMs: 30_000 });
   let runId;
+  let firstScriptPath;
   try {
     const first = await runtime.launch({ name: 'code-review', args: { prompt: 'Review pending.ts' } });
     await collectEvents(runtime, first.taskId);
     runId = runtime.get(first.taskId).runId;
+    firstScriptPath = runtime.get(first.taskId).scriptPath;
     assert.ok(runId);
+    assert.ok(typeof firstScriptPath === 'string');
 
     await assert.rejects(
       () => runtime.launch({ resumeFromRunId: runId, args: { promt: 'typo on resume' } }),
@@ -905,6 +908,17 @@ test('a resumed built-in still validates its request contract', async () => {
     });
     await collectEvents(runtime, replaced.taskId);
     assert.ok(['completed', 'failed'].includes(runtime.get(replaced.taskId).status));
+
+    // A co-supplied scriptPath naming the SAME persisted built-in still executes that built-in, so its
+    // contract must apply even though the launch input carries no `name`.
+    await assert.rejects(
+      () => runtime.launch({
+        resumeFromRunId: runId,
+        scriptPath: firstScriptPath,
+        args: { prompt: 'Review pending.ts', level: 'medium' },
+      }),
+      /workflow arg "level" for built-in "code-review" has an unsupported value "medium"/,
+    );
   } finally {
     await runtime.close();
   }
@@ -956,11 +970,42 @@ test('a resume under a different ref policy is refused', async () => {
   } finally {
     await sameRuntime.close();
   }
+
+  // The REVERSE direction: a lenient source resumed under the strict default. "strict is the default"
+  // proves nothing about what the source ran, and testing only one direction is what let this through.
+  const lenientRoot = await mkdtemp(join(tmpdir(), 'workflow-resume-policy-reverse-'));
+  tempDirs.push(lenientRoot);
+  const lenientStateDir = join(lenientRoot, '.ultracode-for-codex');
+  await initializeGitRepo(lenientRoot);
+  await writeFile(join(lenientRoot, 'pending.ts'), 'export const pending = 1;\n');
+  const sourceLenient = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: lenientRoot, stateDir: lenientStateDir,
+    requestTimeoutMs: 30_000, refPolicy: 'lenient',
+  });
+  let lenientRunId;
+  try {
+    const first = await sourceLenient.launch({ name: 'code-review', args: { prompt: 'Review pending.ts' } });
+    await collectEvents(sourceLenient, first.taskId);
+    lenientRunId = sourceLenient.get(first.taskId).runId;
+  } finally {
+    await sourceLenient.close();
+  }
+  const strictRuntime2 = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: lenientRoot, stateDir: lenientStateDir, requestTimeoutMs: 30_000,
+  });
+  try {
+    await assert.rejects(
+      () => strictRuntime2.launch({ resumeFromRunId: lenientRunId }),
+      /under --ref-policy lenient, whose cached agent results were produced under different failure semantics/,
+    );
+  } finally {
+    await strictRuntime2.close();
+  }
 });
 
-test('a built-in whose recorded script no longer matches any variant fails closed on a policy switch', async () => {
-  // Simulates a source run created by an older generator: provenance still says built_in and the name
-  // is known, but the script matches neither current variant, so its policy cannot be proven.
+test('a built-in whose recorded script no longer matches any variant is still policy-checked', async () => {
+  // Simulates a source run created by an older generator: the script matches neither current variant,
+  // so the script-derived policy is lost. The journaled run-level policy still proves it.
   const legacyReview = { name: 'code-review', script: 'export const meta = { name: "code-review", description: "legacy" };\nreturn { legacy: true };' };
   const root = await mkdtemp(join(tmpdir(), 'workflow-resume-legacy-'));
   tempDirs.push(root);
@@ -985,7 +1030,7 @@ test('a built-in whose recorded script no longer matches any variant fails close
   try {
     await assert.rejects(
       () => lenientRuntime.launch({ resumeFromRunId: runId }),
-      /with a script this version no longer generates/,
+      /under --ref-policy strict, whose cached agent results were produced under different failure semantics/,
     );
   } finally {
     await lenientRuntime.close();
@@ -1046,6 +1091,49 @@ test('an unidentifiable source is refused for a policy switch only when nesting 
     assert.ok(['completed', 'failed'].includes(notNested.get(resumed.taskId).status));
   } finally {
     await notNested.close();
+  }
+
+  // Control: nesting enabled with the SAME policy as the source resumes, so the rule keys on the
+  // mismatch rather than on nesting.
+  const nestedSamePolicy = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: root, stateDir, requestTimeoutMs: 30_000,
+    nestedWorkflows: 'enabled',
+  });
+  try {
+    const resumed = await nestedSamePolicy.launch({ resumeFromRunId: runId });
+    await collectEvents(nestedSamePolicy, resumed.taskId);
+    assert.ok(['completed', 'failed'].includes(nestedSamePolicy.get(resumed.taskId).status));
+  } finally {
+    await nestedSamePolicy.close();
+  }
+
+  // The REVERSE direction: a lenient parent resumed under the strict default with nesting enabled.
+  const lenientParentRoot = await mkdtemp(join(tmpdir(), 'workflow-resume-nested-reverse-'));
+  tempDirs.push(lenientParentRoot);
+  const lenientParentStateDir = join(lenientParentRoot, '.ultracode-for-codex');
+  const lenientParent = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: lenientParentRoot, stateDir: lenientParentStateDir,
+    requestTimeoutMs: 30_000, refPolicy: 'lenient', nestedWorkflows: 'enabled',
+  });
+  let lenientParentRunId;
+  try {
+    const launched = await lenientParent.launch({ script, args: {} });
+    await collectEvents(lenientParent, launched.taskId);
+    lenientParentRunId = lenientParent.get(launched.taskId).runId;
+  } finally {
+    await lenientParent.close();
+  }
+  const strictNested = new WorkflowTaskRegistry({
+    backend: new FakeSubagentBackend(), cwd: lenientParentRoot, stateDir: lenientParentStateDir,
+    requestTimeoutMs: 30_000, nestedWorkflows: 'enabled',
+  });
+  try {
+    await assert.rejects(
+      () => strictNested.launch({ resumeFromRunId: lenientParentRunId }),
+      /under --ref-policy lenient, whose cached agent results were produced under different failure semantics/,
+    );
+  } finally {
+    await strictNested.close();
   }
 });
 

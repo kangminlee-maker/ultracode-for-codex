@@ -6,7 +6,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import { promisify } from 'node:util';
 import { createContext, runInContext } from 'node:vm';
 import type { AgentConcurrency, EvidenceScope, NestedWorkflows, ReasoningEffort, RefPolicy, ResolvedAgentType, SubagentBackend, SubagentRequest, SubagentResult, SubagentUsage, WorktreeRetention } from './types.js';
-import { REF_POLICY_VALUES, SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort, isSubagentFailure } from './types.js';
+import { REF_POLICY_VALUES, SUBAGENT_MODEL_PLACEHOLDER, UltracodeRequestError, estimateTokens, isReasoningEffort, isRefPolicy, isSubagentFailure } from './types.js';
 import { AgentConcurrencyPool } from './agent-concurrency-pool.js';
 import {
   WORKFLOW_JOURNAL_GENESIS_AGENT_CALL_KEY,
@@ -788,22 +788,19 @@ const BUILTIN_WORKFLOWS_BY_REF_POLICY = new Map<RefPolicy, readonly BuiltinWorkf
 // cross-policy resume of those as a mismatch that does not exist.
 interface BuiltinResumeIdentity {
   readonly name: string;
+  // Whether this built-in's generated script varies by ref policy at all. False for task/batch, where
+  // there is nothing to prove and no resume needs refusing.
+  readonly policySensitive: boolean;
+  // The policy proven from the recorded script, when it matches a current variant.
   readonly policy?: RefPolicy;
-  // A built-in this version still knows by name, whose recorded script matches no generated variant.
-  // Its contract still applies; its policy cannot be proven.
-  readonly policyUnproven?: boolean;
 }
 
-// A built-in identified by provenance and name but not by script text. Only policy-sensitive built-ins
-// report an unproven policy: for one that generates the same script under every policy there is
-// nothing to prove.
-function builtinUnprovenPolicyIdentity(name: string): BuiltinResumeIdentity | undefined {
+function builtinPolicySensitive(name: string): boolean | undefined {
   const scripts = REF_POLICY_VALUES
     .map((policy) => defaultBuiltinWorkflows(policy).find((entry) => entry.name === name)?.script)
     .filter((script): script is string => script !== undefined);
   if (scripts.length === 0) return undefined;
-  const policySensitive = scripts.some((script) => script !== scripts[0]);
-  return policySensitive ? { name, policyUnproven: true } : { name };
+  return scripts.some((script) => script !== scripts[0]);
 }
 
 function builtinResumeIdentity(
@@ -811,15 +808,19 @@ function builtinResumeIdentity(
   matchesScript: (script: string) => boolean,
 ): BuiltinResumeIdentity | undefined {
   if (!name) return undefined;
+  const policySensitive = builtinPolicySensitive(name);
+  if (policySensitive === undefined) return undefined;
   const variants: { readonly policy: RefPolicy; readonly script: string }[] = [];
   for (const policy of REF_POLICY_VALUES) {
     const workflow = defaultBuiltinWorkflows(policy).find((entry) => entry.name === name);
     if (workflow) variants.push({ policy, script: workflow.script });
   }
   const matched = variants.find((variant) => matchesScript(variant.script));
-  if (!matched) return undefined;
-  const policySensitive = variants.some((variant) => variant.script !== variants[0].script);
-  return policySensitive ? { name, policy: matched.policy } : { name };
+  // A name this version still ships is a built-in even when its recorded script matches no current
+  // variant (an older generator): the contract still applies, only the script-derived policy is lost.
+  return matched && policySensitive
+    ? { name, policySensitive, policy: matched.policy }
+    : { name, policySensitive };
 }
 
 function defaultBuiltinWorkflows(refPolicy: RefPolicy): readonly BuiltinWorkflow[] {
@@ -2210,6 +2211,13 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     // Before the permission gate and before any journal or spend: a built-in's request contract is
     // decidable from the args alone, so reject an unreadable request loudly here instead of letting
     // the script's silent fallbacks run someone else's review.
+    const parsed = parseInlineWorkflowScript(resolved.script);
+    const scriptHash = workflowScriptHash(resolved.script);
+    const isolationReview = workflowRequestedIsolationModes(resolved.script);
+    resolved = await this.resolveTrustedScriptPathMetadata(resolved, parsed, scriptHash, isolationReview);
+    // After metadata promotion: an explicitly supplied persisted scriptPath is promoted back to
+    // built_in here, and validating before that skipped the contract for the built-in actually running.
+    // Still ahead of the permission gate, the journal, and any spend.
     const builtinContractName = await this.resumeAwareBuiltinContractName(resolved, resumePlan);
     if (builtinContractName) {
       await validateBuiltinRequestArgs(
@@ -2218,10 +2226,6 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         this.options.cwd ?? process.cwd(),
       );
     }
-    const parsed = parseInlineWorkflowScript(resolved.script);
-    const scriptHash = workflowScriptHash(resolved.script);
-    const isolationReview = workflowRequestedIsolationModes(resolved.script);
-    resolved = await this.resolveTrustedScriptPathMetadata(resolved, parsed, scriptHash, isolationReview);
     const permissionRequired = await this.workflowPermissionRequired(
       resumePlan.launchInput,
       resolved,
@@ -2271,6 +2275,7 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
         runtime: {
           schemaVersion: 1,
           cwd: this.options.cwd ?? process.cwd(),
+          refPolicy: this.options.refPolicy ?? 'strict',
           ...(this.options.backend.model !== SUBAGENT_MODEL_PLACEHOLDER
             ? { model: this.options.backend.model }
             : {}),
@@ -2480,39 +2485,43 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   ): Promise<string | undefined> {
     const currentPolicy = this.options.refPolicy ?? 'strict';
     if (resumePlan.sourceTask) {
-      const identity = await this.resumeSourceBuiltinIdentity(resumePlan.sourceTask);
       const runId = resumePlan.sourceTask.runId;
-      if (identity?.policy !== undefined && identity.policy !== currentPolicy) {
-        throw requestContractError(
-          `resume of run ${runId} under --ref-policy ${currentPolicy}`,
-          `the source run executed built-in "${identity.name}" under --ref-policy ${identity.policy}, whose cached agent results were produced under different failure semantics and whose call keys do not record the policy`,
-          `resume with --ref-policy ${identity.policy}, or start a fresh run under ${currentPolicy} without --resume-from-run-id`,
-        );
-      }
-      // Fail closed when the source is a policy-sensitive built-in whose script matches no current
-      // variant (an older generator): its policy cannot be proven, so it must not be replayed under a
-      // non-default one.
-      if (identity?.policyUnproven && currentPolicy !== 'strict') {
-        throw requestContractError(
-          `resume of run ${runId} under --ref-policy ${currentPolicy}`,
-          `the source run executed built-in "${identity.name}" with a script this version no longer generates, so the ref policy it ran under cannot be proven and its cached results cannot be shown to match ${currentPolicy}`,
-          `resume with the default --ref-policy strict, or start a fresh run under ${currentPolicy} without --resume-from-run-id`,
-        );
-      }
-      // A nested built-in child is journaled only as the parent's agent entries with script-agnostic
-      // call keys, so a cross-policy replay can hide inside a parent this check cannot identify.
-      // Refuse that combination rather than let it through unproven; all three conditions are opt-in.
-      if (!identity && currentPolicy !== 'strict' && this.nestedWorkflows) {
-        throw requestContractError(
-          `resume of run ${runId} under --ref-policy ${currentPolicy} with nested workflows enabled`,
-          `the source run is not identifiable as a built-in, and a nested built-in child it may have run is journaled only as script-agnostic agent entries, so cached results cannot be shown to match ${currentPolicy}`,
-          `resume with the default --ref-policy strict, run without --nested-workflows, or start a fresh run under ${currentPolicy} without --resume-from-run-id`,
-        );
+      const started = await this.resumeSourceStartedEntry(resumePlan.sourceTask);
+      const identity = started.workflowSource === 'built_in'
+        ? builtinResumeIdentity(started.workflowName, (script) => workflowScriptHash(script) === started.scriptHash)
+        : undefined;
+      // The journal is the proof; the script-derived policy is the fallback for runs journaled before
+      // the field existed. `strict` being today's default proves nothing about what the source ran, so
+      // an unprovable policy is refused in BOTH directions rather than assumed to match.
+      const journaledPolicy = started.runtime?.refPolicy;
+      const sourcePolicy = isRefPolicy(journaledPolicy) ? journaledPolicy : identity?.policy;
+      // Policy matters for an identified policy-sensitive built-in, and for an unidentified source only
+      // when nesting could have run a built-in child whose call keys are script-agnostic.
+      const policyRelevant = identity ? identity.policySensitive : this.nestedWorkflows;
+      if (policyRelevant && sourcePolicy !== currentPolicy) {
+        const subject = identity
+          ? `built-in "${identity.name}"`
+          : 'a workflow that is not identifiable as a built-in, whose nested built-in child (if any) is journaled only as script-agnostic agent entries';
+        throw sourcePolicy === undefined
+          ? requestContractError(
+            `resume of run ${runId} under --ref-policy ${currentPolicy}`,
+            `the source run executed ${subject} and does not record the ref policy it ran under, so its cached agent results cannot be shown to match ${currentPolicy}`,
+            `start a fresh run under ${currentPolicy} without --resume-from-run-id${identity ? '' : ', or resume without --nested-workflows'}`,
+          )
+          : requestContractError(
+            `resume of run ${runId} under --ref-policy ${currentPolicy}`,
+            `the source run executed ${subject} under --ref-policy ${sourcePolicy}, whose cached agent results were produced under different failure semantics and whose call keys do not record the policy`,
+            `resume with --ref-policy ${sourcePolicy}, or start a fresh run under ${currentPolicy} without --resume-from-run-id`,
+          );
       }
       // The contract must describe the workflow that will actually execute.
       if (identity && !resumePlan.replacedSource) return identity.name;
     }
-    return resolved.workflowSource === 'built_in' ? resolved.name : undefined;
+    // A co-supplied scriptPath carries no `name`, but promotion sets workflowSource from the persisted
+    // metadata, which names the built-in actually being executed.
+    return resolved.workflowSource === 'built_in'
+      ? resolved.name ?? resolved.scriptMetadata?.workflowName
+      : undefined;
   }
 
   // Identity comes from the source journal's run.started entry, which is the only place that records
@@ -2520,18 +2529,17 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
   // that copies a built-in, and would silently skip the contract for a genuine built-in whose script
   // an upgrade changed. Requiring workflowSource === 'built_in' fixes the first; policyUnproven
   // reports the second instead of ignoring it.
-  private async resumeSourceBuiltinIdentity(
+  private async resumeSourceStartedEntry(
     sourceTask: WorkflowResumeSource,
-  ): Promise<BuiltinResumeIdentity | undefined> {
-    const started = await this.readResumeSourceJournal(sourceTask)
-      .then((journal) => journal.started)
-      .catch(() => undefined);
-    if (!started || started.workflowSource !== 'built_in') return undefined;
-    const name = started.workflowName;
-    const sourceHash = started.scriptHash;
-    const identity = builtinResumeIdentity(name, (script) => workflowScriptHash(script) === sourceHash);
-    if (identity) return identity;
-    return builtinUnprovenPolicyIdentity(name);
+  ): Promise<Extract<WorkflowJournalEntry, { readonly kind: 'workflow.run.started' }>> {
+    // A read failure means the provenance is unknown, not that the source is not a built-in. Treating
+    // it as the latter skipped both the request contract and the policy guard while still letting the
+    // cache-backed resume proceed, so it fails loud instead.
+    try {
+      return (await this.readResumeSourceJournal(sourceTask)).started;
+    } catch {
+      throw workflowResumeSourceInvalidError(sourceTask.runId);
+    }
   }
 
   private async prepareResumePlan(input: WorkflowLaunchInput): Promise<WorkflowResumePlan> {

@@ -51,6 +51,10 @@ export interface WorkflowRunStartedEntry extends WorkflowJournalEntryEnvelope {
     readonly cwd: string;
     readonly model?: string;
     readonly workspaceFingerprint?: string;
+    // Run-level ref policy. Recorded so a resume can PROVE the source's policy instead of inferring it
+    // from script bytes: hash matching fails for a script an upgrade changed, and a nested built-in
+    // child has no run.started of its own. Absent on runs journaled before this field existed.
+    readonly refPolicy?: string;
   };
 }
 
@@ -556,9 +560,12 @@ function assertRunStarted(record: Record<string, unknown>): void {
   if (!runtime || runtime.schemaVersion !== 1 || typeof runtime.cwd !== 'string') {
     throw new WorkflowJournalValidationError('runtime must include schemaVersion 1 and cwd.');
   }
-  rejectUnknownKeys(runtime, ['schemaVersion', 'cwd', 'model', 'workspaceFingerprint'], 'runtime');
+  rejectUnknownKeys(runtime, ['schemaVersion', 'cwd', 'model', 'workspaceFingerprint', 'refPolicy'], 'runtime');
   if (runtime.model !== undefined && (typeof runtime.model !== 'string' || !runtime.model)) {
     throw new WorkflowJournalValidationError('runtime.model must be a non-empty string.');
+  }
+  if (runtime.refPolicy !== undefined && typeof runtime.refPolicy !== 'string') {
+    throw new WorkflowJournalValidationError('runtime.refPolicy must be a string.');
   }
   if (runtime.workspaceFingerprint !== undefined && typeof runtime.workspaceFingerprint !== 'string') {
     throw new WorkflowJournalValidationError('runtime.workspaceFingerprint must be a string.');

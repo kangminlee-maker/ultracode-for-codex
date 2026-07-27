@@ -39,6 +39,10 @@ the project uses [semantic versioning](https://semver.org/).
   launch instead. A resume whose source run executed a built-in under a different ref
   policy is refused, because the source's cached agent results carry different failure
   semantics and the agent call keys do not record the policy.
+- The run-level ref policy is recorded in the journal (`runtime.refPolicy`), so a resume can prove
+  the source's policy instead of inferring it from script bytes. A cross-policy resume is refused in
+  both directions; when the source predates this field and its script matches no current variant, the
+  policy is unprovable and the resume is refused rather than assumed to match.
 - A resumed built-in is validated against its request contract. Resume hands back the
   persisted script path, so a resumed run classifies as `script_path`; the built-in
   identity is now recovered from the run's journal (workflow name + script hash) and the
