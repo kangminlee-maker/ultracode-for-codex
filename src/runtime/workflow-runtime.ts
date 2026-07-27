@@ -1213,6 +1213,26 @@ function assertNoVacuousPass(survivingCount, stage) {
   fail("no candidate survived " + refDrops.length + " unsupported-evidence drop(s) at " + stage
     + "; this review is inconclusive, not clean; first: " + refDrops[0].reason);
 }
+// A candidate the runtime dropped never reaches synthesis, so it had no decision row: stats.refDrops
+// rose while stats.dropped.unsupportedEvidence stayed 0 and the two accountings contradicted each other.
+// The committed design (docs/20260727-r6-ref-drop-policy-design.md) keeps stats.dropped the single drop
+// surface and preserves the provenance that the candidate existed and why it left.
+function refDropDecisionRows() {
+  const rows = [];
+  for (let index = 0; index < refDrops.length; index += 1) {
+    const drop = refDrops[index];
+    rows.push({
+      candidateId: drop.stage + ":" + drop.label,
+      candidateDigest: "",
+      action: "drop",
+      reasonCategory: drop.reasonCategory,
+      reason: drop.reason,
+      mergeCandidates: [],
+      severity: ""
+    });
+  }
+  return rows;
+}
 function recordRefDrop(stage, label, err) {
   const reason = text(err && err.message ? err.message : err);
   refDrops.push({ stage: stage, label: label, reasonCategory: "unsupported_evidence", reason: reason });
@@ -1260,6 +1280,15 @@ function normalizeEvidenceRef(ref) {
   if (allowedEvidenceRefMap[ref]) return ref;
   const citedPath = evidenceRefPath(ref);
   if (citedPath) assertPathSafe(citedPath, "evidence ref");
+  // The cited path, exactly as written, wins over the index guess. A trailing ":<digits>" is only a
+  // guess that an index was appended, and file:/diff: refs carry no index in the grammar at all; for a
+  // real file named "notes.md:9" the guess silently redirected the citation to a DIFFERENT file,
+  // "notes.md", attaching the finding to evidence the agent never read.
+  const byCitedPath = citedPath ? allowedPathRefs()[citedPath] : "";
+  if (byCitedPath) {
+    normalizedRefCount += 1;
+    return byCitedPath;
+  }
   const stripped = stripTrailingIndex(ref);
   if (stripped !== ref && allowedEvidenceRefMap[stripped]) {
     normalizedRefCount += 1;
@@ -1783,11 +1812,11 @@ if (activeLenses.length === 0) {
     },
     summary: scope.summary,
     findings: [],
-    synthesis: { mode: "script_fallback", fallbackReason: "no active lenses", decisions: [] },
+    synthesis: { mode: "script_fallback", fallbackReason: "no active lenses", decisions: refDropDecisionRows() },
     degraded: refDrops.length > 0
       ? { refDrops: refDrops.length, entries: refDrops.slice(0, 20), truncated: refDrops.length > 20 }
       : null,
-    stats: { finders: 0, candidates: 0, verifierAttempts: 0, verified: 0, refuted: 0, invalid: 0, reported: 0, normalizedRefs: normalizedRefCount, refDrops: refDrops.length, dropped: droppedStats([]) }
+    stats: { finders: 0, candidates: 0, verifierAttempts: 0, verified: 0, refuted: 0, invalid: 0, reported: 0, normalizedRefs: normalizedRefCount, refDrops: refDrops.length, dropped: droppedStats(refDropDecisionRows()) }
   };
 }
 announcePhasePlan({
@@ -1887,7 +1916,10 @@ if (nonRefuted.length > 0) {
   });
   synthesis = normalizeSynthesis(rawSynthesis, nonRefuted);
 }
-const decisionRows = finalDecisionRows(synthesis, nonRefuted);
+// Runtime drops are appended, so the indexes the findings loop shares with synthesis.decisions are
+// untouched. degraded stays gated on refDrops.length, which is now exactly
+// stats.dropped.unsupportedEvidence: one row per drop.
+const decisionRows = finalDecisionRows(synthesis, nonRefuted).concat(refDropDecisionRows());
 const findings = [];
 for (let index = 0; index < synthesis.decisions.length; index += 1) {
   const decision = synthesis.decisions[index];
@@ -4773,7 +4805,7 @@ async function buildWorkspaceContext(
     const rightHasHunk = evidenceHunkPaths.has(workspacePathKey(right)) ? 1 : 0;
     return leftHasHunk - rightHasHunk;
   });
-  const candidates = uniquePaths([
+  const candidates = uniqueExact([
     ...evidenceCandidates,
     ...explicitPaths,
     ...changedPaths,
@@ -4970,18 +5002,23 @@ async function buildChangeEvidenceContext(
         (text) => {
           const names: string[] = [];
           let unsafe = 0;
+          let unrepresentable = 0;
           for (const raw of text.split('\0').filter(Boolean)) {
             // Git's raw name is the identity. workspacePathKey rewrites a backslash to a slash, which on
             // POSIX turns a legal file into a nonexistent nested path, so the ref would point somewhere
             // that cannot be read or cited. Normalization stays for comparison only.
-            if (isWorkspaceEvidencePathSafe(raw)) names.push(raw);
-            else unsafe += 1;
+            if (!isWorkspaceEvidencePathSafe(raw)) unsafe += 1;
+            else if (!isWorkspaceEvidencePathRepresentable(raw)) unrepresentable += 1;
+            else names.push(raw);
           }
           if (unsafe > 0) {
             unavailableEvidence.push(`unavailable:diff-committed-name:${unsafe}:unsafe-path`);
             unsafeCommittedNames += unsafe;
           }
-          return uniquePaths(names);
+          if (unrepresentable > 0) {
+            unavailableEvidence.push(`unavailable:diff-committed-name:${unrepresentable}:unrepresentable-path`);
+          }
+          return uniqueExact(names);
         },
         (err: unknown) => {
           unavailableEvidence.push(unavailableGitEvidence('diff-committed-names', err, options.diffBaseRef));
@@ -5007,14 +5044,14 @@ async function buildChangeEvidenceContext(
   const diffRefs = diffRefResults.flatMap((entry) => entry.refs);
   // Paths that produced at least one hunk. A path with no readable content block and no hunk gives the
   // reviewer a ref and nothing to look at, which is why the gate is decided after file selection now.
-  const hunkPaths = uniquePaths(diffRefResults.flatMap((entry) => entry.hunkPaths));
+  const hunkPaths = uniqueExact(diffRefResults.flatMap((entry) => entry.hunkPaths));
   // A file ref is what the review harness validates its scope and findings against, so a
   // diffBaseRef range that touched a file has to contribute one too — otherwise a committed-only
   // review collects committed diff evidence it is then forbidden to cite. Taken from a NUL-delimited
   // name listing rather than the patch header: `diff --git a/foo bar.ts b/foo bar.ts` does not quote
   // spaces, so a header parser cannot split it and the path (and the whole gate) would be lost.
   const committedPaths = committedRangePaths.filter((path) => evidencePathAllowed(path, runtimeStateExcludedPaths, evidenceScope));
-  const admittedPaths = uniquePaths([...changedPaths, ...committedPaths]);
+  const admittedPaths = uniqueExact([...changedPaths, ...committedPaths]);
   // Two audiences, two projections of the same drop list. The caller owns the repository, so its
   // diagnostic names the paths it can act on and counts only those — runtime state and unsafe paths
   // are not the caller's changes, and counting them would report a clean tree as "3 paths dropped".
@@ -5046,8 +5083,8 @@ async function buildChangeEvidenceContext(
   const evidenceUnavailable = withheldPathCount > 0
     ? [...unavailableEvidence, `unavailable:file-evidence:${withheldPathCount}:no-content-block-or-hunk`]
     : unavailableEvidence;
-  const fileRefs = uniqueStrings(readablePaths.map((path) => `file:${path}`));
-  const allowedEvidenceRefs = uniqueStrings([...fileRefs, ...diffRefs]);
+  const fileRefs = uniqueExact(readablePaths.map((path) => `file:${path}`));
+  const allowedEvidenceRefs = uniqueExact([...fileRefs, ...diffRefs]);
   const allowedEvidenceIndexDigest = fullHash(allowedEvidenceRefs.join('\n'));
   const contextHash = fullHash(JSON.stringify({
     root,
@@ -5506,7 +5543,9 @@ function parseGitStatusPaths(
     }
     const selectedPath = renameParts ? renameParts.target : rawPath;
     const path = normalizeGitStatusPath(selectedPath);
-    if (isWorkspaceEvidencePathSafe(path) && shouldExposeWorkspaceStatusPath(path, runtimeStateExcludedPaths)) paths.push(path);
+    if (isWorkspaceEvidencePathSafe(path) && !isWorkspaceEvidencePathRepresentable(path)) {
+      unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:unrepresentable-path`);
+    } else if (isWorkspaceEvidencePathSafe(path) && shouldExposeWorkspaceStatusPath(path, runtimeStateExcludedPaths)) paths.push(path);
     else if (isWorkspaceEvidencePathSafe(path)) excludedPaths.push(path);
     else unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:${renameParts ? 'unsafe-target' : 'unsafe-path'}`);
   }
@@ -5542,7 +5581,9 @@ function parseGitStatusPathsZ(
         excludedBySource = true;
       }
     }
-    if (isWorkspaceEvidencePathSafe(path) && shouldExposeWorkspaceStatusPath(path, runtimeStateExcludedPaths) && !excludedBySource) paths.push(path);
+    if (isWorkspaceEvidencePathSafe(path) && !isWorkspaceEvidencePathRepresentable(path)) {
+      unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:unrepresentable-path`);
+    } else if (isWorkspaceEvidencePathSafe(path) && shouldExposeWorkspaceStatusPath(path, runtimeStateExcludedPaths) && !excludedBySource) paths.push(path);
     else if (isWorkspaceEvidencePathSafe(path)) excludedPaths.push(path);
     else unavailableEvidence.push(`unavailable:git-status-path:${entryIndex}:${renameOrCopy ? 'unsafe-target' : 'unsafe-path'}`);
     if (renameOrCopy) {
@@ -5660,6 +5701,15 @@ function formatGitStatusPathForDisplay(
 
 function isWorkspaceEvidencePathSafe(path: string): boolean {
   return path !== '' && !/[\uFFFD\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(path);
+}
+
+// Refs travel as lines, and every consumer of that protocol trims a line — including the built-in
+// script's own section parser. A name ending in whitespace therefore comes back as a DIFFERENT name: the
+// runtime read the real file and published a ref for a path that does not exist, so citing the true path
+// was rejected while citing the published ref pointed nowhere. Leading whitespace is interior to the
+// line and survives, so only a trailing run is unrepresentable.
+function isWorkspaceEvidencePathRepresentable(path: string): boolean {
+  return !/\s$/u.test(path);
 }
 
 interface GitStatusRenameParts {
@@ -5909,10 +5959,11 @@ function splitLines(value: string): string[] {
   return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
-// Paths are values, not tokens. uniqueStrings trims, which renames a file whose name has a leading or
-// trailing space into one that does not exist: the ref survived (the `file:` prefix moved the space
-// inward) while the read of the same path failed, so the file was citable and unreadable at once.
-function uniquePaths(values: Iterable<string>): string[] {
+// Dedup that preserves the value. The trimming variant this replaced renamed a file whose name carried a
+// leading or trailing space into one that does not exist — in one direction the read failed while the ref
+// kept the true name, in the other the ref lost it while the read succeeded. Paths and the refs built
+// from them are values, not tokens, so nothing on this path may normalize them.
+function uniqueExact(values: Iterable<string>): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const value of values) {
@@ -5923,17 +5974,6 @@ function uniquePaths(values: Iterable<string>): string[] {
   return out;
 }
 
-function uniqueStrings(values: Iterable<string>): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const value of values) {
-    const normalized = value.trim();
-    if (!normalized || seen.has(normalized)) continue;
-    seen.add(normalized);
-    out.push(normalized);
-  }
-  return out;
-}
 
 function preservedWorktree(
   worktree: WorkflowAgentWorktree,

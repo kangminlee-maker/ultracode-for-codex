@@ -131,6 +131,28 @@ the project uses [semantic versioning](https://semver.org/).
   that does not exist — the shared `uniqueStrings` dedup (which trims) and the workspace path resolver —
   while its `file:` ref kept the true name, so the reviewer held a citation licence for a file the runtime
   had just failed to read. Path lists now dedup without trimming.
+- A filename ending in whitespace is no longer admitted as evidence, reported as
+  `unavailable:git-status-path:<n>:unrepresentable-path`. Refs travel as lines and every consumer of that
+  protocol trims a line — including the built-in script's own section parser — so such a name comes back
+  as a different one: the runtime read the real file and published a ref for a path that does not exist,
+  while citing the true path was rejected. Leading whitespace is interior to the line and stays
+  admissible. The two dedup helpers are now one that never normalizes its input.
+- A cited path ending in `:<digits>` (a legal filename such as `issue:123`) is matched exactly before the
+  trailing-index reading is tried. Stripping first redirected the citation to a different, usually
+  nonexistent file, so a strict review failed and a lenient one dropped the candidate — for `file:`/`diff:`
+  refs, which carry no index in the grammar at all. An exact path match is a fact; the index reading is a
+  guess, so the fact wins.
+- Runtime ref drops now produce synthesis decision rows, so `stats.dropped.unsupportedEvidence` counts
+  them. `stats.refDrops` rose while that field stayed `0`, contradicting the other accounting;
+  `docs/20260727-r6-ref-drop-policy-design.md` had committed to `stats.dropped` being the single drop
+  surface, and this implements it. The dropped candidate's provenance (that it existed, and why it left)
+  is now in `synthesis.decisions`.
+- Launch notices no longer break the channel they are written to. `--ref-policy` and the `--agent-types`
+  registry warnings were written as plain stderr text unconditionally; with `--progress jsonl` stderr IS
+  the event stream, and the background launcher redirects its child's stderr into `progress.jsonl`, so
+  every non-default-policy background run wrote an invalid first line that `status` then counted as a
+  malformed progress line. An attached JSONL run emits them as a `workflow.notice` event; a background
+  parent, whose stderr is the user's terminal, keeps the readable line.
 
 ## [0.6.1] - 2026-07-18
 

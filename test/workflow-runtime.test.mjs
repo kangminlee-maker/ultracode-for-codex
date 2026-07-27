@@ -790,13 +790,16 @@ test('code-review normalizes ref grammar mistakes instead of discarding the run'
   }
 });
 
-async function runCodeReview({ marker, refPolicy }) {
+async function runCodeReview({ marker, refPolicy, evidenceScope, extraFiles = {} }) {
   const backend = new FakeSubagentBackend();
-  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { refPolicy } });
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { refPolicy, evidenceScope } });
   try {
     await initializeGitRepo(root);
     await mkdir(join(root, 'docs'), { recursive: true });
     await writeFile(join(root, 'docs', 'client-package-plan.md'), 'The platform token owns authority.\n');
+    for (const [name, contents] of Object.entries(extraFiles)) {
+      await writeFile(join(root, name), contents);
+    }
     const launch = await runtime.launch({
       name: 'code-review',
       args: { prompt: `${marker} Review docs/client-package-plan.md.` },
@@ -821,6 +824,42 @@ test('refPolicy lenient drops the unusable candidate and keeps the rest of the r
   for (const finding of snapshot.result.findings) {
     assert.ok(finding.evidenceRefs.every((ref) => !ref.includes('outside.md')));
   }
+  // One drop-accounting surface. A candidate the runtime dropped never reaches synthesis, so without a
+  // synthesized decision row refDrops rose while dropped.unsupportedEvidence stayed 0 and the two
+  // accountings contradicted each other (docs/20260727-r6-ref-drop-policy-design.md).
+  assert.equal(snapshot.result.stats.dropped.unsupportedEvidence, 1);
+  const dropRow = snapshot.result.synthesis.decisions.find((row) => row.reasonCategory === 'unsupported_evidence');
+  assert.ok(dropRow, JSON.stringify(snapshot.result.synthesis.decisions));
+  assert.equal(dropRow.action, 'drop');
+  assert.match(dropRow.candidateId, /^candidate:/);
+});
+
+test('a cited path that ends in a colon and digits is not read as an appended index', async () => {
+  // `issue:123` is a legal filename. Stripping ":123" first redirected the citation to `issue`, a
+  // different (nonexistent) file, so a review of a real change failed as unsupported evidence. An exact
+  // path match is a fact; the index reading is a guess, and file:/diff: refs carry no index at all.
+  const { snapshot } = await runCodeReview({
+    marker: 'COLON_INDEX_REF',
+    refPolicy: 'strict',
+    evidenceScope: 'all',
+    extraFiles: { 'issue:123': 'the tracked issue body\n' },
+  });
+  // Strict is the demanding side: before the fix this run failed outright on the candidate's ref.
+  assert.equal(snapshot.status, 'completed', snapshot.error ?? '');
+  assert.doesNotMatch(snapshot.error ?? '', /unsupported evidence ref/);
+  assert.ok(snapshot.result.stats.normalizedRefs >= 1, JSON.stringify(snapshot.result.stats));
+  assert.equal(snapshot.result.stats.refDrops, 0);
+
+  // Control: the same kind-mismatch on a name WITHOUT a colon suffix already normalized, so the test is
+  // about the suffix rather than about kind normalization in general.
+  const plain = await runCodeReview({
+    marker: 'COLON_INDEX_REF_PLAIN',
+    refPolicy: 'strict',
+    evidenceScope: 'all',
+    extraFiles: { 'issue.md': 'the tracked issue body\n' },
+  });
+  assert.equal(plain.snapshot.status, 'completed', plain.snapshot.error ?? '');
+  assert.ok(plain.snapshot.result.stats.normalizedRefs >= 1);
 });
 
 test('refPolicy strict fails the same run (lenient flag is wired, not inert)', async () => {
@@ -1386,6 +1425,41 @@ test('the gate refuses to open when an admitted path produced nothing readable',
     await writeFile(join(root, 'src', 'Small.java'), 'class Small { void ok() {} }\n');
     const ready = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
     assert.equal(ready.evidence.gated, false);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a filename ending in whitespace is not admitted as evidence', async () => {
+  // Refs travel as lines and every consumer of that protocol trims a line — including the built-in
+  // script's own section parser. Publishing `file:src/app.ts ` therefore handed the reviewer a ref that
+  // reads back as a different, nonexistent file: citing the real path was rejected as unsupported while
+  // citing the published ref pointed nowhere. Such a name is excluded, with the reason named.
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend, runtimeOptions: { evidenceScope: 'all' } });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src', 'app.ts '), 'export const trailing = 1;\n');
+
+    const report = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.equal(report.evidence.gated, true);
+    assert.deepEqual(report.evidence.allowedEvidenceRefs, [], 'no ref may name a path the protocol cannot carry');
+    assert.ok(
+      report.evidence.unavailableEvidence.includes('unavailable:git-status-path:1:unrepresentable-path'),
+      JSON.stringify(report.evidence.unavailableEvidence),
+    );
+
+    // Control: leading whitespace is interior to the ref line, so it survives and stays admissible.
+    await writeFile(join(root, 'src', ' leading.ts'), 'export const leading = 1;\n');
+    const withLeading = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
+    assert.equal(withLeading.evidence.gated, false);
+    assert.equal(withLeading.evidence.allowedEvidenceRefs.includes('file:src/ leading.ts'), true);
+    assert.equal(
+      withLeading.evidence.allowedEvidenceRefs.some((ref) => ref.includes('app.ts')),
+      false,
+      'the unrepresentable path stays out even once the gate opens',
+    );
   } finally {
     await runtime.close();
   }
@@ -4748,6 +4822,30 @@ function fakeReviewFinder(prompt) {
         summary: 'This candidate cites a path that escapes the workspace.',
         failureScenario: 'A structural violation must not be degraded into a drop.',
         evidenceRefs: ['file:../outside.md'],
+        kind: 'contract',
+      }],
+    };
+  }
+  if (/COLON_INDEX_REF_PLAIN/.test(prompt)) {
+    return {
+      candidates: [{
+        file: 'issue.md',
+        line: 1,
+        summary: 'Same kind mismatch, ordinary filename.',
+        failureScenario: 'This one always normalized; it is the control for the colon-suffix case.',
+        evidenceRefs: ['diff:unstaged:issue.md'],
+        kind: 'contract',
+      }],
+    };
+  }
+  if (/COLON_INDEX_REF/.test(prompt)) {
+    return {
+      candidates: [{
+        file: 'issue:123',
+        line: 1,
+        summary: 'This candidate cites a real file whose name ends in a colon and digits.',
+        failureScenario: 'The kind is wrong, but the path is exact: normalization must not read ":123" as an index.',
+        evidenceRefs: ['diff:unstaged:issue:123'],
         kind: 'contract',
       }],
     };

@@ -123,10 +123,16 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   const nestedWorkflows = parseNestedWorkflows(options.nestedWorkflows);
   const evidenceScope = parseEvidenceScope(options.evidenceScope);
   const refPolicy = parseRefPolicy(options.refPolicy);
+  const progressMode = parseProgressMode(options.progress);
+  // With --progress jsonl on an attached run, stderr IS the event stream, and the background launcher
+  // redirects its child's stderr straight into progress.jsonl — so a plain notice there makes the file
+  // invalid JSONL and is counted as a malformed line. A background PARENT writes to the user's terminal,
+  // so it keeps the readable form.
+  const streamsJsonlEvents = executionMode !== 'background' && progressMode === 'jsonl';
   // A loosened ref policy must not run unnoticed. Built-ins bypass the permission gate, so there is no
   // prompt to carry this; announcing the resolved value catches a policy left on in settings.json too.
   if (refPolicy !== 'strict') {
-    process.stderr.write(`ultracode: ref-policy=${refPolicy} — a review can complete with findings dropped; the result's degraded block lists them. Use --ref-policy strict to fail the run instead.\n`);
+    emitLaunchNotice(streamsJsonlEvents, `ref-policy=${refPolicy} — a review can complete with findings dropped; the result's degraded block lists them. Use --ref-policy strict to fail the run instead.`);
   }
   const agentWebSearch = parseAgentWebSearch(options.agentWebSearch);
   const agentFileWrite = parseAgentFileWrite(options.agentFileWrite);
@@ -140,7 +146,6 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   const heartbeatMs = parseNonNegativeIntOption(options.heartbeatMs, workflowDefaultHeartbeatMs(), 'heartbeat-ms');
   const retryLimit = parseRetryLimit(options.retryLimit);
   const permissionPolicy = parsePermissionPolicy(options.permission);
-  const progressMode = parseProgressMode(options.progress);
   const input = await inputPromise;
   const resumeModel = input.resumeFromRunId && !options.model
     ? await resolveResumeBackendModel(cwd, input.resumeFromRunId)
@@ -153,7 +158,7 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
     || (input.resumeFromRunId ? await resumeUsedAgentTypes(cwd, input.resumeFromRunId) : false)
       ? 'enabled'
       : 'disabled';
-  const agentTypes = agentTypesGate === 'enabled' ? await loadEnabledAgentTypeRegistry() : undefined;
+  const agentTypes = agentTypesGate === 'enabled' ? await loadEnabledAgentTypeRegistry(streamsJsonlEvents) : undefined;
   const reasoningEffort = parseReasoningEffort(options.reasoningEffort);
   const backend = new CodexSubagentBackend({
     command: options.command,
@@ -296,10 +301,17 @@ async function resumeUsedAgentTypes(cwd: string, runId: string): Promise<boolean
 // Load the native Codex agent-type registry (only when --agent-types is on), surfacing any skipped
 // files on stderr. Returns a map (possibly empty) so the runtime can distinguish gate-on-empty
 // ("unknown type") from gate-off (undefined → "requires --agent-types").
-async function loadEnabledAgentTypeRegistry(): Promise<ReadonlyMap<string, ResolvedAgentType>> {
+async function loadEnabledAgentTypeRegistry(streamsJsonlEvents: boolean): Promise<ReadonlyMap<string, ResolvedAgentType>> {
   const { registry, warnings } = await loadAgentTypeRegistry(join(codexSourceHome(), 'agents'));
-  for (const warning of warnings) process.stderr.write(`ultracode: ${warning}\n`);
+  for (const warning of warnings) emitLaunchNotice(streamsJsonlEvents, warning);
   return registry;
+}
+
+// One channel decision for every launch notice. Adding a plain write anywhere on this path reintroduces
+// the malformed-line defect, so notices go through here.
+function emitLaunchNotice(streamsJsonlEvents: boolean, message: string): void {
+  if (streamsJsonlEvents) writeJsonlProgress({ event: 'workflow.notice', summary: message });
+  else process.stderr.write(`ultracode: ${message}\n`);
 }
 
 const PREFLIGHT_BACKEND = {
