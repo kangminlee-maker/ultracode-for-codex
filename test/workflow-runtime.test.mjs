@@ -1314,6 +1314,9 @@ test('the gate refuses to open when an admitted path produced nothing readable',
     const report = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review it' } });
     assert.equal(report.evidence.gated, true);
     assert.match(report.evidence.reason, /none produced readable evidence/);
+    // The remediation has to be true for the path that closed the gate. A binary change cannot be
+    // reviewed from evidence at all, so the message must not offer only text-file remedies.
+    assert.match(report.evidence.reason, /a binary file produces neither/);
 
     const launch = await runtime.launch({ name: 'code-review', args: { prompt: 'Review it' } });
     await collectEvents(runtime, launch.taskId);

@@ -5120,7 +5120,7 @@ function changeEvidenceGate(
   return {
     open: false,
     reason: admittedButUnreadable > 0
-      ? `no readable change evidence in the working tree: ${admittedButUnreadable} changed path(s) were admitted but none produced readable evidence — no content block fit the file/byte budget and no diff hunk was available (an untracked file has no patch); reduce the change, raise the workspace context budget, or stage the file so a diff exists`
+      ? `no readable change evidence in the working tree: ${admittedButUnreadable} changed path(s) were admitted but none produced readable evidence — no content block fit the file/byte budget, and no diff hunk was available (an untracked file has no patch, and a binary file produces neither); if the path is text, reduce the change, raise the workspace context budget, or stage the file so a diff exists — a binary change cannot be reviewed from evidence at all`
       : changeEvidenceGateReason(
         evidence.statusPathCount,
         evidence.droppedPaths,
