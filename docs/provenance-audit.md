@@ -1,20 +1,21 @@
 # Provenance Audit
 
 Date: 2026-06-23
-Update 2026-07-18: version references updated to the 0.6.1 release line (two
-prompt-size fixes since the previous release — the journal now audit-bounds an
-oversized agent prompt instead of aborting the run, and the workspace context's
-git-status section is byte-bounded). The runtime change set is project-authored
-source with no new third-party runtime code; the ESLint dev toolchain added after the
-previous release is a devDependency only and is excluded from the published package
-(contents unchanged), so the marker-scan evidence below is unchanged from the 2026-06-23 audit.
+Update 2026-07-28: version references updated to the 0.7.0 release line. Since the
+previous release the built-in `code-review` workflow's failure modes were reworked —
+per-built-in request contracts rejected before any spend, an evidence gate that keys
+on whether the reviewer can actually read a change, a zero-token `--validate`
+preflight, and the two default-off review policies `--evidence-scope` and
+`--ref-policy`. The runtime change set is project-authored source with no new
+third-party runtime code and no new dependencies of any kind, so the marker-scan
+evidence below is unchanged from the 2026-06-23 audit.
 
 ## Scope
 
 This audit checked:
 
 - tracked repository files;
-- generated npm package contents for `ultracode-for-codex@0.6.1`;
+- generated npm package contents for `ultracode-for-codex@0.7.0`;
 - the locally installed companion Codex skill.
 
 Generated build output and package tarballs were checked as projections of the
@@ -30,7 +31,7 @@ License transition completed:
 
 - Apache-2.0 `LICENSE` file is present;
 - `package.json` and `package-lock.json` declare `Apache-2.0`;
-- audited package metadata version is `0.6.1`;
+- audited package metadata version is `0.7.0`;
 - npm publish state is verified separately during release preparation.
 
 ## Evidence

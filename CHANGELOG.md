@@ -8,6 +8,8 @@ the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-28
+
 ### Added
 
 - Per-built-in request contracts validated at launch, before the permission gate and
