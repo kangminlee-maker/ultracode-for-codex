@@ -33,8 +33,11 @@ the project uses [semantic versioning](https://semver.org/).
   block plus `stats.refDrops`. A run whose candidates were ALL dropped still fails, so
   a degraded run can never present as a clean review. Lens decisions (the review's
   premises) and structural violations stay fatal at every policy. The policy is baked
-  into the built-in script text, so switching it changes the script hash and needs a
-  fresh permission decision rather than silently reusing a grant or a resume cache.
+  into the built-in script text, so the two policies have different script hashes and are
+  distinguishable in run records. Built-in workflows are not permission-gated, so a policy
+  switch is not confirmed by a prompt — a non-default policy is announced on stderr at
+  launch instead. Resume-cache reuse is not yet bound to the policy; see the known-gaps
+  note below.
 - Evidence context discloses `#### Dropped From Evidence` (paths the reviewer can see
   in git status but may not cite) and `#### Evidence Ref Grammar`.
 

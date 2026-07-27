@@ -1139,6 +1139,9 @@ function failUnsupportedRef(prefix, value, refSet) {
 // Exact match first, then a trailing numeric index, then the path. A path that is not in evidence
 // still fails: the anti-fabrication property is unchanged.
 let normalizedRefCount = 0;
+// Verifier agents that ran and consumed tokens, including ones whose result a lenient policy dropped.
+// Deriving this from the surviving list under-reported real spend.
+let verifierDispatchCount = 0;
 // Ref policy (R6). "strict" fails the run on a ref that normalization cannot resolve to a path in
 // evidence. "lenient" drops the one candidate that cited it and lets the rest of the review stand.
 // What stays fatal at every policy: lens decisions (the review's premises, not its items) and any
@@ -1440,6 +1443,7 @@ function reviewLensStage(lens) {
       if (verifierResults.length !== envelopes.length) fail("verifier count mismatch for " + lens.lensKey);
       const verified = [];
       for (let index = 0; index < envelopes.length; index += 1) {
+        verifierDispatchCount += 1;
         if (verifierResults[index] == null) fail("missing verifier result for " + envelopes[index].candidateId);
         let verifier;
         try {
@@ -1535,6 +1539,7 @@ function reviewSweepCandidates(lens, rawCandidates) {
     if (verifierResults.length !== envelopes.length) fail("sweep verifier count mismatch");
     const verified = [];
     for (let index = 0; index < envelopes.length; index += 1) {
+      verifierDispatchCount += 1;
       if (verifierResults[index] == null) fail("missing sweep verifier result");
       let sweepVerifier;
       try {
@@ -1896,7 +1901,7 @@ return {
   stats: {
     finders: activeLenses.length + (caps.sweep ? 1 : 0),
     candidates: verifiedCandidates.length,
-    verifierAttempts: verifiedCandidates.length,
+    verifierAttempts: verifierDispatchCount,
     verified: verifiedCandidates.length,
     refuted: refuted,
     invalid: 0,
@@ -2372,13 +2377,12 @@ export class WorkflowTaskRegistry implements WorkflowRuntime {
     });
     const root = await workspaceContextRoot(cwd);
     const runtimeStateExcludedPaths = workspaceRuntimeStateExcludedPaths(root);
-    const gitStatus = await gitOutputRaw(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.'])
-      .catch(() => '');
+    const status = await collectWorkspaceGitStatus(root, runtimeStateExcludedPaths);
     const evidence = await buildChangeEvidenceContext(
       root,
-      gitStatus,
+      status.paths,
       options,
-      [],
+      status.unavailableEvidence,
       runtimeStateExcludedPaths,
       // The preview must answer for the scope the run would actually use, or it stops being a
       // pre-check and becomes a second opinion.
@@ -4478,6 +4482,36 @@ async function gitOutputRaw(cwd: string, args: readonly string[]): Promise<strin
   }
 }
 
+// Both the run and `--validate` read git status through here, so a status failure produces the same
+// unavailable-evidence tokens on both paths. When the preview collected status on its own, a
+// non-repository workspace made the preview report a different evidence snapshot than the run.
+interface WorkspaceGitStatus {
+  readonly display: string;
+  readonly paths: string;
+  readonly unavailableEvidence: readonly string[];
+}
+
+async function collectWorkspaceGitStatus(
+  root: string,
+  runtimeStateExcludedPaths: ReadonlySet<string>,
+): Promise<WorkspaceGitStatus> {
+  const unavailableEvidence: string[] = [];
+  let gitStatusRaw = '';
+  try {
+    gitStatusRaw = await gitOutputRaw(root, ['status', '--short', '--untracked-files=all', '--', '.']);
+  } catch (err) {
+    unavailableEvidence.push(`unavailable:git-status:${gitFailureToken(err)}`);
+  }
+  const display = unavailableEvidence.length
+    ? `(unavailable: ${unavailableEvidence[0]})`
+    : boundWorkspaceStatusDisplay(formatGitStatusDisplay(gitStatusRaw, runtimeStateExcludedPaths));
+  const paths = await gitOutputRaw(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.']).catch((err) => {
+    unavailableEvidence.push(`unavailable:git-status-raw:${gitFailureToken(err)}`);
+    return gitStatusRaw;
+  });
+  return { display, paths, unavailableEvidence };
+}
+
 async function buildWorkspaceContext(
   cwd: string,
   options: WorkspaceContextOptions,
@@ -4485,20 +4519,10 @@ async function buildWorkspaceContext(
 ): Promise<string> {
   const root = await workspaceContextRoot(cwd);
   const runtimeStateExcludedPaths = workspaceRuntimeStateExcludedPaths(root);
-  const statusUnavailableEvidence: string[] = [];
-  let gitStatusRaw = '';
-  try {
-    gitStatusRaw = await gitOutputRaw(root, ['status', '--short', '--untracked-files=all', '--', '.']);
-  } catch (err) {
-    statusUnavailableEvidence.push(`unavailable:git-status:${gitFailureToken(err)}`);
-  }
-  const gitStatus = statusUnavailableEvidence.length
-    ? `(unavailable: ${statusUnavailableEvidence[0]})`
-    : boundWorkspaceStatusDisplay(formatGitStatusDisplay(gitStatusRaw, runtimeStateExcludedPaths));
-  const gitStatusPaths = await gitOutputRaw(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.']).catch((err) => {
-    statusUnavailableEvidence.push(`unavailable:git-status-raw:${gitFailureToken(err)}`);
-    return gitStatusRaw;
-  });
+  const status = await collectWorkspaceGitStatus(root, runtimeStateExcludedPaths);
+  const statusUnavailableEvidence = [...status.unavailableEvidence];
+  const gitStatus = status.display;
+  const gitStatusPaths = status.paths;
   const gitStatusPathParse = parseGitStatusPaths(gitStatusPaths, runtimeStateExcludedPaths);
   const excludedWorkspacePaths = new Set(gitStatusPathParse.excludedPaths.map(workspacePathKey));
   const changeEvidence = options.includeDiff
@@ -4654,7 +4678,7 @@ async function buildChangeEvidenceContext(
     });
     if (baseCommit) {
       acceptedDiffBaseRef = options.diffBaseRef;
-      committed = filterWorkspaceContextDiff(await boundedGitOutput(root, [
+      const rawCommitted = await boundedGitOutput(root, [
         'diff',
         '--no-ext-diff',
         '--patch',
@@ -4664,7 +4688,15 @@ async function buildChangeEvidenceContext(
       ], options.maxDiffBytes).catch((err) => {
         unavailableEvidence.push(unavailableGitEvidence('diff-committed', err, options.diffBaseRef));
         return { text: '', truncated: false };
-      }), excludedDiffPaths, runtimeStateExcludedPaths, evidenceScope);
+      });
+      // A committed-range path never appears in git status, so unless it is classified here the diff
+      // filter discards it silently and the gate reports "git status found no changes" for a range
+      // that did contain files.
+      for (const path of gitDiffHeaderPaths(rawCommitted.text)) {
+        const rule = workspaceContextPathVerdict(path, runtimeStateExcludedPaths);
+        if (rule !== undefined && !evidenceScopeForgives(rule, evidenceScope)) recordDroppedPath(path, rule);
+      }
+      committed = filterWorkspaceContextDiff(rawCommitted, excludedDiffPaths, runtimeStateExcludedPaths, evidenceScope);
     }
   }
   const diffEvidence = [
@@ -4892,6 +4924,18 @@ function workspaceContextDiffPathAllowed(
   if (!path || path === '/dev/null') return true;
   const key = workspacePathKey(path);
   return evidencePathAllowed(key, runtimeStateExcludedPaths, evidenceScope) && !workspacePathExcludedBySet(key, excludedPaths);
+}
+
+// Every path a diff touches, before any admission filtering. Uses the one diff-header parser.
+function gitDiffHeaderPaths(diff: string): readonly string[] {
+  const paths: string[] = [];
+  for (const line of diff.split(/\r?\n/)) {
+    const header = parseGitDiffHeader(line);
+    if (!header) continue;
+    const path = header.newPath && header.newPath !== '/dev/null' ? header.newPath : header.oldPath;
+    if (path && path !== '/dev/null') paths.push(workspacePathKey(path));
+  }
+  return uniqueStrings(paths);
 }
 
 function diffEvidenceRefs(

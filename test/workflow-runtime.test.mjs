@@ -837,6 +837,90 @@ test('refPolicy lenient still fails when every candidate is dropped (no vacuous 
   assert.match(snapshot.error, /includes unsupported evidence ref file:outside\.md/);
 });
 
+test('validation preview carries git-status failures like the run does', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime } = await createRuntime({ backend });
+  try {
+    // No initializeGitRepo: the workspace is not a repository, so status collection fails.
+    const report = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review.' } });
+    assert.equal(report.evidence.gated, true);
+    assert.ok(
+      report.evidence.unavailableEvidence.some((token) => token.startsWith('unavailable:git-status')),
+      `preview dropped the status failure: ${JSON.stringify(report.evidence.unavailableEvidence)}`,
+    );
+    assert.equal(backend.requests.length, 0);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('validation preview reports no status failure inside a repository (control)', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    const report = await runtime.validateWorkflowInput({ name: 'code-review', args: { prompt: 'Review.' } });
+    assert.equal(
+      report.evidence.unavailableEvidence.some((token) => token.startsWith('unavailable:git-status')),
+      false,
+    );
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('a committed range narrowed by a path rule is named, not reported as "no changes"', async () => {
+  const backend = new FakeSubagentBackend();
+  const { runtime, root } = await createRuntime({ backend });
+  try {
+    await initializeGitRepo(root);
+    await mkdir(join(root, 'src'), { recursive: true });
+    await writeFile(join(root, 'src', 'App.java'), 'class App {}\n');
+    await gitLines(root, ['add', 'src/App.java']);
+    await gitLines(root, ['commit', '-m', 'ship java']);
+
+    // Clean tree: the only evidence would come from the committed range, and its one file is
+    // extension-excluded. The gate must name that rule rather than claim git status found nothing.
+    const report = await runtime.validateWorkflowInput({
+      name: 'code-review',
+      args: { prompt: 'Review the last commit.', diffBaseRef: 'HEAD~1' },
+    });
+    assert.equal(report.evidence.gated, true);
+    assert.deepEqual(report.evidence.dropped, [{ path: 'src/App.java', rule: 'extension-not-allowed' }]);
+    assert.match(report.evidence.reason, /1 by extension-not-allowed \(src\/App\.java\)/);
+    assert.doesNotMatch(report.evidence.reason, /no changed or untracked paths/);
+
+    // Control: an admissible committed file opens the gate through the same range.
+    await writeFile(join(root, 'src', 'app.ts'), 'export const app = 1;\n');
+    await gitLines(root, ['add', 'src/app.ts']);
+    await gitLines(root, ['commit', '-m', 'ship ts']);
+    const ready = await runtime.validateWorkflowInput({
+      name: 'code-review',
+      args: { prompt: 'Review the last commit.', diffBaseRef: 'HEAD~1' },
+    });
+    assert.equal(ready.evidence.gated, false);
+    assert.equal(ready.evidence.allowedEvidenceRefs.includes('file:src/app.ts'), true);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test('verifierAttempts counts verifier agents that ran, including dropped results', async () => {
+  const lenient = await runCodeReview({ marker: 'VERIFIER_BAD_REF', refPolicy: 'lenient' });
+  assert.equal(lenient.snapshot.status, 'completed', lenient.snapshot.error ?? '');
+  const stats = lenient.snapshot.result.stats;
+  assert.equal(stats.refDrops, 1);
+  assert.equal(lenient.snapshot.result.degraded.entries[0].stage, 'verifier');
+  // Two verifiers ran and consumed tokens; one result was dropped.
+  assert.equal(stats.verifierAttempts, 2);
+  assert.equal(stats.candidates, 1);
+
+  // Control: strict still fails on the same fixture.
+  const strict = await runCodeReview({ marker: 'VERIFIER_BAD_REF', refPolicy: 'strict' });
+  assert.equal(strict.snapshot.status, 'failed');
+  assert.match(strict.snapshot.error, /includes unsupported evidence ref file:outside\.md/);
+});
+
 test('the change-evidence context has a pinned section order', async () => {
   // The cross-family review's highest-severity issue was that this context changed unconditionally
   // while the change claimed byte-identity. Identity with the previous release is genuinely broken and
@@ -3566,6 +3650,28 @@ function fakeReviewFinder(prompt) {
   }
   // The two ref shapes observed in real rejected runs: a file: ref with a line number appended, and
   // a diff:unstaged: guess for a path that exists only as file: (an untracked file).
+  if (/VERIFIER_BAD_REF/.test(prompt)) {
+    return {
+      candidates: [
+        {
+          file: 'docs/client-package-plan.md',
+          line: 1,
+          summary: 'This candidate is verified normally.',
+          failureScenario: 'It must survive its sibling verifier being dropped.',
+          evidenceRefs: ['file:docs/client-package-plan.md'],
+          kind: 'contract',
+        },
+        {
+          file: 'docs/client-package-plan.md',
+          line: 3,
+          summary: 'VERIFIER_BAD_REF_MARK this candidate gets a verifier that cites unsupported evidence.',
+          failureScenario: 'The verifier result is dropped while the run continues.',
+          evidenceRefs: ['file:docs/client-package-plan.md'],
+          kind: 'coverage',
+        },
+      ],
+    };
+  }
   if (/DRIVE_ABSOLUTE_REF/.test(prompt)) {
     return {
       candidates: [{
@@ -3660,6 +3766,16 @@ function fakeReviewFinder(prompt) {
 
 function fakeReviewVerifier(prompt) {
   const second = /candidate_runtime-contract_2|candidate_sweep_2/.test(prompt);
+  // Only the second candidate's verifier cites unsupported evidence, so one verifier result is
+  // dropped while the run still completes — the case where attempt accounting used to under-report.
+  if (/VERIFIER_BAD_REF_MARK/.test(prompt)) {
+    return {
+      verdict: 'CONFIRMED',
+      evidence: 'This verifier cites a path that is not in evidence.',
+      evidenceRefs: ['file:outside.md'],
+      severity: 'P2',
+    };
+  }
   return {
     verdict: 'CONFIRMED',
     evidence: second

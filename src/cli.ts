@@ -123,6 +123,11 @@ async function runWorkflow(args: readonly string[]): Promise<number> {
   const nestedWorkflows = parseNestedWorkflows(options.nestedWorkflows);
   const evidenceScope = parseEvidenceScope(options.evidenceScope);
   const refPolicy = parseRefPolicy(options.refPolicy);
+  // A loosened ref policy must not run unnoticed. Built-ins bypass the permission gate, so there is no
+  // prompt to carry this; announcing the resolved value catches a policy left on in settings.json too.
+  if (refPolicy !== 'strict') {
+    process.stderr.write(`ultracode: ref-policy=${refPolicy} — a review can complete with findings dropped; the result's degraded block lists them. Use --ref-policy strict to fail the run instead.\n`);
+  }
   const agentWebSearch = parseAgentWebSearch(options.agentWebSearch);
   const agentFileWrite = parseAgentFileWrite(options.agentFileWrite);
   const agentMcpServers = parseAgentMcpServers(options.agentMcp);
@@ -2283,7 +2288,7 @@ Options:
   --agent-concurrency <unbounded|auto|N>  Bound concurrent agent dispatches per run. 'auto' = min(16, cores-2). Default: settings.json (${String(workflowDefaultAgentConcurrency())}).
   --nested-workflows <disabled|enabled>  Let a workflow run a built-in or inline child via workflow(). Default: settings.json (${workflowDefaultNestedWorkflows()}).
   --evidence-scope <default|all>      Which changed paths may become citable review evidence. 'all' forgives only the extension allowlist (so .java/.rb/.sql projects are reviewable); excluded dirs, runtime state, and unsafe paths stay out. Run-level; re-pass on resume. Default: settings.json (${workflowDefaultEvidenceScope()}).
-  --ref-policy <strict|lenient>       What happens to a cited evidence ref that resolves to no path in evidence. 'strict' fails the run; 'lenient' drops that one candidate, discloses it in the result's degraded block, and fails only if every candidate dropped. Lens decisions and structural violations stay fatal either way. Changes the built-in script hash, so a policy switch needs a fresh permission decision. Default: settings.json (${workflowDefaultRefPolicy()}).
+  --ref-policy <strict|lenient>       What happens to a cited evidence ref that resolves to no path in evidence. 'strict' fails the run; 'lenient' drops that one candidate, discloses it in the result's degraded block, and fails only if every candidate dropped. Lens decisions and structural violations stay fatal either way. Built-in workflows are not permission-gated, so a policy switch is NOT confirmed by a prompt: a non-default policy is announced on stderr at launch instead. Default: settings.json (${workflowDefaultRefPolicy()}).
   --agent-web-search <disabled|enabled>  Let workflow subagents use the native web_search tool (run-level; re-pass on resume; results aren't reproducible on re-run). Default: settings.json (${workflowDefaultAgentWebSearch()}).
   --agent-file-write <disabled|enabled>  Let worktree-isolated subagents write files (write_file/str_replace, confined to the worktree; run-level; re-pass on resume). Default: settings.json (${workflowDefaultAgentFileWrite()}).
   --agent-mcp <server1,server2,...>  Let subagents call the named Codex MCP servers (allowlist; provisioned from your config.toml + auto-approved; run-level; re-pass on resume). Off when empty. Default: settings.json (${JSON.stringify(workflowDefaultAgentMcpServers())}).
