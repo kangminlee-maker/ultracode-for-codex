@@ -790,7 +790,7 @@ test('code-review normalizes ref grammar mistakes instead of discarding the run'
   }
 });
 
-async function runCodeReview({ marker, refPolicy, evidenceScope, extraFiles = {} }) {
+async function runCodeReview({ marker, refPolicy, evidenceScope, level, extraFiles = {} }) {
   const backend = new FakeSubagentBackend();
   const { runtime, root } = await createRuntime({ backend, runtimeOptions: { refPolicy, evidenceScope } });
   try {
@@ -802,7 +802,7 @@ async function runCodeReview({ marker, refPolicy, evidenceScope, extraFiles = {}
     }
     const launch = await runtime.launch({
       name: 'code-review',
-      args: { prompt: `${marker} Review docs/client-package-plan.md.` },
+      args: { prompt: `${marker} Review docs/client-package-plan.md.`, ...(level ? { level } : {}) },
     });
     await collectEvents(runtime, launch.taskId);
     return { snapshot: runtime.get(launch.taskId), backend };
@@ -810,6 +810,74 @@ async function runCodeReview({ marker, refPolicy, evidenceScope, extraFiles = {}
     await runtime.close();
   }
 }
+
+test('a merged duplicate group is reported as one finding, not discarded', async () => {
+  // The synthesis agent has four dispositions — report, merge, drop, or be covered as a merge target — and
+  // a `merge` row is the SURVIVING representative: normalizeSynthesis requires it to name the indexes it
+  // absorbed. The findings loop skipped every action that was not "report", so an entire consolidated group
+  // vanished. Measured on a real repository: an agent that announced "Selected 11 material final findings"
+  // returned 1, and 7 of the 10 lost rows were P1.
+  const { snapshot } = await runCodeReview({ marker: 'SYNTH_MERGE', refPolicy: 'strict' });
+  assert.equal(snapshot.status, 'completed', snapshot.error ?? '');
+  assert.equal(snapshot.result.findings.length, 1, 'the merged representative must reach the reader');
+
+  const finding = snapshot.result.findings[0];
+  assert.equal(finding.severity, 'P1');
+  assert.equal(finding.synthesisDecision.action, 'merge');
+  assert.equal(finding.synthesisDecision.mergeCandidates.length, 1, 'the absorbed duplicate is disclosed');
+  assert.equal(snapshot.result.stats.reported, 1);
+  // The absorbed candidate is what consolidation removed, and it has no decision row of its own. Counting
+  // merge ROWS instead left it in no bucket: one real run booked 10 duplicates for 49 absorbed candidates.
+  assert.equal(snapshot.result.stats.dropped.duplicate, 1);
+});
+
+test('a synthesis with no decisions at all falls back instead of presenting as agent-selected', async () => {
+  // `{summary, decisions: []}` is schema-valid. Repairing every uncovered index would turn it into a clean
+  // agent synthesis with fallbackReason null — a quieter degradation than the one being fixed.
+  const { snapshot } = await runCodeReview({ marker: 'SYNTH_EMPTY', refPolicy: 'strict' });
+  assert.equal(snapshot.status, 'completed', snapshot.error ?? '');
+  assert.equal(snapshot.result.synthesis.mode, 'script_fallback', 'an empty selection is not an agent synthesis');
+  assert.match(snapshot.result.synthesis.fallbackReason, /no usable decision/);
+});
+
+test('the script fallback cuts by severity, not by discovery order', async () => {
+  // The degraded path kept the first caps.reportCap candidates in discovery order, so a late P1 was dropped
+  // while an early P3 was kept — and sweep results are appended last, so the stage that exists to catch what
+  // the lenses missed was cut first.
+  const { snapshot } = await runCodeReview({ marker: 'SYNTH_FALLBACK_ORDER', refPolicy: 'strict' });
+  assert.equal(snapshot.status, 'completed', snapshot.error ?? '');
+  assert.equal(snapshot.result.synthesis.mode, 'script_fallback');
+
+  // 24 candidates against a report cap of 15, so 9 are cut. What matters is WHICH 9.
+  const decisions = snapshot.result.synthesis.decisions;
+  const cut = decisions.filter((row) => row.action === 'drop');
+  assert.equal(cut.length, 9, JSON.stringify(decisions.map((row) => [row.action, row.severity])));
+  assert.ok(cut.every((row) => row.severity === 'P3'), 'only the least severe may lose the cap');
+  assert.equal(
+    decisions.filter((row) => row.action === 'report' && row.severity === 'P1').length,
+    8,
+    'every sweep-found P1 must survive the cap',
+  );
+  assert.equal(snapshot.result.stats.dropped.reportCap, 9);
+  // Published findings lead with the most severe. Without this the reader gets the lens P3s first and the
+  // sweep P1s last, because decisions are emitted in candidate order and the sweep is appended last.
+  assert.equal(snapshot.result.findings[0].severity, 'P1');
+  assert.equal(snapshot.result.findings[snapshot.result.findings.length - 1].severity, 'P3');
+  assert.match(snapshot.result.summary, /not an agent-selected review/);
+});
+
+test('a synthesis that forgets a candidate is repaired, not discarded', async () => {
+  // One uncovered index used to throw away the ENTIRE agent synthesis. The gap is now backfilled OPEN — the
+  // forgotten candidate is reported rather than dropped — and the repair is disclosed.
+  const { snapshot } = await runCodeReview({ marker: 'SYNTH_PARTIAL', refPolicy: 'strict' });
+  assert.equal(snapshot.status, 'completed', snapshot.error ?? '');
+  assert.equal(snapshot.result.synthesis.mode, 'agent', 'the agent decisions are kept, not thrown away');
+  assert.match(snapshot.result.synthesis.fallbackReason, /partial synthesis recovery: 1 candidate/);
+  assert.equal(snapshot.result.findings.length, 2, 'the forgotten candidate still reaches the reader');
+  const backfilled = snapshot.result.synthesis.decisions.find((row) => /Backfilled by the runtime/.test(row.reason));
+  assert.ok(backfilled, JSON.stringify(snapshot.result.synthesis.decisions));
+  assert.equal(backfilled.action, 'report');
+});
 
 test('refPolicy lenient drops the unusable candidate and keeps the rest of the review', async () => {
   const { snapshot } = await runCodeReview({ marker: 'PARTIAL_INVALID_REF', refPolicy: 'lenient' });
@@ -4651,7 +4719,7 @@ class FakeSubagentBackend {
         return structuredToolResult(fakeReviewVerifier(workflowPrompt));
       }
       if (isReviewSynthesisSchema(schema)) {
-        return structuredToolResult(fakeReviewSynthesis());
+        return structuredToolResult(fakeReviewSynthesis(workflowPrompt));
       }
       return subagentResult({
         text: '',
@@ -4743,7 +4811,10 @@ function fakeReviewScope(prompt = '') {
   // to travel through scope.instructions.
   const sweepMarker = /SWEEP_ONLY_DROP/.test(prompt)
     ? 'SWEEP_ONLY_DROP'
-    : /SWEEP_RESCUE/.test(prompt) ? 'SWEEP_RESCUE' : '';
+    : /SWEEP_RESCUE/.test(prompt) ? 'SWEEP_RESCUE' : ''
+      // The lens finders after the first, and the sweep, do not receive the user prompt — only the scope
+      // block — so a marker that must reach every finder rides through instructions.
+      || (/SYNTH_FALLBACK_ORDER/.test(prompt) ? 'SYNTH_FALLBACK_ORDER' : '');
   // A scope that selects no lens at all reaches the early return, which must obey the same
   // vacuous-pass rule as candidate verification.
   if (/SCOPE_NO_LENSES/.test(prompt)) {
@@ -4839,6 +4910,27 @@ function fakeReviewFinder(prompt) {
         }],
       };
   }
+  if (/SYNTH_FALLBACK_ORDER/.test(prompt)) {
+    // At the default level the per-lens cap is 8 and the report cap is 15, and sweep results are appended
+    // LAST — so 8 lens candidates plus 8 sweep candidates overflow the cap by exactly one. That makes the
+    // cut observable, and it puts the sweep (the stage that exists to catch what the lenses missed) in the
+    // position that discovery-order truncation always sacrificed first.
+    // Identical candidates from two lenses collapse into one set, so each lens must be distinguishable.
+    const lensMatch = /Lens key: ([a-z-]+)/.exec(prompt);
+    const origin = sweep ? 'sweep-severe' : 'lens-minor-' + (lensMatch ? lensMatch[1] : 'unknown');
+    const candidates = [];
+    for (let index = 0; index < 8; index += 1) {
+      candidates.push({
+        file: 'docs/client-package-plan.md',
+        line: index + 1,
+        summary: 'SYNTH_FALLBACK_ORDER ' + origin + '-' + index,
+        failureScenario: sweep ? 'The authority binding is unenforced.' : 'Low materiality.',
+        evidenceRefs: ['file:docs/client-package-plan.md'],
+        kind: sweep ? 'contract' : 'maintainability',
+      });
+    }
+    return { candidates };
+  }
   if (sweep || /Lens key: security-boundary/.test(prompt)) {
     return { candidates: [] };
   }
@@ -4912,6 +5004,43 @@ function fakeReviewFinder(prompt) {
         evidenceRefs: ['file:../outside.md'],
         kind: 'contract',
       }],
+    };
+  }
+  if (/SYNTH_EMPTY/.test(prompt)) {
+    return {
+      candidates: [
+        { file: 'docs/client-package-plan.md', line: 1, summary: 'SYNTH_EMPTY candidate.', failureScenario: 'The synthesis returns no decisions at all.', evidenceRefs: ['file:docs/client-package-plan.md'], kind: 'contract' },
+      ],
+    };
+  }
+  if (/SYNTH_PARTIAL/.test(prompt)) {
+    return {
+      candidates: [
+        { file: 'docs/client-package-plan.md', line: 1, summary: 'SYNTH_PARTIAL judged candidate.', failureScenario: 'The agent returned a decision for this one.', evidenceRefs: ['file:docs/client-package-plan.md'], kind: 'contract' },
+        { file: 'docs/client-package-plan.md', line: 2, summary: 'SYNTH_PARTIAL uncovered candidate the agent forgot.', failureScenario: 'No decision was returned for this one.', evidenceRefs: ['file:docs/client-package-plan.md'], kind: 'contract' },
+      ],
+    };
+  }
+  if (/SYNTH_MERGE/.test(prompt)) {
+    return {
+      candidates: [
+        {
+          file: 'docs/client-package-plan.md',
+          line: 1,
+          summary: 'SYNTH_MERGE authority binding is unenforced (representative of the duplicate group).',
+          failureScenario: 'A client package binds to a token the platform never validates.',
+          evidenceRefs: ['file:docs/client-package-plan.md'],
+          kind: 'contract',
+        },
+        {
+          file: 'docs/client-package-plan.md',
+          line: 2,
+          summary: 'SYNTH_MERGE the same authority binding gap, found again by another angle.',
+          failureScenario: 'Same failure, duplicate report.',
+          evidenceRefs: ['file:docs/client-package-plan.md'],
+          kind: 'contract',
+        },
+      ],
     };
   }
   if (/COLON_INDEX_REF_PLAIN/.test(prompt)) {
@@ -5018,6 +5147,15 @@ function fakeReviewVerifier(prompt) {
       severity: 'P2',
     };
   }
+  if (/SYNTH_FALLBACK_ORDER/.test(prompt)) {
+    const severe = /sweep-severe-/.test(prompt);
+    return {
+      verdict: 'CONFIRMED',
+      evidence: severe ? 'Unenforced authority binding.' : 'Minor maintainability point.',
+      evidenceRefs: ['file:docs/client-package-plan.md'],
+      severity: severe ? 'P1' : 'P3',
+    };
+  }
   return {
     verdict: 'CONFIRMED',
     evidence: second
@@ -5028,7 +5166,42 @@ function fakeReviewVerifier(prompt) {
   };
 }
 
-function fakeReviewSynthesis() {
+function fakeReviewSynthesis(prompt = '') {
+  // The synthesis prompt carries only its header and the candidate JSON — no user prompt, no scope block —
+  // so a marker has to ride in through a candidate summary, which the finder controls.
+  if (/SYNTH_FALLBACK_ORDER/.test(prompt)) {
+    // An out-of-range index is a structural violation, which stays fatal and forces the script fallback.
+    return {
+      summary: 'Unusable.',
+      decisions: [{ index: 99, action: 'report', merge: null, severity: 'P1', reasonCategory: 'material', reason: 'out of range' }],
+    };
+  }
+  if (/SYNTH_EMPTY/.test(prompt)) {
+    // Schema-valid and useless: `decisions` may legally be an empty array.
+    return { summary: 'All candidates reviewed.', decisions: [] };
+  }
+  if (/SYNTH_PARTIAL/.test(prompt)) {
+    // Covers only the first candidate; the second has no decision at all.
+    return {
+      summary: 'Only one candidate was judged.',
+      decisions: [{ index: 0, action: 'report', merge: null, severity: 'P2', reasonCategory: 'material', reason: 'judged' }],
+    };
+  }
+  if (/SYNTH_MERGE/.test(prompt)) {
+    return {
+      summary: 'Selected 1 material finding: one duplicate group was consolidated.',
+      decisions: [
+        {
+          index: 0,
+          action: 'merge',
+          merge: [1],
+          severity: 'P1',
+          reasonCategory: 'duplicate',
+          reason: 'Both candidates describe the same authority-binding gap; consolidated into one finding.',
+        },
+      ],
+    };
+  }
   return {
     summary: 'One material runtime contract issue should be reported; the lower-risk coverage point is dropped.',
     decisions: [

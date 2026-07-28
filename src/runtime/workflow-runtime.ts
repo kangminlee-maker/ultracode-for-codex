@@ -1670,18 +1670,40 @@ function reviewSweepCandidates(lens, rawCandidates) {
   });
 }
 function fallbackDecisions(items, reason) {
+  // Rank by severity BEFORE the report cap bites. This path used to keep the first caps.reportCap items in
+  // discovery order, which drops a late P1 while keeping an early P3 — and sweep results are appended last,
+  // so the stage that exists to catch what the lenses missed was cut first. Ties keep discovery order, so
+  // the selection stays deterministic for a given candidate list.
+  const ranked = [];
+  for (let index = 0; index < items.length; index += 1) {
+    ranked.push({ index: index, severity: items[index].verifier.severity || "P2" });
+  }
+  ranked.sort(function (left, right) {
+    const bySeverity = severityRank(left.severity) - severityRank(right.severity);
+    return bySeverity !== 0 ? bySeverity : left.index - right.index;
+  });
+  const reported = {};
+  let cut = 0;
+  for (let rank = 0; rank < ranked.length; rank += 1) {
+    if (rank < caps.reportCap) reported[ranked[rank].index] = true;
+    else cut += 1;
+  }
   const decisions = [];
   for (let index = 0; index < items.length; index += 1) {
+    const keep = reported[index] === true;
     decisions.push({
       index: index,
-      action: index < caps.reportCap ? "report" : "drop",
+      action: keep ? "report" : "drop",
       severity: items[index].verifier.severity || "P2",
-      reasonCategory: index < caps.reportCap ? "material" : "report_cap",
+      reasonCategory: keep ? "material" : "report_cap",
       reason: reason,
       merge: []
     });
   }
-  return { mode: "script_fallback", summary: "Script fallback synthesis.", fallbackReason: reason, decisions: decisions };
+  const summary = cut > 0
+    ? "Script fallback synthesis: the synthesis agent's output was unusable, so candidates were ranked by severity and " + cut + " were cut at the report cap of " + caps.reportCap + ". This is not an agent-selected review."
+    : "Script fallback synthesis: the synthesis agent's output was unusable, so every verified candidate is reported. This is not an agent-selected review.";
+  return { mode: "script_fallback", summary: summary, fallbackReason: reason, decisions: decisions };
 }
 function normalizeSynthesis(raw, items) {
   try {
@@ -1711,10 +1733,36 @@ function normalizeSynthesis(raw, items) {
         merge: merge
       });
     }
+    // A single uncovered index used to discard the ENTIRE agent synthesis and fall back to a rank-and-cap
+    // pass; with 60+ candidates one gap threw away 60 good decisions. Repair the gap instead, and repair it
+    // OPEN — the uncovered candidate is reported, never dropped — so a synthesis slip cannot remove a
+    // finding. Duplicate coverage and out-of-range indexes stay fatal above: those say the output cannot be
+    // trusted, and resolving a duplicate by position would let an earlier merge swallow a candidate that a
+    // later row reported.
+    const repaired = [];
     for (let index = 0; index < items.length; index += 1) {
-      if (!covered[index]) fail("missing synthesis coverage for index " + index);
+      if (covered[index]) continue;
+      repaired.push(index);
+      normalized.push({
+        index: index,
+        action: "report",
+        severity: items[index].verifier.severity || "P2",
+        reasonCategory: "material",
+        reason: "Backfilled by the runtime: the synthesis agent returned no decision for this candidate, so it is reported rather than silently dropped.",
+        merge: []
+      });
     }
-    return { mode: "agent", summary: text(raw.summary), fallbackReason: null, decisions: normalized };
+    // Floor: an empty or all-backfilled decision set is not an agent synthesis. Without this, the
+    // schema-valid output {summary, decisions: []} would present as a clean agent selection.
+    if (normalized.length === repaired.length) fail("synthesis returned no usable decision");
+    return {
+      mode: "agent",
+      summary: text(raw.summary),
+      fallbackReason: repaired.length > 0
+        ? "partial synthesis recovery: " + repaired.length + " candidate(s) had no decision and were backfilled as reported"
+        : null,
+      decisions: normalized
+    };
   } catch (err) {
     return fallbackDecisions(items, text(err && err.message ? err.message : err));
   }
@@ -1741,11 +1789,27 @@ function finalDecisionRows(synthesis, items) {
   }
   return rows;
 }
+// One place decides which dispositions survive, so the findings loop and the drop accounting can never
+// disagree again — that disagreement is what made a selected finding invisible.
+function producesFinding(action) {
+  return action === "report" || action === "merge";
+}
+function severityRank(value) {
+  if (value === "P0") return 0;
+  if (value === "P1") return 1;
+  if (value === "P2") return 2;
+  if (value === "P3") return 3;
+  return 4;
+}
 function droppedStats(decisions) {
   const stats = { duplicate: 0, notMaterial: 0, reportCap: 0, unsupportedEvidence: 0, superseded: 0 };
   for (let index = 0; index < decisions.length; index += 1) {
     const row = decisions[index];
-    if (row.action !== "drop" && row.action !== "merge") continue;
+    // Absorbed candidates are what consolidation removed from the report, and they have no decision row of
+    // their own. Counting merge ROWS instead left them in no bucket at all: one run booked 10 duplicates
+    // for 49 absorbed candidates. "merge" is required on every decision, so a drop row can carry targets too.
+    stats.duplicate += row.mergeCandidates.length;
+    if (row.action !== "drop") continue;
     if (row.reasonCategory === "duplicate") stats.duplicate += 1;
     else if (row.reasonCategory === "not_material") stats.notMaterial += 1;
     else if (row.reasonCategory === "report_cap") stats.reportCap += 1;
@@ -1974,7 +2038,11 @@ const decisionRows = finalDecisionRows(synthesis, nonRefuted).concat(refDropDeci
 const findings = [];
 for (let index = 0; index < synthesis.decisions.length; index += 1) {
   const decision = synthesis.decisions[index];
-  if (decision.action !== "report") continue;
+  // A merge row IS a finding: the synthesis prompt offers four dispositions (reported, merged, dropped,
+  // or covered as a merge target) and normalizeSynthesis requires a merge row to name the indexes it
+  // absorbed, so it is the surviving representative of a consolidated group. Filtering on "report" alone
+  // discarded whole groups: one measured run announced 11 selected findings and returned 1, losing 7 P1s.
+  if (!producesFinding(decision.action)) continue;
   const item = nonRefuted[decision.index];
   const row = decisionRows[index];
   findings.push({
@@ -1997,6 +2065,10 @@ for (let index = 0; index < synthesis.decisions.length; index += 1) {
     }
   });
 }
+// A merged representative can outrank a plain report, so publish by severity. Only the findings array is
+// sorted: synthesis.decisions and decisionRows keep emission order because the loop above indexes them
+// positionally and the audit trail must stay aligned.
+findings.sort(function (left, right) { return severityRank(left.severity) - severityRank(right.severity); });
 return {
   level: level,
   provenance: {
