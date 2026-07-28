@@ -8,6 +8,27 @@ the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- The README now documents the full execution and output contract: every command and
+  flag (including which flags are validated in the parent process and which only in a
+  detached background child), the per-built-in `--args` schemas, the `settings.json`
+  keys and the fact that only the installed package's own file is read, the
+  environment variables, exit codes, every stdout record `kind`, every stderr progress
+  event with its ordering guarantees, the failure-reason vocabulary and its
+  retryability, the background job files, the journal entry kinds, each built-in's
+  result payload, and the workflow-script authoring surface with the `agent()` options
+  that participate in the resume call key.
+
+### Fixed
+
+- `workflow.notice` now carries `status: "notice"`. It was the only progress record
+  without a `status` field, so a consumer keying on `status` read `undefined`.
+- `--help` reported the `archive` output default as `.ultracode-for-codex/archive`,
+  which reads as a project-relative path; it resolves to `<state-root>/archive`, and
+  the help text now prints the resolved absolute path.
+
+
 ## [0.7.0] - 2026-07-28
 
 ### Added

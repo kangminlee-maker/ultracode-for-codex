@@ -398,7 +398,7 @@ async function assertLaunchNoticeChannel(installedCli) {
 
   await waitForJsonFile(launch.resultPath, REQUEST_TIMEOUT_MS);
   const progress = await waitForProgressFile(launch.progressPath, REQUEST_TIMEOUT_MS);
-  const notice = assertProgressEvent(progress, 'workflow.notice');
+  const notice = assertProgressEvent(progress, 'workflow.notice', { status: 'notice' });
   assert.match(notice.summary, /ref-policy=lenient/);
 
   // Every line, not just the ones the reader understood: the defect was a line that is not JSON at all.

@@ -310,7 +310,8 @@ async function loadEnabledAgentTypeRegistry(streamsJsonlEvents: boolean): Promis
 // One channel decision for every launch notice. Adding a plain write anywhere on this path reintroduces
 // the malformed-line defect, so notices go through here.
 function emitLaunchNotice(streamsJsonlEvents: boolean, message: string): void {
-  if (streamsJsonlEvents) writeJsonlProgress({ event: 'workflow.notice', summary: message });
+  // `status` is on every other progress record, so a consumer keying on it must not read undefined here.
+  if (streamsJsonlEvents) writeJsonlProgress({ event: 'workflow.notice', status: 'notice', summary: message });
   else process.stderr.write(`ultracode: ${message}\n`);
 }
 
@@ -2330,7 +2331,7 @@ Background command options:
   --plain                            Print a human-readable background summary.
   --result                           wait prints the workflow result on completion.
   --wait                             cancel waits for terminal workflow status.
-  --out-dir <dir>                    archive output directory. Default: .ultracode-for-codex/archive.
+  --out-dir <dir>                    archive output directory. Default: <state-root>/archive (${defaultUltracodeStateRoot()}/archive).
   --output-path <path>               archive output file path.
   --install                          skills copies the packaged skill commands into \${CODEX_HOME:-~/.codex}/skills.
 `;
