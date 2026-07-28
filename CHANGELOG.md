@@ -8,6 +8,8 @@ the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-28
+
 ### Added
 
 - The README now documents the full execution and output contract: every command and

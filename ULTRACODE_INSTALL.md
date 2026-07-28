@@ -132,9 +132,15 @@ Structure:
   hints. No variables, calls, spreads, or template strings inside `meta`.
 - The body is plain async JavaScript (no TypeScript syntax). `return` produces
   the workflow result JSON.
-- Forbidden inside scripts: `Date`, `Math.random`, dynamic `import`, `eval`,
-  and the `Function` constructor. Scripts are capped at 64 KiB. Violations
-  fail before any agent runs.
+- Forbidden inside scripts, rejected statically before any agent runs: `Date`,
+  `Math.random` (and computed `Math[...]`), dynamic `import`, `eval`, the
+  `Function` constructor, `WebAssembly`, `require`, `process`, `module`,
+  `exports`, `global`, `globalThis`, `Object`, `Reflect`, `constructor`,
+  `prototype`, `__proto__`, and TypeScript type annotations. **Declaring your own
+  `async function` is also rejected** — the body is already async, so use
+  top-level `await` and `.then()`. Scripts are capped at 64 KiB.
+- `meta` is also injected as a script-local constant, so the body can read
+  `meta.name` and `meta.phases` without redeclaring them.
 
 API surface:
 
@@ -153,24 +159,62 @@ API surface:
   - `model`: per-agent model override. Precedence: per-agent `model` beats
     run-level `--model`, which beats the Codex thread default. Unknown models
     fail that agent loudly; there is no silent fallback.
-  - `key`: logical identity for resume/cache. Required discipline for dynamic
+  - `key`: logical identity for resume/cache — a trimmed string of at most 160
+    characters matching `^[A-Za-z0-9_.:/@+-]+$`. Required discipline for dynamic
     parallel agents: bind the key to the evidence snapshot it depends on
     (for example fold a `workspaceContext` snapshot hash into the key), and
     never reuse a key within one run — a duplicate key fails at reservation.
+    Without a key, call identity chains positionally, so inserting an agent
+    invalidates the cache for every agent after it; with a key, an unchanged call
+    can be reused even after a reorder.
+  - `agentType`: a type name from your Codex registry (`~/.codex/agents/*.toml`),
+    which supplies developer instructions plus a default model and effort for that
+    one agent. Requires `--agent-types enabled`; an unknown name fails before
+    spend. An explicit `model`/`effort` on the call still wins.
   - `label` and `phase`: display grouping only; not part of cache identity.
-  - `isolation: "worktree"`: run the agent in an isolated git worktree.
-- `parallel(items)` runs thunks concurrently. A failed item becomes `null`
-  in the result array; the script must check for `null` and fail closed when
-  the result is required.
-- `pipeline(items, ...stages)` moves each item through stages independently.
-  It is item-preserving: stage return arrays are not flattened.
+  - `isolation: "worktree"`: run the agent in an isolated git worktree. It must be
+    covered by the run's permission review or the call throws.
+  - **In the resume call key:** the prompt, `schema`, `model`, `effort`,
+    `isolation`, `agentType`, and `key`. Not in it: `label` and `phase`. Changing
+    anything in the key means that agent re-runs on resume instead of replaying.
+- `parallel(items)` runs thunks concurrently, at most 16 at a time, and returns
+  results in input order. A failed item becomes `null` in the result array; the
+  script must check for `null` and fail closed when the result is required.
+- `pipeline(items, ...stages)` moves each item through stages independently. Each
+  stage is called `(previousResult, originalItem, index)`. It is item-preserving:
+  stage return arrays are not flattened. Only a stage that **throws** drops its
+  item to `null`; a stage that returns `null` or `undefined` passes that value on
+  as the next stage's input.
+- `parallel` and `pipeline` accept at most 4096 items — exceeding it is an error,
+  never a silent truncation. A run may make at most 1000 agent calls.
+- `workflow(name, args)` runs another workflow as a nested child and returns its
+  result. It requires `--nested-workflows enabled`, is one level deep only, and a
+  child from a permission-gated source runs only if that exact workflow was
+  already approved. Disabled by default: calling it then fails loudly.
 - `phase(title)` groups later agents in progress output; overlapping calls
-  should pass an explicit `phase` option instead.
-- `workspaceContext(options)` returns deterministic workspace evidence
-  (`includeDiff: true` adds bounded diff evidence and allowed evidence refs).
+  should pass an explicit `phase` option instead. A `meta.phases[]` entry with the
+  same `title` supplies that phase's display detail.
+- `workspaceContext(options)` returns deterministic workspace evidence **as a
+  single string** — parse it by its section headings, which are part of the
+  contract (`## Workspace Context`, `Root:`, and with `includeDiff: true` also
+  `evidenceGate:`, `evidenceGateReason:`, `### Change Evidence`,
+  `### Allowed Evidence Refs`, `### Unavailable Evidence`, then `### Git Status`
+  and `### Included Files`). Options `query`, `files`, `includeDiff`,
+  `diffBaseRef`, `maxFiles`, `maxFileBytes`, `maxBytes`, and `maxDiffBytes` are
+  clamped rather than rejected. The README's Workflow Script Contract section
+  lists the full section order.
 - `log(message)`, `announcePlan`, `announcePhasePlan`, `hash(value)`, `args`,
   and `budget` are available; `setTimeout`/`clearTimeout` work inside the
-  run.
+  run. `console.log`, `console.warn`, and `console.error` are aliases of `log`.
+- `budget` exposes `total` (the `--budget` ceiling, or `null`), `spent()`,
+  `remaining()`, `maxAgentCalls`, `maxParallelism`, and `agentConcurrency`.
+  `spent()` counts only this run's fresh output tokens, so a resumed agent whose
+  result was replayed from cache contributes nothing.
+- Catchable with `try`/`catch`: input errors, script errors, structured-output
+  failures, and coded agent failures. **Not catchable:** a journal write failure
+  and a throwing `setTimeout` callback — both fail the run out of band. After
+  cancellation `agent()` returns `null`, `log()` no-ops, and `phase()` and
+  `workspaceContext()` throw.
 
 This contract governs script *structure*. For the natural-language `prompt`
 body of each `agent()` call — outcome-first framing, grounding and verification
@@ -192,9 +236,19 @@ npm exec -- ultracode-for-codex run \
 `--validate` resolves and parses the source without running agents. It
 hard-fails structural problems (meta shape, size cap, forbidden APIs) and
 prints non-blocking static warnings: agent() call sites without `schema` and
-dynamic fan-out without a logical `key`.
+dynamic fan-out without a logical `key`. For a built-in that reviews change
+evidence it also reports the evidence precondition — whether the gate would open,
+the citable refs, and every dropped path with the rule that dropped it — using
+the same builder the run uses, so the pre-check cannot disagree with the launch.
+Read `evidence.gated` rather than the top-level `status`: `status: "valid"`
+answers whether the request is well-formed, and a well-formed request can still
+be gated.
 
-Settings defaults:
+Settings defaults — this is the complete shipped `settings.json`, and the
+installed package's own copy is the only one the runtime reads. There is no
+project-level or user-level settings file and no environment override of a
+settings key, so a persistent change means editing that file; otherwise pass the
+flag.
 
 ```json
 {
@@ -204,6 +258,16 @@ Settings defaults:
     "permission": "ask",
     "retryLimit": 0,
     "timeoutMs": 0,
+    "heartbeatMs": 120000,
+    "worktreeRetention": "remove-clean",
+    "agentConcurrency": "unbounded",
+    "nestedWorkflows": "disabled",
+    "evidenceScope": "default",
+    "refPolicy": "strict",
+    "agentWebSearch": "disabled",
+    "agentFileWrite": "disabled",
+    "agentMcp": [],
+    "agentTypes": "disabled",
     "background": {
       "runDir": "{stateRoot}/background/{jobId}",
       "resultFile": "result.json",
@@ -211,9 +275,15 @@ Settings defaults:
       "metadataFile": "metadata.json",
       "pidFile": "pid"
     }
+  },
+  "codex": {
+    "reasoningEffort": "medium",
+    "verbosity": "medium"
   }
 }
 ```
+
+`--budget` has no settings key: it is off unless the flag is passed.
 
 Useful controls:
 
@@ -279,6 +349,19 @@ Useful controls:
 - Use `--permission ask|allow|deny` for project/user/plugin/scriptPath
   workflow permission reviews.
 - Use `--progress plain` for human-readable log lines.
+- `--evidence-scope all` forgives only the evidence extension allowlist, which
+  makes `.java`/`.rb`/`.sql`/`.kt` projects reviewable by `code-review`; excluded
+  directories, runtime state, and unsafe paths stay inadmissible at every scope.
+- `--ref-policy lenient` drops the one candidate whose cited evidence ref cannot
+  be resolved instead of failing the run, and discloses it in the result's
+  `degraded` block with `stats.refDrops`. A run whose candidates all dropped
+  still fails, so a degraded review never presents as a clean one. Lens decisions
+  and structural violations stay fatal at either policy. A non-default policy is
+  announced at launch; a resume or a `--script-path` launch across policies is
+  refused, because the policy is baked into the generated script text.
+- The README documents the complete execution and output contract: every flag,
+  every `--args` schema, every record and progress event, the failure-reason
+  vocabulary, and each built-in's result payload.
 - Use `--execution background` for OS background runs and `--execution attached`
   only when the caller should stay connected until completion.
 

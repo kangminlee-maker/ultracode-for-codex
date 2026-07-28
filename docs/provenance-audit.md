@@ -1,21 +1,20 @@
 # Provenance Audit
 
 Date: 2026-06-23
-Update 2026-07-28: version references updated to the 0.7.0 release line. Since the
-previous release the built-in `code-review` workflow's failure modes were reworked —
-per-built-in request contracts rejected before any spend, an evidence gate that keys
-on whether the reviewer can actually read a change, a zero-token `--validate`
-preflight, and the two default-off review policies `--evidence-scope` and
-`--ref-policy`. The runtime change set is project-authored source with no new
-third-party runtime code and no new dependencies of any kind, so the marker-scan
-evidence below is unchanged from the 2026-06-23 audit.
+Update 2026-07-28: version references updated to the 0.7.1 release line. This is a
+documentation release: the README gained the complete execution and output contract,
+and the install guide printed by `--llm-guide` was corrected to match the runtime's
+actual script API. Two contract inconsistencies were fixed alongside it (a progress
+record missing its `status` field, and a help-text default that read as
+project-relative). No dependency changed and no third-party runtime code was added, so
+the marker-scan evidence below is unchanged from the 2026-06-23 audit.
 
 ## Scope
 
 This audit checked:
 
 - tracked repository files;
-- generated npm package contents for `ultracode-for-codex@0.7.0`;
+- generated npm package contents for `ultracode-for-codex@0.7.1`;
 - the locally installed companion Codex skill.
 
 Generated build output and package tarballs were checked as projections of the
@@ -31,7 +30,7 @@ License transition completed:
 
 - Apache-2.0 `LICENSE` file is present;
 - `package.json` and `package-lock.json` declare `Apache-2.0`;
-- audited package metadata version is `0.7.0`;
+- audited package metadata version is `0.7.1`;
 - npm publish state is verified separately during release preparation.
 
 ## Evidence
