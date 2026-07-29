@@ -877,6 +877,9 @@ test('a synthesis that forgets a candidate is repaired, not discarded', async ()
   const backfilled = snapshot.result.synthesis.decisions.find((row) => /Backfilled by the runtime/.test(row.reason));
   assert.ok(backfilled, JSON.stringify(snapshot.result.synthesis.decisions));
   assert.equal(backfilled.action, 'report');
+  // The agent wrote its summary for the decisions it returned, so an unamended summary can claim fewer
+  // findings than the result carries — the same summary-vs-findings contradiction this fix exists to end.
+  assert.match(snapshot.result.summary, /Runtime repair: 1 candidate\(s\) received no decision/);
 });
 
 test('refPolicy lenient drops the unusable candidate and keeps the rest of the review', async () => {

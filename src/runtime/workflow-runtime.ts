@@ -1755,9 +1755,15 @@ function normalizeSynthesis(raw, items) {
     // Floor: an empty or all-backfilled decision set is not an agent synthesis. Without this, the
     // schema-valid output {summary, decisions: []} would present as a clean agent selection.
     if (normalized.length === repaired.length) fail("synthesis returned no usable decision");
+    // The agent wrote its summary for the decisions it returned. If the runtime added findings the agent
+    // never judged, an unamended summary can say "no material findings" while findings is non-empty — the
+    // exact summary-vs-findings contradiction that exposed the discarded-merge bug in the first place.
+    const repairNote = repaired.length > 0
+      ? " (Runtime repair: " + repaired.length + " candidate(s) received no decision from the synthesis agent and were reported rather than dropped, so this summary may understate the findings.)"
+      : "";
     return {
       mode: "agent",
-      summary: text(raw.summary),
+      summary: text(raw.summary) + repairNote,
       fallbackReason: repaired.length > 0
         ? "partial synthesis recovery: " + repaired.length + " candidate(s) had no decision and were backfilled as reported"
         : null,

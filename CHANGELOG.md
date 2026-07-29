@@ -34,7 +34,18 @@ the project uses [semantic versioning](https://semver.org/).
   reported, never dropped — and disclosed in `fallbackReason`. Duplicate coverage and out-of-range
   indexes stay fatal, because resolving a duplicate by position could delete a finding the agent
   selected. A synthesis that contributes no usable decision at all still takes the fallback, so an empty
-  selection cannot present as a clean agent synthesis.
+  selection cannot present as a clean agent synthesis. When the runtime repairs a gap it also amends the
+  result `summary`, because the agent wrote that sentence for the decisions it returned — without the
+  amendment a repaired run could say "no material findings" while `findings` is non-empty, which is the
+  same summary-vs-findings contradiction that exposed the discarded-merge bug.
+
+### Changed
+
+- Documented that the `code-review` report cap is an instruction to the synthesis agent, not a limit the
+  runtime enforces. The runtime truncates only when it selects the findings itself
+  (`synthesis.mode: "script_fallback"`), where it now ranks by severity first and discloses the cut. It
+  deliberately does not truncate an agent's selection: choosing which findings to discard with no evidence
+  is the failure this release fixes on the fallback path.
 
 
 ## [0.7.1] - 2026-07-28
