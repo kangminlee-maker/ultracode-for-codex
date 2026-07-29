@@ -8,6 +8,46 @@ the project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A consolidated duplicate group is reported instead of being silently discarded.** The built-in
+  `code-review` synthesis stage offers four dispositions — report, merge, drop, or be covered as a merge
+  target — and a `merge` row is the surviving representative: the validator requires it to name the
+  candidates it absorbed. The findings loop reported only `report` rows, so every merged group vanished.
+  Measured on a real repository: one run whose synthesis announced "Selected 11 material final findings"
+  returned 1, and a second announcing 15 returned 4 — 21 findings lost across two runs, 14 of them P1.
+  `findings[].synthesisDecision.action` now carries `merge` for such a finding, with `mergeCandidates[]`
+  naming what it absorbed.
+- **`stats.dropped.duplicate` counts the candidates absorbed into merges**, not the merge rows. Counting
+  rows left the absorbed candidates in no bucket at all: one run booked 10 duplicates for 49 absorbed
+  candidates. A `drop` row may also carry merge targets, and those are counted too.
+- **Findings are published most-severe-first.** A merged representative can outrank a plain report, and
+  the fallback path appends sweep results last, so emission order is not severity order.
+- **The script fallback selects by severity before the report cap applies.** It kept the first
+  `reportCap` candidates in discovery order, so a late P1 was dropped while an early P3 was reported —
+  and sweep results are appended last, meaning the stage that exists to catch what the lenses missed was
+  cut first. Its `summary` now states that the selection was the runtime's, not the agent's, and how many
+  candidates the cap cut.
+- **A synthesis that forgets one candidate is repaired instead of discarded.** A single uncovered index
+  threw away the entire agent synthesis and fell back to order-based truncation; with 60+ candidates one
+  gap discarded 60 good decisions. The gap is now backfilled **open** — the forgotten candidate is
+  reported, never dropped — and disclosed in `fallbackReason`. Duplicate coverage and out-of-range
+  indexes stay fatal, because resolving a duplicate by position could delete a finding the agent
+  selected. A synthesis that contributes no usable decision at all still takes the fallback, so an empty
+  selection cannot present as a clean agent synthesis. When the runtime repairs a gap it also amends the
+  result `summary`, because the agent wrote that sentence for the decisions it returned — without the
+  amendment a repaired run could say "no material findings" while `findings` is non-empty, which is the
+  same summary-vs-findings contradiction that exposed the discarded-merge bug.
+
+### Changed
+
+- Documented that the `code-review` report cap is an instruction to the synthesis agent, not a limit the
+  runtime enforces. The runtime truncates only when it selects the findings itself
+  (`synthesis.mode: "script_fallback"`), where it now ranks by severity first and discloses the cut. It
+  deliberately does not truncate an agent's selection: choosing which findings to discard with no evidence
+  is the failure this release fixes on the fallback path.
+
+
 ## [0.7.1] - 2026-07-28
 
 ### Added

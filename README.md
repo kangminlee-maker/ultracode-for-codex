@@ -690,7 +690,7 @@ and `stats` are always present.
 | `provenance.diffBaseRef` | string \| null | `null` when no range was reviewed |
 | `provenance.truncation` | `{raw: string}` | a **stringified** JSON object, not parsed |
 | `summary` | string | when nothing survived a drop, it says so explicitly rather than reading clean |
-| `findings[]` | array | one entry per reported decision; `[]` is a legitimate clean result |
+| `findings[]` | array | one entry per reported or merged decision, ordered most severe first; `[]` is a legitimate clean result |
 | `findings[].candidateId`, `.candidateDigest` | string | stable identity of the candidate |
 | `findings[].severity` | `P0 \| P1 \| P2 \| P3` | |
 | `findings[].file`, `.line` | string, integer \| null | workspace-relative |
@@ -698,21 +698,21 @@ and `stats` are always present.
 | `findings[].verdict` | `CONFIRMED \| PLAUSIBLE` | a refuted candidate never becomes a finding |
 | `findings[].evidenceRefs[]` | string, ≥1 | `file:<path>`, `diff:<kind>:<path>`, or `hunk:<kind>:<path>:<n>` — every ref exists in the evidence index |
 | `findings[].lens` | `{key, title}` | which review lens found it |
-| `findings[].synthesisDecision` | `{action, reasonCategory, reason, mergeCandidates[]}` | why it was reported |
+| `findings[].synthesisDecision` | `{action, reasonCategory, reason, mergeCandidates[]}` | why it was reported. `action` is `merge` when this finding is the representative of a consolidated duplicate group, and `mergeCandidates[]` names what it absorbed |
 | `degraded` | object \| null | `null` unless a ref drop happened, so it is always `null` under `--ref-policy strict` |
 | `degraded.refDrops` | integer | total drops |
 | `degraded.entries[]` | array | first 20 drops; `truncated` says whether more exist |
 | `degraded.entries[].subject` | `scope_file \| candidate \| verifier_result` | **which lifecycle event happened** — scope narrowing is not a rejected candidate |
 | `degraded.entries[].stage`, `.label`, `.reason` | string | where it dropped and why |
 | `degraded.entries[].dropped` | `{candidateId, file, claim}` | a bounded projection of what was lost, so the omission is judgeable |
-| `synthesis.mode` | `agent \| script_fallback` | `script_fallback` means the synthesis agent's output was not usable |
-| `synthesis.fallbackReason` | string \| null | `null` only when mode is `agent` |
-| `synthesis.decisions[]` | array | one row per candidate decision, plus one per candidate-lifecycle ref drop (`droppedSubject`, `droppedFile`, `droppedClaim`) |
+| `synthesis.mode` | `agent \| script_fallback` | `script_fallback` means the synthesis agent's output was not usable at all, so the runtime selected by severity and cut at the report cap — read `summary`, which says so explicitly |
+| `synthesis.fallbackReason` | string \| null | why the agent's selection was not usable as-is. `null` means the agent synthesis was used unchanged; a non-null value with `mode: "agent"` means the runtime **repaired** it — a candidate the agent returned no decision for is backfilled as reported rather than dropped, and the count is stated here |
+| `synthesis.decisions[]` | array | one row per candidate decision, plus one per candidate-lifecycle ref drop (`droppedSubject`, `droppedFile`, `droppedClaim`). A row whose `action` is `report` **or `merge`** produced a finding; only `drop` removed a candidate from the report |
 | `stats.finders`, `.candidates`, `.verified`, `.refuted`, `.reported` | integer | pipeline counters |
 | `stats.verifierAttempts` | integer | includes cached attempts, so it is not a spend figure |
 | `stats.normalizedRefs` | integer | refs repaired by grammar normalization |
 | `stats.refDrops` | integer | all drops — the authoritative count |
-| `stats.dropped` | `{duplicate, notMaterial, reportCap, unsupportedEvidence, superseded}` | `unsupportedEvidence` counts candidate-lifecycle drops only, so it can be lower than `refDrops` |
+| `stats.dropped` | `{duplicate, notMaterial, reportCap, unsupportedEvidence, superseded}` | `duplicate` counts the candidates **absorbed into** merged findings, not the merged findings themselves — a representative is reported, and what it consolidated is what left the report. `unsupportedEvidence` counts candidate-lifecycle drops only, so it can be lower than `refDrops` |
 
 **Reading a `code-review` result safely:** `findings: []` alone does not mean
 clean. Check `stats.refDrops` and `degraded` first — under `--ref-policy lenient`
